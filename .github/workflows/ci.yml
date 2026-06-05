@@ -1,0 +1,25 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  govern:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # The governance gate — toolchain-agnostic, no ANTHROPIC_API_KEY, no Claude.
+      # `npx` fetches govkit on demand; pin a version for reproducible CI (e.g. govkit@0.2).
+      # verify = structural gate (blocks); eval = quality floor (blocks) + advisory score.
+      - name: govkit verify
+        run: npx --yes govkit verify
+      - name: govkit eval
+        run: npx --yes govkit eval
+
+      # Add your own steps below (install / lint / typecheck / test for your stack).
+      # - run: <your build & tests>

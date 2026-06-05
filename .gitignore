@@ -1,0 +1,14 @@
+# deps / build (add your stack's artifacts here)
+node_modules/
+dist/
+build/
+
+# env / secrets
+.env
+.env.*
+!.env.example
+*.local.*
+
+# os / editor
+.DS_Store
+Thumbs.db

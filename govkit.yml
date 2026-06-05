@@ -1,0 +1,86 @@
+# govkit governance schema — the single pluggable interface the engine reads.
+# Doc dirs, required keys, lifecycle states, and the quality rubric are CONFIG,
+# not hardcoded in the CLI, so any repo (any doc layout / quality bar) adopts
+# govkit by editing this file.
+schemaVersion: 1
+
+# ── Layer 1: the structural GATE (`govkit verify`) ───────────────────────────
+# Front-matter completeness · status ∈ allowed set · id↔filename convention ·
+# INDEX sync · globally-unique ids · no unresolved placeholders. Binary pass/fail.
+docs:
+  ignore: [INDEX.md, _TEMPLATE.md]
+  base:
+    required: [id, title, status, owner, date]
+  types:
+    prd:
+      dir: docs/product
+      required: [id, title, status, owner, date]
+      idPrefix: PRD
+      startStatus: draft
+      statuses: [draft, review, approved, rejected, superseded]
+    rfc:
+      dir: docs/rfc
+      required: [id, title, status, owner, date]
+      idPrefix: RFC
+      startStatus: draft
+      statuses: [draft, proposed, accepted, rejected, superseded]
+    adr:
+      dir: docs/adr
+      required: [id, title, status, owner, date]
+      idPrefix: ADR
+      startStatus: proposed
+      statuses: [proposed, accepted, rejected, superseded]
+    us:
+      dir: docs/issues
+      required: [id, title, status, owner, date, priority]
+      idPrefix: US
+      startStatus: open
+      statuses: [open, in-progress, blocked, done, wontfix]
+
+# ── Layer 2: the quality EVAL (`govkit eval`) ────────────────────────────────
+# An HONEST deterministic, no-API-key layer. It is a STRUCTURAL FLOOR, not a
+# substance judge: a presence/shape rubric cannot tell a real artifact from a
+# keyword-salad with the right headings (same lexical fingerprint). So:
+#   • CI BLOCKS only on `required:` rules — a tiny floor (not a stub, no filler)
+#     tuned for ZERO false-positive on legitimate docs. A determined gamer can
+#     pass the floor; that is by design — the swe-flow `reviewer` agent (opt-in,
+#     needs a key, never in no-key CI) is the substance judge. See RFC-0001.
+#   • The 0–100 `score` is ADVISORY: it rewards distinct canonical sections and
+#     a quality trend to watch; below `threshold` warns, it does NOT block.
+# Section rules match DISTINCT headings (one heading ≠ four sections); regex/
+# minWords run on prose with code fences + comments stripped.
+eval:
+  threshold: 70
+  rubrics:
+    prd:
+      - { id: problem, weight: 20, kind: section, pattern: 'problem|background|context|motivation|why|status quo|pain', desc: "problem framing" }
+      - { id: persona, weight: 20, kind: section, pattern: 'persona|user|audience|who|customer|segment|stakeholder|icp|target', desc: "explicit persona / audience" }
+      - { id: metric, weight: 20, kind: section, pattern: 'success|metric|kpi|goal|objective|outcome|target|north star', desc: "success-metric section" }
+      - { id: scope, weight: 15, kind: section, pattern: 'scope|non-?goal|out of scope|boundaries|deliverable', desc: "scope / non-goals" }
+      - { id: kpi, weight: 10, kind: regex, pattern: '\$?\d+\s*(%|percent|x\b|ms\b|/s|/mo|/day|k\b|m\b|bps|users|req)|\bfrom\s+\d+\b.*\bto\s+\d+\b', desc: "a quantified target (advisory; cannot judge if meaningful)" }
+      - { id: substance, weight: 10, kind: minWords, min: 40, required: true, desc: "not an empty stub (≥40 words of prose)" }
+      - { id: nofiller, weight: 5, kind: forbid, pattern: 'lorem ipsum|to be filled (in|out)|to be written|todo:?\s*write|placeholder text|fill (this )?in later|insert [a-z ]+ here', required: true, desc: "no template filler left in" }
+    rfc:
+      - { id: summary, weight: 15, kind: section, pattern: 'summary|overview|proposal|abstract|context', desc: "summary / proposal" }
+      - { id: alternatives, weight: 20, kind: section, pattern: 'alternative|trade-?off|option|comparison|considered', desc: "alternatives + trade-offs" }
+      - { id: openq, weight: 15, kind: section, pattern: 'open question|unresolved|loose end|to be decided|risk', desc: "open questions" }
+      - { id: impact, weight: 15, kind: section, pattern: 'impact|migration|rollout|rollback|deployment|phases', desc: "impact / rollout" }
+      - { id: decision, weight: 15, kind: section, pattern: 'decision|recommendation|proposal|rollout|what we|chosen', desc: "stated recommendation" }
+      - { id: comparison, weight: 5, kind: regex, pattern: '\brejected\b|\bruled out\b|\bdiscarded\b|\bpreferred\b|instead of|rather than|versus|pros and cons|trade-?off', desc: "weighs an alternative (advisory)" }
+      - { id: substance, weight: 10, kind: minWords, min: 40, required: true, desc: "not an empty stub (≥40 words of prose)" }
+      - { id: nofiller, weight: 5, kind: forbid, pattern: 'lorem ipsum|to be filled (in|out)|to be written|todo:?\s*write|placeholder text|fill (this )?in later|insert [a-z ]+ here', required: true, desc: "no template filler left in" }
+    adr:
+      - { id: context, weight: 25, kind: section, pattern: 'context|background|problem statement|forces|status quo|situation', desc: "context section" }
+      - { id: decision, weight: 25, kind: section, pattern: 'decision|chosen|resolution|outcome|drivers|considered options|what we', desc: "decision section" }
+      - { id: consequences, weight: 20, kind: section, pattern: 'consequence|trade-?off|result|implication|pros and cons|negative|impact|risk', desc: "consequences section" }
+      - { id: alternatives, weight: 10, kind: regex, pattern: 'option|alternative|considered|weighed|instead of|rather than|versus|pros and cons|\brejected\b', desc: "mentions alternatives (advisory)" }
+      - { id: substance, weight: 15, kind: minWords, min: 30, required: true, desc: "not an empty stub (≥30 words of prose)" }
+      - { id: nofiller, weight: 5, kind: forbid, pattern: 'lorem ipsum|to be filled (in|out)|to be written|todo:?\s*write|placeholder text|fill (this )?in later|insert [a-z ]+ here', required: true, desc: "no template filler left in" }
+    us:
+      - { id: story, weight: 15, kind: regex, pattern: '\bas an?\b.+\bi (want|need|would like|wish|can|must)\b', desc: "user-story / job-story form (advisory)" }
+      - { id: acceptance, weight: 25, kind: section, pattern: 'acceptance|criteria|scenario|expected behaviou?r|requirement|definition of done', desc: "acceptance-criteria section" }
+      - { id: testable, weight: 20, kind: regex, pattern: '^\s*[-*]?\s*\[[ xX]\]|\b(given|when|then)\b', desc: "checkbox / Gherkin criteria (advisory)" }
+      - { id: benefit, weight: 10, kind: regex, pattern: '\bso (that|i|we|they|the|my|our|you|it)\b|in order to', desc: "states a benefit (advisory)" }
+      - { id: priority, weight: 10, kind: frontmatter, key: priority, desc: "priority set (presence only)" }
+      - { id: substance, weight: 15, kind: minWords, min: 30, required: true, desc: "not an empty stub (≥30 words of prose)" }
+      - { id: nofiller, weight: 5, kind: forbid, pattern: 'lorem ipsum|to be filled (in|out)|to be written|todo:?\s*write|placeholder text|fill (this )?in later|insert [a-z ]+ here', required: true, desc: "no template filler left in" }
