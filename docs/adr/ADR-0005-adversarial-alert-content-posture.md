@@ -1,8 +1,8 @@
 ---
 id: ADR-0005
 title: Adversarial alert content posture — prompt-injection containment
-status: proposed
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-05
 ---
 
