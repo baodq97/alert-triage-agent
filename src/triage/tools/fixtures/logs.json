@@ -1,0 +1,44 @@
+{
+  "svc-deploy-prod": {
+    "entity": "svc-deploy-prod",
+    "window": "last_24h",
+    "total_events": 1180,
+    "recent": [
+      {"ts": "2026-04-09T03:10:00Z", "action": "deploy.start", "result": "ok"},
+      {"ts": "2026-04-09T03:12:44Z", "action": "api.call", "endpoint": "/admin/users/export", "result": "ok"}
+    ]
+  },
+  "10.200.3.47": {
+    "entity": "10.200.3.47",
+    "window": "last_24h",
+    "total_events": 851,
+    "recent": [
+      {"ts": "2026-04-09T03:11:50Z", "action": "auth.api_key", "result": "ok"},
+      {"ts": "2026-04-09T03:12:44Z", "action": "api.call", "endpoint": "/admin/users/export", "result": "ok"}
+    ]
+  },
+  "/admin/users/export": {
+    "entity": "/admin/users/export",
+    "window": "last_24h",
+    "total_events": 849,
+    "recent": [
+      {"ts": "2026-04-09T03:12:44Z", "caller": "svc-deploy-prod", "result": "ok"}
+    ]
+  },
+  "dev-intern-jpark": {
+    "entity": "dev-intern-jpark",
+    "window": "last_24h",
+    "total_events": 37,
+    "recent": [
+      {"ts": "2026-04-09T11:47:02Z", "action": "iam.attach_policy", "result": "ok"}
+    ]
+  },
+  "203.0.113.22": {
+    "entity": "203.0.113.22",
+    "window": "last_24h",
+    "total_events": 14,
+    "recent": [
+      {"ts": "2026-04-09T11:46:30Z", "action": "console.login", "result": "ok"}
+    ]
+  }
+}

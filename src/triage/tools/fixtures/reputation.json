@@ -1,0 +1,18 @@
+{
+  "10.200.3.47": {
+    "entity": "10.200.3.47",
+    "scope": "rfc1918_internal",
+    "classification": "internal",
+    "score": 0,
+    "known_bad": false,
+    "sources_checked": ["internal-asset-db"]
+  },
+  "203.0.113.22": {
+    "entity": "203.0.113.22",
+    "scope": "public",
+    "classification": "unlisted",
+    "score": 0,
+    "known_bad": false,
+    "sources_checked": ["internal-asset-db", "threat-feed-mock"]
+  }
+}

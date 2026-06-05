@@ -1,0 +1,22 @@
+{
+  "svc-deploy-prod": {
+    "entity": "svc-deploy-prod",
+    "kind": "service_account",
+    "status": "active",
+    "role": "ci-cd-deployer",
+    "owner_team": "platform-engineering",
+    "created_days_ago": 540,
+    "mfa_enrolled": false,
+    "expected_caller_ips": ["10.200.1.0/24"]
+  },
+  "dev-intern-jpark": {
+    "entity": "dev-intern-jpark",
+    "kind": "iam_user",
+    "status": "active",
+    "role": "developer-readonly",
+    "owner_team": "data-platform",
+    "created_days_ago": 12,
+    "mfa_enrolled": true,
+    "manager": "lchen"
+  }
+}

@@ -12,7 +12,8 @@ Distilled from RFC-0001 (`docs/rfc/RFC-0001-agent-architecture.md`). If this fil
 ```
 run.py                      # entry/adapters: --alert <file> | --watch <dir> | --resume <run_id> [--approve|--deny]
 src/triage/
-├── models.py               # Alert, InvestigationPlan, PlanStep, Finding, Verdict, ToolResult (Pydantic)
+├── models.py               # Alert, InvestigationPlan, PlanStep, Finding, Verdict, ToolResult, GateDecision (Pydantic)
+├── core.py                 # triage(alert, deps) -> RunResult — transport-agnostic core flow; TriageDeps container; target-entity invariant
 ├── llm.py                  # OpenAI-compatible client: retry ×3 exp backoff, timeout, 1 repair attempt on bad structured output
 ├── planner.py              # alert (+ memory recall) → InvestigationPlan  (LLM, structured)
 ├── executor.py             # ReAct loop: step → tool → observation → reason (continue|revise|conclude); max-steps guard; repeat-call guard
@@ -40,7 +41,8 @@ Typed envelope (required): `alert_id`, `timestamp`, `source`, `severity_hint`, `
 - The `ToolRegistry` exposes **read-only investigation tools only**: `lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`. The executor can never mutate anything mid-loop.
 - **`block_user` is a Response Action, not an investigation tool.** It is never callable by the executor; it executes only in the post-verdict flow: Verdict → RiskPolicy → Approval Gate → approved → execute (mock), denied → recorded. One gate per run.
 - This makes the eval assertion `gate_before_high_risk` structurally sound: a high-risk `action_executed` event without a preceding `gate_decision(approved)` is impossible by construction, not by prompt discipline.
-- **Target invariant:** `block_user` (and any targeted response action) must reference an entity present in the alert envelope/payload; a verdict whose action target is not an alert entity is rejected before the gate.
+- **Target invariant:** `block_user` (and any targeted response action) must reference an entity present in the alert envelope/payload; a verdict whose action target is not an alert entity is rejected before the gate (`action_rejected`). The invariant applies to **targeted** actions only (`TARGETED_ACTIONS` in `tools/actions.py`): an untargeted recommendation (e.g. an advisory `notify_soc`) passes through to the RiskPolicy/gate untouched — a capability fact never decides whether a human sees a recommendation. An approved action with no registered executor is recorded as `action_skipped`, never executed and never a crash (decided 2026-06-05, wave-1 QA).
+- `Tool` carries descriptive `risk_tier` metadata (RFC-0001 §Tools — all four investigation tools are `"read_only"`); it is planner-facing description only. RiskPolicy classifies `Action.name`, never tools.
 
 ## Verdict contract
 
@@ -59,9 +61,11 @@ One JSON object per line, append-only, never mutated. Common fields: `seq` (mono
 | `plan_created` / `plan_revised` | `steps` |
 | `tool_called` | `step`, `tool`, `args`, `attempt` |
 | `tool_result` | `step`, `attempt`, `ok`, `data` \| `error` |
+| `action_rejected` | `action`, `reason` — PRE-gate only: target-entity invariant ("missing required target" \| "target is not an alert entity"); always precedes `gate_requested` |
 | `gate_requested` | `actions` (batched), `risk` |
 | `gate_decision` | `decision` (approved/denied), `by` |
 | `action_executed` | `action`, `result` |
+| `action_skipped` | `action`, `reason` — POST-gate only: an approved action with no registered executor ("no executor for action"); per approved action, `action_executed` XOR `action_skipped` follows `gate_decision(approved)` |
 | `verdict` | full verdict object |
 | `run_terminated` | `reason` (completed/max_steps/awaiting_approval/error) |
 
@@ -81,8 +85,8 @@ Wave 1 MUST define these boundaries even where the real implementation comes lat
 
 - **`LLM` port**: one Protocol the whole agent talks to; impls: `OpenAICompatibleLLM` (real) and `FakeLLM` (tests — see Test architecture).
 - **`Journal` port + `NoopJournal`**: the executor/planner/gate emit events from day one; wave 2 only adds `JsonlJournal`. Never add emit calls retroactively.
-- **`planner(alert, recall=None)`**: the recall parameter exists from wave 1 (always `None` until wave 3).
-- **Contracts in `models.py`**: `ReasonerDecision` (`continue | revise_plan | conclude` + rationale + next-step payload), `RunResult` (verdict + gate_decisions + executed_actions + run_id + terminated_reason — what `run.py` prints and evals read; persisted as a **versioned run record** at `runs/<run_id>/result.json`, which external eval adapters read instead of importing `src/triage`), `Action`, alongside Alert/InvestigationPlan/PlanStep/Finding/Verdict/ToolResult.
+- **`Planner.plan(alert, recall=None)`**: the recall parameter exists from wave 1 (always `None` until wave 3); deps (`llm`, `journal`, `tool_specs`) bind in the constructor.
+- **Contracts in `models.py`**: `ReasonerDecision` (`continue | revise_plan | conclude` + rationale + next-step payload), `RunResult` (verdict + gate_decisions + executed_actions + run_id + terminated_reason — what `run.py` prints and evals read; persisted as a **versioned run record** at `runs/<run_id>/result.json`, which external eval adapters read instead of importing `src/triage`), `Action`, `GateDecision` (`{decision, by}`, mirrors the journal payload), alongside Alert/InvestigationPlan/PlanStep/Finding/Verdict/ToolResult.
 - **Structured output**: request `response_format` JSON schema when the endpoint supports it, ALWAYS with the prompt-instructed-JSON + parse + one-repair-attempt fallback. The fallback is load-bearing (Ollama/some vLLM lack json_schema — it is how the local-model bonus works), not a rare path.
 - **Risk policy file**: `config/risk_policy.yaml`, overridable via `RISK_POLICY_PATH` env.
 - **`prompt_hash`**: sha256 over the full rendered message list (model-agnostic); used in `llm_call` events and as the Replay Mode key.

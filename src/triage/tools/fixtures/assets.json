@@ -1,0 +1,32 @@
+{
+  "user-management-api": {
+    "entity": "user-management-api",
+    "kind": "service",
+    "environment": "production",
+    "owner_team": "identity",
+    "data_classification": "pii",
+    "exposes": ["/admin/users/export"]
+  },
+  "/admin/users/export": {
+    "entity": "/admin/users/export",
+    "kind": "endpoint",
+    "service": "user-management-api",
+    "environment": "production",
+    "data_classification": "pii",
+    "auth_required": true
+  },
+  "arn:aws:iam::123456789012:role/dev-intern-jpark-role": {
+    "entity": "arn:aws:iam::123456789012:role/dev-intern-jpark-role",
+    "kind": "iam_role",
+    "environment": "staging",
+    "owner_team": "data-platform",
+    "trust": "self-assume"
+  },
+  "arn:aws:iam::aws:policy/AdministratorAccess": {
+    "entity": "arn:aws:iam::aws:policy/AdministratorAccess",
+    "kind": "iam_policy",
+    "managed_by": "aws",
+    "grants": "full-administrator",
+    "sensitivity": "high"
+  }
+}
