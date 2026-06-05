@@ -1,0 +1,14 @@
+# Risk Policy (RFC-0001 HITL gate; triage-conventions Risk Policy format).
+#
+# Maps a Recommended Action's exact name to its Risk Tier. The Approval Gate
+# batches every High-risk Action of a Run into a single human decision; lower
+# tiers never gate. An action name NOT listed here defaults to high_risk — the
+# safe default, so a new Response Action cannot slip past the gate by omission.
+#
+# Tier vocabulary (minimal — only high_risk gates):
+#   high_risk - irreversible / high blast-radius; requires the Approval Gate
+#   low_risk  - reversible / advisory; executes without a gate (zero-touch)
+#
+# Override the file location with the RISK_POLICY_PATH env var.
+actions:
+  block_user: high_risk

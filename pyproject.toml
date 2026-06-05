@@ -56,7 +56,10 @@ error-on-warning = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--cov=triage --cov-branch --cov-report=term-missing"
+addopts = "--cov=triage --cov=run --cov-branch --cov-report=term-missing"
+markers = [
+    "live: Tier B live smoke — hits a real LLM endpoint; auto-skipped without LLM_API_KEY",
+]
 
 [tool.coverage.report]
 fail_under = 100
