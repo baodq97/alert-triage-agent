@@ -27,7 +27,8 @@ src/triage/
 prompts/*.md                # ALL LLM prompts (planner.md, reasoner.md, verdict.md, judge.md)
 tests/test_{module}.py
 alerts/*.json               # sample inputs
-runs/<run_id>/journal.jsonl # runtime artifacts (gitignored)
+runs/<run_id>/              # runtime artifacts (gitignored): journal.jsonl (append-only event stream),
+                            # result.json (versioned run record), alert.json (input copy — resume rebuilds without the original path)
 ```
 
 Dependency direction: `models` ← everything; `journal`/`llm`/`tools`/`gate` are leaves consumed by `planner`/`executor`/`verdict`; nothing imports `run.py`. The core entrypoint `triage(alert, deps)` is transport-agnostic — adapters live only in `run.py`.
@@ -75,7 +76,7 @@ Renaming a field here is a breaking change for resume rebuild AND eval assertion
 
 ## HITL gate
 
-ONE gate per run, after verdict: all high-risk actions batched into a single approval request. Approved → execute immediately; denied → record, verdict still ships. Risk tiers come from `config/risk_policy.yaml` (action → tier); **unclassified actions default to high-risk**. `ApprovalGate` is a Protocol; impls: `CLIGate` (interactive), `AutoGate` (config-driven, default-deny — used in tests/CI). The gate is enforced by the run flow in code, never delegated to LLM judgment.
+ONE gate per run, after verdict: all high-risk actions batched into a single approval request. Approved → execute immediately; denied → record, verdict still ships. Risk tiers come from `config/risk_policy.yaml` (action → tier); **unclassified actions default to high-risk**. `ApprovalGate` is a Protocol; impls: `CLIGate` (interactive), `AutoGate` (config-driven, default-deny — used in tests/CI), `DeferredGate` (emits `gate_requested`, returns the `HOLD` sentinel, no decision — the run exits `awaiting_approval` for `--resume --approve|--deny`; wired by non-interactive adapters). `GateOutcome = GateDecision | HOLD | None` (`None` = zero-touch). The gate is enforced by the run flow in code, never delegated to LLM judgment.
 
 **Resume idempotency:** on `--resume --approve`, execute a high-risk action only if no `action_executed` event exists for it; order is check → execute → record, so a recorded result is reused, never re-applied.
 
@@ -110,7 +111,7 @@ All prompts live in `prompts/*.md` — never inline strings. Every template that
 
 ## Config / env vars (names are a contract — keep `.env.example`, code, Makefile, README in sync)
 
-`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `MAX_STEPS` (15), `MEMORY_SYNTHESIZE_EVERY_N_RUNS` (0 = disabled).
+`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `MAX_STEPS` (15), `RISK_POLICY_PATH` (default `config/risk_policy.yaml`), `MEMORY_DIR` (default `.memory/`, gitignored), `MEMORY_SYNTHESIZE_EVERY_N_RUNS` (0 = disabled).
 
 ## Memory
 
