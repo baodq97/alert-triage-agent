@@ -84,6 +84,10 @@ L0 = journals (free). L1 = finding atoms persisted at verdict time, keyed by ent
 - **Pydantic strict mode** on alert envelope fields (no implicit coercion); payload dicts stay flexible.
 - **Typed errors with boundary conversion** (`errors.py`: `TriageError` → `LLMError`, `ToolError(transient|permanent)`, `GateError`, `JournalError`, `ConfigError`). Raise only inside the owning module; convert at every seam (tool failure → `ToolResult(ok=False)`; LLM retries exhausted → `run_terminated(error)` + partial verdict). No exception crosses two module boundaries — QA checks this seam.
 
+## Naming — ubiquitous language
+
+`UBIQUITOUS_LANGUAGE.md` (repo root) is the canonical vocabulary. Identifiers, journal event names, prompt wording, docstrings, and test names use those exact terms — e.g. `Finding` not "insight", `Observation` not "tool output", **Resume** (state rebuild) vs **Replay Mode** (eval cache) are different things, `Plan Step` vs executor `Step` are different counters. When a new domain concept appears, add it there first, then code it.
+
 ## Style
 
 - Python ≥3.11 syntax only (ruff/ty target py311 even though dev runs 3.12).
