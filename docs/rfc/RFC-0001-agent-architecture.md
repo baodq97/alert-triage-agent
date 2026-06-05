@@ -81,5 +81,5 @@ Recall is **entity-scoped**, not a monolithic blob: alert entities → matching 
 
 ## Security & operational risks
 
-- Prompt injection via alert `description` is acknowledged and out of scope for the exercise (mock data); a production note in the README covers input sanitization and tool-result quoting.
+- Adversarial alert content (prompt injection via `description` and any `entities`/`context` value) is a real product threat: containment posture is recorded in **ADR-0005** (separation, deterministic verdict validation, read-only mid-loop, untrusted recall). Fixture World data is benign; roadmap connectors ingest hostile input.
 - The journal contains investigation data — `runs/` is gitignored; production would need retention/PII policy.

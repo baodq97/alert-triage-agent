@@ -24,6 +24,8 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 | **Observation** | The result of one tool call as seen by the agent, including errors (`ToolResult`) | output, response |
 | **Reasoner** | The LLM decision after each Observation: continue, revise the plan, or conclude | judge (reserved for evals) |
 | **Fixture World** | The internally-consistent mock dataset behind all tools — every Entity tells the same story everywhere | stub data, mocks (alone) |
+| **TI Agent** | The delegated specialist mini-loop a Reasoner may invoke for an external IOC Entity — own prompt, own read-only TI tools, Journal Events tagged `agent: "threat-intel"` | sub-agent, second agent |
+| **TIReport** | The schema-validated structured result a TI Agent returns, consumed by the primary loop as one Observation (untrusted context) | intel report, enrichment (alone) |
 
 ## Verdict and actions
 
