@@ -27,7 +27,7 @@ In scope (hard requirements from the exercise):
 
 1. Receive an alert as JSON (stable envelope; `entities`/`context` payloads vary by event type)
 2. Plan an investigation via LLM reasoning — **not hardcoded**; new event types adapt without code changes
-3. ≥3 mock tools returning realistic stubbed data (`lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`, plus `block_user` as the gated action)
+3. ≥3 mock tools returning realistic stubbed data (`lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`), plus `block_user` as the gated **Response Action** (post-verdict only — never an investigation tool)
 4. Chain reasoning: each tool output feeds the decision about the next step
 5. Structured verdict: severity, findings, recommended actions, confidence
 6. Human-in-the-loop gate before any high-risk action
@@ -39,6 +39,7 @@ Product-grade additions (differentiators, in scope):
 - **Memory L0→L3** — runs feed finding atoms → entity dossiers → threat posture, so the agent gets smarter across runs (exercise bonus)
 - **Two-tier eval** — deterministic behavioral assertions on trajectories + advisory LLM judge, so prompt changes are regression-tested
 - **Autonomous adapters** — CLI one-shot and watch-mode folder ingestion
+- **Threat Intel Agent (stretch — claims exercise bonus 1)** — a delegated specialist mini-loop for external IOCs returning a structured TIReport as one Observation (US-0005); core + eval are never sacrificed for it
 
 ### Non-goals
 
@@ -49,7 +50,7 @@ Product-grade additions (differentiators, in scope):
 ## Success metrics
 
 - **Rubric coverage (primary):** every weighted area of the published evaluation rubric has a dedicated, demonstrable artifact — architecture 30% (module separation), reliability 25% (retry/timeout/guardrails visible in the journal), reasoning 20% (readable trace), code 15%, docs 10%. Target: 100% of hard requirements verifiably met (a requirements-traceability section in the README maps each to code/tests).
-- **Behavioral eval pass rate:** 100% of blocking assertions pass on the golden set (2 sample alerts + 1 unknown event type + 1 benign + 1 tool-failure case) before submission.
+- **Behavioral eval pass rate:** 100% of blocking assertions pass on the golden set (2 sample alerts + 1 unknown event type + 1 benign + 1 tool-failure + 1 benign-after-flagged case) before submission.
 - **Zero-touch rate (product KPI):** on the golden set, 100% of runs without high-risk actions complete with no human input; 0 high-risk actions execute without an approval event in the journal.
 - **Adaptability:** an alert with a never-seen event type produces a sensible plan and verdict with 0 code changes.
 
@@ -58,7 +59,7 @@ Product-grade additions (differentiators, in scope):
 1. **Decided (2026-06-05):** the agent **executes** mock containment actions immediately after approval; denial is recorded and the verdict still ships.
 2. The reviewer grades with their own LLM key — therefore the LLM client is OpenAI-compatible and provider choice is pure configuration (`.env`).
 3. "High-risk" classification is owned by a config-file risk policy, defaulting to conservative (unclassified = high-risk) — not by code or by the LLM.
-4. **Decided (2026-06-05): one approval gate per run.** All high-risk actions in a verdict pass through a single gate point before execution, batched into one approval request. Per-action approval and tiered gates (approver level by risk tier / blast radius) are roadmap items behind the `ApprovalGate` extension seam.
+4. **Decided (2026-06-05): one approval gate per run.** All high-risk actions in a verdict pass through a single gate point before execution, batched into one approval request. Per-action approval and tiered gates (approver level by action reversibility, blast radius, and AI confidence) are roadmap items behind the `ApprovalGate` extension seam.
 
 ## Open questions
 

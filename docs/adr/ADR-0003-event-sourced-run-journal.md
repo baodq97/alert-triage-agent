@@ -16,7 +16,7 @@ Four needs point at runtime state: an audit trail of every LLM/tool call, retry 
 
 ## Decision
 
-One append-only JSONL journal per run (`runs/<run_id>/journal.jsonl`) is the single runtime record. Every LLM call, plan, tool attempt, gate event, and verdict is an ordered event (`seq`). Resume rebuilds state from the journal — completed steps are never re-executed (LLM calls are non-deterministic; recorded results are reused). The approval flow rides on it: a pending gate exits as `awaiting_approval`; `--resume --approve|--deny` completes the run. Eval assertions read the journal directly.
+One append-only JSONL journal per run (`runs/<run_id>/journal.jsonl`) is the single runtime record. Every LLM call, plan, tool attempt, gate event, and verdict is an ordered event (`seq`). Resume rebuilds state from the journal — completed steps are never re-executed (LLM calls are non-deterministic; recorded results are reused). A step counts as completed only when its result event is written; a started step with no recorded result is the single re-entry point on resume; a torn final JSONL line is discarded. The approval flow rides on it: a pending gate exits as `awaiting_approval`; `--resume --approve|--deny` completes the run. Eval assertions read the journal directly.
 
 ## Alternatives considered
 
@@ -30,3 +30,4 @@ One append-only JSONL journal per run (`runs/<run_id>/journal.jsonl`) is the sin
 - (+) Replay mode gives key-free CI eval runs (cached LLM responses keyed by prompt hash).
 - (−) Journal schema is a load-bearing contract: a renamed field breaks replay and evals together — schema lives in `triage-conventions` and QA checks emitter/reader lockstep.
 - (−) Single-writer assumption (no concurrent runs on one run_id); acceptable, documented.
+- (−) `seq` gives ordering, not tamper-evidence — a writer with access to `runs/` can renumber undetectably; per-entry hash-chaining (`prev_hash`) is a roadmap item for a future ADR.
