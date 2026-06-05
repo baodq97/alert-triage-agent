@@ -15,6 +15,13 @@ product. `govkit verify` already passes — every change below is content, not m
 4. Watch-mode posture → **recommend-and-hold**: a high-risk action in watch mode exits the run
    at `awaiting_approval` and queues for a human `--resume --approve|--deny`; watch mode never
    auto-executes a high-risk action.
+5. Requirements bonus 1 (second specialized agent) → **adopted as stretch**, not declined:
+   **US-0005 "Threat Intel Agent"** (P2, stretch) — delegation when the reasoner meets an
+   external IOC entity; TI mini-loop returns a structured `TIReport` consumed as an Observation.
+   Cut line: core + eval are never sacrificed for the bonus; implement only if D4 has slack.
+6. Reviewer pass on `c194e42..HEAD` returned SHIP-WITH-CAVEATS. P1: PRD-0001 line 30 still
+   groups `block_user` with the investigation tools — must close (wave 3b) before any
+   implementation commit that depends on the Tool/Response-Action split.
 
 ## Constraints
 
@@ -41,6 +48,8 @@ Commit 1a (`UBIQUITOUS_LANGUAGE.md`, `AGENTS.md`, `triage-conventions/SKILL.md`)
       action only if no `action_executed` event exists for it; order check → execute → record.
 - [ ] Conventions, contracts: `Action = {name, params?, description?}`; RiskPolicy classifies on
       exact `Action.name` match (unmatched ⇒ high-risk); add `Action` to the `models.py` ports list.
+- [ ] Conventions, journal event schema: every event carries `agent: "triage" | "threat-intel"`
+      (default `"triage"`) — the one-line seam that keeps US-0005 additive.
 
 Commit 1b (US docs, all `open` — normal authoring):
 - [ ] US-0001 AC: a malformed LLM structured-output response triggers exactly one repair
@@ -53,7 +62,7 @@ Commit 1b (US docs, all `open` — normal authoring):
 - [ ] US-0004 scope + AC: on-demand L3 synthesis flag (e.g. `run.py --synthesize-posture`)
       works regardless of cadence, including `MEMORY_SYNTHESIZE_EVERY_N_RUNS=0`.
 
-## Wave 2 — ADR-0005 (1 commit, authored via `spec-author`)
+## Wave 2 — ADR-0005 + US-0005 (1 commit, authored via `spec-author`)
 
 - [ ] ADR-0005 "Adversarial alert content posture", `status: proposed`, `owner: TBD`, INDEX row.
   - Context: alert `description` + all `entities`/`context` values are attacker-controlled LLM
@@ -70,7 +79,19 @@ Commit 1b (US docs, all `open` — normal authoring):
     small token overhead per prompt.
 - [ ] RFC-0001 line 84: replace the "out of scope (mock data)" wording with a cross-reference to
       ADR-0005.
-- Human gate: Bao reviews and flips ADR-0005 status.
+- [ ] US-0005 "Threat Intel Agent collaboration" (`status: open`, `owner: TBD`, `priority: P2`,
+      marked stretch) + INDEX row.
+  - Delegation trigger: reasoner meets an external IOC entity (public IP, domain, hash) →
+    TI mini-loop (own prompt, own read-only TI tools: multi-source reputation, passive-DNS
+    fixture, threat-feed fixture) → structured `TIReport` returned as one Observation.
+  - ACs: delegation fires only for external IOCs; `TIReport` schema-validated; journal events
+    tagged `agent: "threat-intel"` give a readable hierarchical trace; primary loop consumes the
+    report as untrusted context (same labeling rule as ADR-0005 property 4).
+  - Cut line stated in the story: stretch — implement only if D4 has slack; core + eval never
+    sacrificed for the bonus.
+- [ ] Glossary: add rows **TI Agent** and **TIReport** (delegated mini-loop; structured report
+      consumed as an Observation).
+- Human gate: Bao reviews both artifacts, flips ADR-0005 status, assigns US-0005 owner.
 
 ## Wave 3 — amendments to accepted/approved docs (2 commits, per-doc review by Bao)
 
@@ -96,9 +117,10 @@ Commit 3b — remaining amendments:
 - [ ] ADR-0003 completed-step rule: a step counts completed only when its result event is
       written; a started step with no recorded result is the single re-entry point on resume; a
       torn final JSONL line is discarded.
-- [ ] PRD-0001 Non-goals: decline the requirements bonus "second specialized agent" — single-agent
-      depth over multi-agent breadth; the ToolRegistry/DataSource seam keeps a future
-      collaborating agent additive.
+- [ ] PRD-0001 line 30 (reviewer P1): reword scope item 3 — `block_user` is the gated Response
+      Action, not one of the mock investigation tools (sync with RFC/glossary vocabulary).
+- [ ] PRD-0001 scope: add stretch item — Threat Intel Agent collaboration (bonus 1), pointing to
+      US-0005; explicitly marked stretch with the cut line.
 - [ ] PRD-0001 assumption 4: sync tiered-gate axes wording with RFC line 78.
 - PRD memory numbering needs no edit (L0 canonized in glossary, wave 1).
 
