@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from triage.errors import ConfigError
-from triage.gate import ApprovalGate, AutoGate, CLIGate, RiskPolicy
+from triage.gate import HOLD, ApprovalGate, AutoGate, CLIGate, DeferredGate, RiskPolicy, is_hold
 from triage.models import Action, GateDecision
 
 if TYPE_CHECKING:
@@ -306,3 +306,50 @@ def test_cli_gate_accepts_whitespace_and_case_insensitive_yes(
 
 def test_a_plain_object_is_not_an_approval_gate() -> None:
     assert not isinstance(object(), ApprovalGate)
+
+
+# --------------------------------------------------------------------------- #
+# DeferredGate — the asynchronous-HITL seam (awaiting_approval)               #
+# --------------------------------------------------------------------------- #
+
+
+def test_deferred_gate_satisfies_the_approval_gate_protocol() -> None:
+    gate: ApprovalGate = DeferredGate(RecordingJournal())
+    assert isinstance(gate, ApprovalGate)
+
+
+def test_deferred_gate_zero_touch_returns_none_and_emits_nothing(tmp_path: Path) -> None:
+    journal = RecordingJournal()
+    gate = DeferredGate(journal)
+    policy = _high_risk_policy(tmp_path)
+
+    outcome = gate.request([Action(name="notify")], policy)
+
+    # No high-risk action -> Zero-touch: never parks, emits nothing (like AutoGate).
+    assert outcome is None
+    assert is_hold(outcome) is False
+    assert journal.events == []
+
+
+def test_deferred_gate_holds_on_high_risk_emitting_request_but_no_decision(tmp_path: Path) -> None:
+    journal = RecordingJournal()
+    gate = DeferredGate(journal)
+    policy = _high_risk_policy(tmp_path)
+
+    outcome = gate.request([Action(name="block_user", params={"user": "alice"})], policy)
+
+    # HOLD sentinel: gate_requested emitted, NO gate_decision — the pending shape
+    # Resume detects as awaiting_approval.
+    assert is_hold(outcome) is True
+    assert outcome is HOLD
+    names = [event for event, _, _ in journal.events]
+    assert names == ["gate_requested"]
+    request_payload = journal.events[0][1]
+    assert [a["name"] for a in request_payload["actions"]] == ["block_user"]
+    assert request_payload["risk"] == "high_risk"
+
+
+def test_hold_helper_rejects_a_decision_and_none() -> None:
+    assert is_hold(GateDecision(decision="denied", by="auto")) is False
+    assert is_hold(None) is False
+    assert repr(HOLD) == "HOLD"

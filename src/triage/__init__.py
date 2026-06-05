@@ -8,6 +8,9 @@ human approval. See docs/rfc/RFC-0001-agent-architecture.md for the design.
 from triage.core import (
     SCHEMA_VERSION,
     TriageDeps,
+    resume_approve,
+    resume_deny,
+    resume_investigation,
     summarize,
     triage,
 )
@@ -24,8 +27,23 @@ from triage.executor import (
     Executor,
     ObservationEntry,
 )
-from triage.gate import ApprovalGate, AutoGate, CLIGate, RiskPolicy
-from triage.journal import Journal, NoopJournal
+from triage.gate import (
+    HOLD,
+    ApprovalGate,
+    AutoGate,
+    CLIGate,
+    DeferredGate,
+    GateOutcome,
+    RiskPolicy,
+    is_hold,
+)
+from triage.journal import (
+    Journal,
+    JsonlJournal,
+    NoopJournal,
+    ReconstructedRun,
+    rebuild,
+)
 from triage.llm import (
     LLM,
     Completion,
@@ -34,6 +52,7 @@ from triage.llm import (
     OpenAICompatibleLLM,
     prompt_hash,
 )
+from triage.memory import FindingAtom, MemoryStore
 from triage.models import (
     Action,
     Alert,
@@ -72,6 +91,7 @@ __all__ = [
     "BLOCK_USER_TARGET_KEY",
     "DEGRADED_CONFIDENCE",
     "DEGRADED_SEVERITY",
+    "HOLD",
     "LLM",
     "SCHEMA_VERSION",
     "Action",
@@ -82,18 +102,23 @@ __all__ = [
     "Completion",
     "ConfigError",
     "DataSource",
+    "DeferredGate",
     "ExecutionResult",
     "Executor",
     "FakeLLM",
     "Finding",
+    "FindingAtom",
     "FixtureDataSource",
     "GateDecision",
     "GateError",
+    "GateOutcome",
     "InvestigationPlan",
     "InvestigationTool",
     "Journal",
     "JournalError",
+    "JsonlJournal",
     "LLMError",
+    "MemoryStore",
     "Message",
     "NoopJournal",
     "ObservationEntry",
@@ -101,6 +126,7 @@ __all__ = [
     "PlanStep",
     "Planner",
     "ReasonerDecision",
+    "ReconstructedRun",
     "RiskPolicy",
     "RunResult",
     "Severity",
@@ -117,7 +143,12 @@ __all__ = [
     "block_user",
     "block_user_target",
     "execute_tool",
+    "is_hold",
     "prompt_hash",
+    "rebuild",
+    "resume_approve",
+    "resume_deny",
+    "resume_investigation",
     "summarize",
     "triage",
 ]

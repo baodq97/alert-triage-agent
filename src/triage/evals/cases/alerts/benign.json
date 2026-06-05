@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-BENIGN-0001",
+  "timestamp": "2026-05-02T14:05:00Z",
+  "source": "edr",
+  "severity_hint": "low",
+  "event_type": "off_hours_login",
+  "description": "User 'dev-intern-jpark' logged in at 14:05 local time from their registered corporate device on the known office network. Flagged only because a coarse rule fired on a weekend timestamp; no other anomaly is present.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "source_ip": "203.0.113.22"
+  },
+  "context": {
+    "device_fingerprint": "known_corp_laptop",
+    "mfa_used": true,
+    "network": "office-vpn",
+    "weekend": true,
+    "note": "false-positive shape — the agent should dare to say low and take no high-risk action"
+  }
+}

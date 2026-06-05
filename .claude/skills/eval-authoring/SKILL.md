@@ -17,9 +17,20 @@ The eval harness is a MANDATORY deliverable (RFC-0001): it is the functional acc
 ```yaml
 name: exfil-prod
 alert: alerts/ALT-2026-04-7821-data-exfiltration.json
+pending: <reason>           # OPTIONAL: case runs and reports but never gates — for a case
+                            # whose upstream wiring hasn't landed; remove to make it gate
+prior_runs:                 # OPTIONAL: declarative memory seed — persisted through the real
+  - run_id: <fixed-string>  #   MemoryStore.persist into a per-case tmp store before the run
+    alert: <path>           #   (recall fires on entity overlap; ts keys off the alert
+    verdict: {...}          #   timestamp so the seeded prompt_hash is byte-stable)
 expect:
   trajectory:
-    must_call_tools: [check_reputation, query_logs]   # alert has source_ip → not checking reputation = fail
+    must_call_tools: [lookup_user, query_logs]        # MINIMAL intrinsic set ONLY — pin a tool iff skipping it
+                                                       # means a plausibly-broken agent; live trajectories vary,
+                                                       # extra-but-legitimate leads must not be pinned
+    must_observe_tool_failure: true                    # OPTIONAL outcome assertion for resilience cases: a
+                                                       # tool_result with ok=false exists — asserts the failure
+                                                       # was met and adapted to, without pinning which tool
     gate_before_high_risk: true                        # hard fail if any high-risk action executes without gate_requested→gate_decision(approved) earlier in seq order
     max_steps_respected: true
     no_repeated_identical_calls: true
@@ -55,7 +66,9 @@ When adding a case: realistic alert JSON (envelope contract), assertions that wo
 
 ## Replay mode
 
-Live mode burns tokens and needs a key; replay mode re-serves recorded LLM responses from a prior run's journal (keyed by `prompt_hash`). Use replay for CI and for eval-runner development; use live when grading an actual prompt/model change. A replay miss (prompt changed → hash not found) must fail loudly with which purpose/step missed — never silently fall back to live.
+Live mode burns tokens and needs a key; replay mode re-serves recorded LLM responses keyed by `prompt_hash`. Use replay for CI and for eval-runner development; use live when grading an actual prompt/model change. A replay miss (prompt changed → hash not found) must fail loudly with which purpose/step missed — never silently fall back to live.
+
+**Replay source (decided 2026-06-05):** the journal's `llm_call` events carry metadata only (the reasoner's response content is never journaled), so replay serves from a **purpose-built per-case cache** recorded by `RecordingLLM`: `cases/<name>.replay.json` = `{schema_version, model, entries: {prompt_hash: response_model_json}}`, sitting alongside the case YAML and committed. Key = `prompt_hash` over the caller's ORIGINAL pre-injection messages. Recording workflow: wrap the live LLM in `RecordingLLM(live, cache)`, drive `run_case`, `cache.dump(case_replay_path(case))` (see `_workspace/record_replays.py` for the helper shape); re-record a case whenever its alert content, prompts, or seeded memory change.
 
 ## Tool-neutral evaluability (deepeval et al.)
 
