@@ -20,7 +20,7 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 | **Investigation Plan** | The LLM-generated, structured sequence of intended Plan Steps for a Run | playbook, workflow, strategy |
 | **Plan Step** | One intended tool action within an Investigation Plan | task, stage |
 | **Step** | One iteration of the executor loop, counted against `MAX_STEPS` | turn, cycle |
-| **Tool** | A callable capability with a JSON schema and a Risk Tier (`lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`, `block_user`) | function, action (for lookups) |
+| **Tool** | A **read-only** investigation capability with a JSON schema (`lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`) — the executor can never mutate state | function, action (for lookups) |
 | **Observation** | The result of one tool call as seen by the agent, including errors (`ToolResult`) | output, response |
 | **Reasoner** | The LLM decision after each Observation: continue, revise the plan, or conclude | judge (reserved for evals) |
 | **Fixture World** | The internally-consistent mock dataset behind all tools — every Entity tells the same story everywhere | stub data, mocks (alone) |
@@ -34,6 +34,7 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 | **Severity** | The agent's concluded rating: `low / medium / high / critical` | priority, level |
 | **Confidence** | The agent's 0–1 self-assessment attached to the Verdict | certainty, score (alone) |
 | **Recommended Action** | A response the Verdict proposes (e.g. `block_user`, rotate key) | remediation, fix |
+| **Response Action** | An executable mutation (e.g. `block_user`) that runs ONLY in the post-Verdict gate flow — never callable as a Tool mid-investigation | tool (for mutations), remediation tool |
 | **High-risk Action** | A Recommended Action whose Risk Tier requires the Approval Gate before execution | dangerous action, critical action |
 
 ## Human-in-the-loop
@@ -99,5 +100,6 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 - **"step"** collided: a planned tool action vs an executor-loop iteration (what `MAX_STEPS` counts). Canonical: **Plan Step** for the former, **Step** for the latter.
 - **"agent"** means the triage product in all repo docs. The Claude Code build agents (`triage-implementer`, `triage-qa`) are **build agents** — never plain "agent" in repo prose.
 - **"eval"** means the agent eval harness (`make eval`). The docs-governance gate is always called **govkit eval** in full.
-- **"severity"** alone was ambiguous between intake hint and conclusion. Canonical: **Severity Hint** (input) vs **Severity** (Verdict field).
+- **"severity"** alone was ambiguous between intake hint and conclusion. Canonical: **Severity Hint** (input, free string — never validated against an enum) vs **Severity** (Verdict field, strict enum).
+- **"tool" vs "action"** collided on `block_user`: a **Tool** is read-only investigation; a **Response Action** mutates and runs only post-gate (decided 2026-06-05). `block_user` is a Response Action, never a Tool.
 - **"memory"** means the product's L1–L3 layer; the developer-tooling memory plugin is out of domain scope and always named in full (tencentdb-agent-memory).

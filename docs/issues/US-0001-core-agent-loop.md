@@ -15,7 +15,7 @@ As a SOC analyst, I want the agent to investigate any alert JSON end-to-end and 
 
 ## Scope
 
-`models.py`, `llm.py`, `tools/` (registry + 5 tools + fixture world), `planner.py`, `executor.py`, `gate.py`, `verdict.py`, `prompts/*.md`, `run.py --alert`, the 3 required tests.
+`models.py`, `errors.py`, `llm.py` (port + OpenAI-compatible impl + FakeLLM), `tools/` (registry + 4 read-only investigation tools + `block_user` response action + fixture world), `planner.py`, `executor.py`, `journal.py` (port + `NoopJournal` only), `gate.py`, `verdict.py`, `prompts/*.md`, `config/risk_policy.yaml`, `run.py --alert`, the 3 required tests.
 
 ## Acceptance criteria
 

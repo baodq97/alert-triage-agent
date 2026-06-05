@@ -28,7 +28,7 @@ alert.json → validate → PLANNER (LLM: structured InvestigationPlan)
 
 - **Alert contract:** Pydantic envelope (6 typed fields: `alert_id`, `timestamp`, `source`, `severity_hint`, `event_type`, `description`) + `entities`/`context` as pass-through dicts. New event types parse without code changes; the planner reads whatever keys exist. Strict per-event-type schemas were **rejected** — they reintroduce the hardcoding the exercise forbids.
 - **LLM boundary:** the `openai` SDK as the single wire format; provider, base URL, and model are env config (`LLM_BASE_URL`, `LLM_MODEL`). Swapping in DeepSeek/Ollama/vLLM is configuration, not code (covers the local-model bonus). Retries ×3 with exponential backoff, per-call timeout, one repair attempt on malformed structured output.
-- **Tools:** `ToolRegistry` of `Tool` (name, JSON schema, `risk_tier`) over a `DataSource` interface. The exercise ships `FixtureDataSource` — a consistent fixture world (the same entity tells the same story across `lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`); `block_user` is the high-risk action. Real connectors (Splunk, VirusTotal, Okta, CMDB) are an OSS roadmap item, interface-ready but explicitly not built.
+- **Tools:** `ToolRegistry` of `Tool` (name, JSON schema, `risk_tier`) over a `DataSource` interface — **read-only investigation tools only** (`lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`); the executor can never mutate state mid-loop. `block_user` is a **response action**, executed exclusively in the post-verdict gate flow (decided 2026-06-05). The exercise ships `FixtureDataSource` — a consistent fixture world (the same entity tells the same story across every tool). Real connectors (Splunk, VirusTotal, Okta, CMDB) are an OSS roadmap item, interface-ready but explicitly not built.
 - **HITL:** `RiskPolicy` is a config file mapping actions to risk tiers (unclassified ⇒ high-risk). `ApprovalGate` is a Protocol with two implementations: `CLIGate` (interactive) and `AutoGate` (policy-driven, default-deny — CI/headless). Production surfaces (ticket comment, Slack) are roadmap.
 
 ### Run journal (one mechanism, four jobs)
@@ -47,7 +47,7 @@ Append-only JSONL per run (`runs/<run_id>/journal.jsonl`): `run_started`, `llm_c
 | L0 | Run journals | already exists |
 | L1 | Finding atoms (entity-keyed facts from verdicts) | persisted at verdict time — findings are the atoms |
 | L2 | Entity dossiers (per IP/user/asset history) | deterministic group-by, no LLM |
-| L3 | Threat posture (org-level brief) | synthesized every N runs (1 LLM call); degradation path: deterministic top-N summary |
+| L3 | Threat posture (org-level brief) | config-driven cadence (`MEMORY_SYNTHESIZE_EVERY_N_RUNS`, 0 = disabled) + on-demand CLI trigger; degradation path: deterministic top-N summary |
 
 Recall is **entity-scoped**, not a monolithic blob: alert entities → matching atoms/dossiers + L3 brief (~hundreds of tokens) into the planner context. A repeat offender IP measurably sharpens the second run's plan.
 

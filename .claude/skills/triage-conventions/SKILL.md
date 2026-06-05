@@ -20,7 +20,8 @@ src/triage/
 ├── gate.py                 # RiskPolicy (YAML config) + ApprovalGate Protocol + CLIGate + AutoGate
 ├── verdict.py              # findings → structured Verdict (LLM)
 ├── memory/                 # L1 atoms, L2 dossiers, L3 posture; entity-scoped recall
-├── tools/                  # registry.py, base.py (Tool + DataSource Protocol), fixture_source.py, fixtures/*.json
+├── tools/                  # registry.py (4 read-only investigation tools), base.py (Tool + DataSource Protocol),
+│                           # actions.py (response actions: block_user — post-gate only), fixture_source.py, fixtures/*.json
 └── evals/                  # runner.py, cases/*.yaml, replay
 prompts/*.md                # ALL LLM prompts (planner.md, reasoner.md, verdict.md, judge.md)
 tests/test_{module}.py
@@ -32,7 +33,13 @@ Dependency direction: `models` ← everything; `journal`/`llm`/`tools`/`gate` ar
 
 ## Alert contract
 
-Typed envelope (required): `alert_id`, `timestamp`, `source`, `severity_hint`, `event_type`, `description`. Flexible payload: `entities: dict[str, Any]`, `context: dict[str, Any]` — passed through to the LLM untouched. **Never** branch on `event_type` in code; never define per-event-type schemas. Unknown event types must parse and plan without code changes.
+Typed envelope (required): `alert_id`, `timestamp`, `source`, `severity_hint`, `event_type`, `description`. **`severity_hint` is a free `str`** (required, non-empty, NOT an enum — upstream systems vary and unknown alerts must never fail validation at the door); only the agent's own `Verdict.severity` is the strict enum. Flexible payload: `entities: dict[str, Any]`, `context: dict[str, Any]` — passed through to the LLM untouched. **Never** branch on `event_type` in code; never define per-event-type schemas. Unknown event types must parse and plan without code changes.
+
+## Investigation tools vs response actions (decided 2026-06-05)
+
+- The `ToolRegistry` exposes **read-only investigation tools only**: `lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`. The executor can never mutate anything mid-loop.
+- **`block_user` is a Response Action, not an investigation tool.** It is never callable by the executor; it executes only in the post-verdict flow: Verdict → RiskPolicy → Approval Gate → approved → execute (mock), denied → recorded. One gate per run.
+- This makes the eval assertion `gate_before_high_risk` structurally sound: a high-risk `action_executed` event without a preceding `gate_decision(approved)` is impossible by construction, not by prompt discipline.
 
 ## Verdict contract
 
@@ -59,7 +66,25 @@ Renaming a field here is a breaking change for journal replay AND eval assertion
 
 ## HITL gate
 
-ONE gate per run, after verdict: all high-risk actions batched into a single approval request. Approved → execute immediately; denied → record, verdict still ships. Risk tiers come from a YAML risk policy config (action → tier); **unclassified actions default to high-risk**. `ApprovalGate` is a Protocol; impls: `CLIGate` (interactive), `AutoGate` (config-driven, default-deny — used in tests/CI). The gate is enforced by the executor, never delegated to LLM judgment.
+ONE gate per run, after verdict: all high-risk actions batched into a single approval request. Approved → execute immediately; denied → record, verdict still ships. Risk tiers come from `config/risk_policy.yaml` (action → tier); **unclassified actions default to high-risk**. `ApprovalGate` is a Protocol; impls: `CLIGate` (interactive), `AutoGate` (config-driven, default-deny — used in tests/CI). The gate is enforced by the run flow in code, never delegated to LLM judgment.
+
+## Ports-first (wave 1 lays every seam; later waves swap implementations only)
+
+Wave 1 MUST define these boundaries even where the real implementation comes later — otherwise waves 2–4 refactor wave-1 code and churn the 100%-covered tests:
+
+- **`LLM` port**: one Protocol the whole agent talks to; impls: `OpenAICompatibleLLM` (real) and `FakeLLM` (tests — see Test architecture).
+- **`Journal` port + `NoopJournal`**: the executor/planner/gate emit events from day one; wave 2 only adds `JsonlJournal`. Never add emit calls retroactively.
+- **`planner(alert, recall=None)`**: the recall parameter exists from wave 1 (always `None` until wave 3).
+- **Contracts in `models.py`**: `ReasonerDecision` (`continue | revise_plan | conclude` + rationale + next-step payload), `RunResult` (verdict + gate_decisions + executed_actions + run_id + terminated_reason — what `run.py` prints and evals read), alongside Alert/InvestigationPlan/PlanStep/Finding/Verdict/ToolResult.
+- **Structured output**: request `response_format` JSON schema when the endpoint supports it, ALWAYS with the prompt-instructed-JSON + parse + one-repair-attempt fallback. The fallback is load-bearing (Ollama/some vLLM lack json_schema — it is how the local-model bonus works), not a rare path.
+- **Risk policy file**: `config/risk_policy.yaml`, overridable via `RISK_POLICY_PATH` env.
+- **`prompt_hash`**: sha256 over the full rendered message list (model-agnostic); used in `llm_call` events and as the Replay Mode key.
+
+## Test architecture (resolves the 100%-coverage × real-LLM × no-key triangle)
+
+- **Tier A — deterministic suite (feeds the coverage gate):** all unit/integration tests run against `FakeLLM` with canned structured responses. `make check` stays green with no key and no network.
+- **Tier B — live smoke (`@pytest.mark.live`):** the "≥1 real LLM call" requirement; auto-**skipped when `LLM_API_KEY` is unset**, run manually before submission. Never counted on for coverage.
+- Unit tests assert **structural** properties only (valid plan schema, no crash, gate ordering); "plans sensibly" is LLM behavior — judged by the wave-3 live eval, never unit-asserted.
 
 ## Reliability rules
 
