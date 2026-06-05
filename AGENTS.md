@@ -40,3 +40,14 @@ front-matter, sets `owner: TBD` + the start status, updates `INDEX.md`, and self
 
 `npx govkit verify` is the source of truth (front-matter completeness + INDEX sync). The
 `PreToolUse` hook runs the per-write twin (`govkit audit-write`). Both run with no API key.
+
+## Harness: alert-triage-agent build
+
+**Goal:** implement the product defined by PRD-0001/RFC-0001 through staged waves with built-in QA and eval gates.
+
+**Trigger:** for any implementation/build/fix/extend request on the agent codebase (`src/triage/`, `tests/`, `prompts/`, `evals/`), use the `triage-build` skill — it orchestrates `triage-implementer` and `triage-qa` (both in `.claude/agents/`). Direct answers are fine for simple questions; governed-doc authoring stays with `spec-author`.
+
+**Changelog:**
+| Date | Change | Target | Reason |
+|------|--------|--------|--------|
+| 2026-06-05 | Initial harness: 2 agents + 3 skills | agents/, skills/ | build phase start |
