@@ -1,8 +1,8 @@
 ---
 id: RFC-0001
 title: Agent architecture — agentic core, run journal, memory, eval
-status: draft
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-05
 ---
 

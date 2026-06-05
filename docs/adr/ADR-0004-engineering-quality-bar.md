@@ -1,8 +1,8 @@
 ---
 id: ADR-0004
 title: Engineering quality bar — strictest lint/type gates, 100% coverage, typed error model
-status: proposed
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-05
 ---
 

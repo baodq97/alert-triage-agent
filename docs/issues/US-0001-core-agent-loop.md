@@ -2,7 +2,7 @@
 id: US-0001
 title: "Wave 1: core agent loop — alert in, verdict out, gated actions"
 status: open
-owner: TBD
+owner: baodq97
 date: 2026-06-05
 priority: P0
 ---

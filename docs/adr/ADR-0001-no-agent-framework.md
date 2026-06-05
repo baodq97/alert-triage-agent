@@ -1,8 +1,8 @@
 ---
 id: ADR-0001
 title: Raw Python agent loop — no agent framework
-status: proposed
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-05
 ---
 

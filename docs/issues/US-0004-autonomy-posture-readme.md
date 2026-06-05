@@ -2,7 +2,7 @@
 id: US-0004
 title: "Wave 4: watch mode, L3 threat posture, README"
 status: open
-owner: TBD
+owner: baodq97
 date: 2026-06-05
 priority: P1
 ---

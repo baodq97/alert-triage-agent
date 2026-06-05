@@ -1,8 +1,8 @@
 ---
 id: ADR-0002
 title: OpenAI-compatible API as the single LLM boundary
-status: proposed
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-05
 ---
 

@@ -1,8 +1,8 @@
 ---
 id: ADR-0003
 title: Event-sourced JSONL run journal as the single runtime record
-status: proposed
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-05
 ---
 

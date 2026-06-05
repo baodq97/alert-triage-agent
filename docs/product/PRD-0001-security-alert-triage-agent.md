@@ -1,8 +1,8 @@
 ---
 id: PRD-0001
 title: Autonomous security alert triage agent
-status: draft
-owner: TBD
+status: approved
+owner: baodq97
 date: 2026-06-05
 ---
 
