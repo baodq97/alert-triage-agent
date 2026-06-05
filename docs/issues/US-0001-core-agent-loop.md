@@ -27,3 +27,4 @@ As a SOC analyst, I want the agent to investigate any alert JSON end-to-end and 
 - [ ] Tool error returns as an observation — run never crashes
 - [ ] Tests: tool call, approval gate (deny path), tool-error edge case — all green under `make check`
 - [ ] A malformed LLM structured-output response triggers exactly one repair re-prompt; a second malformed response degrades to a lower-confidence/partial verdict — the run never crashes (deterministically testable with `FakeLLM`, no journal-event wording: US-0001 ships `NoopJournal` only)
+- [ ] Every prompt template delimits and labels untrusted alert payload apart from instructions (ADR-0005 property 1) — verifiable in `prompts/*.md`: alert content sits inside a labeled delimiter block, never interleaved with instructions

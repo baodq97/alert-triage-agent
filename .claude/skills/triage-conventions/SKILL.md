@@ -87,6 +87,10 @@ Wave 1 MUST define these boundaries even where the real implementation comes lat
 - **Risk policy file**: `config/risk_policy.yaml`, overridable via `RISK_POLICY_PATH` env.
 - **`prompt_hash`**: sha256 over the full rendered message list (model-agnostic); used in `llm_call` events and as the Replay Mode key.
 
+## Prompt-file rules (ADR-0005)
+
+All prompts live in `prompts/*.md` — never inline strings. Every template that includes alert content **delimits and labels the untrusted payload apart from instructions** (a generic labeled block, e.g. `<alert_payload>…</alert_payload>`; no per-event-type schema). Recalled memory gets the same labeling (untrusted context, with source run-id + confidence). Verdict safety is never delegated to prompt discipline — the deterministic checks (severity enum, RiskPolicy allowlist, target-entity invariant) enforce it in code.
+
 ## Test architecture (resolves the 100%-coverage × real-LLM × no-key triangle)
 
 - **Tier A — deterministic suite (feeds the coverage gate):** all unit/integration tests run against `FakeLLM` with canned structured responses. `make check` stays green with no key and no network.
