@@ -39,41 +39,78 @@ Flow (RFC-0001 §Core loop / triage-conventions):
    Verdict still ships.
 7. ``run_terminated`` — the single ``reason`` derived in step 2.
 
-``awaiting_approval`` cannot occur in wave 1: the CLI adapter is synchronous, so
-the gate resolves in-process and the Run never parks. The reason is reserved for
-the later async ``--watch`` / ``--resume`` adapters; ``triage`` never sets it.
+``awaiting_approval`` (wave 2): when the Run's gate cannot resolve in-process (a
+``DeferredGate`` — the asynchronous-HITL seam the watch adapter wires), ``request``
+returns the ``HOLD`` sentinel. ``triage`` then parks the Run: ``gate_requested`` was
+emitted, NO ``gate_decision`` follows, ``run_terminated(reason="awaiting_approval")``
+is emitted, and the ``RunResult`` carries ``terminated_reason="awaiting_approval"``
+with empty ``gate_decisions`` / ``executed_actions`` — the pending state ``--resume
+--approve|--deny`` completes. The Verdict's own ``terminated_reason`` stays the
+*investigation* reason (``completed``), not the run-level park — so the post-approve
+``RunResult`` rebuilt from the ``verdict`` event is naturally consistent.
+
+**Resume (wave 2, US-0002):** three reader-side entrypoints rebuild state from
+``runs/<run_id>/journal.jsonl`` (via ``journal.rebuild``) and continue the Run —
+*never* re-emitting ``run_started`` (the reopened journal already has it and just
+continues ``seq``):
+
+* ``resume_investigation`` — an interrupted Run (no ``run_terminated`` recorded):
+  the rebuilt Observations seed ``Executor.resume`` (completed Tool Steps reused
+  from the record, never re-executed; the reasoner is re-run because its verb was
+  never journaled), then the shared run *tail* synthesizes the Verdict, gates, and
+  terminates.
+* ``resume_approve`` / ``resume_deny`` — a pending Run (``awaiting_approval``):
+  emit the deferred ``gate_decision`` and, on approve, execute the High-risk batch
+  **idempotently** — per Action, execute only if no ``action_executed`` already
+  exists for it (check -> execute -> record), so a kill between execute and record
+  reuses the recorded result and never double-executes (US-0002 AC6). The Verdict
+  still ships on deny.
+
+**JournalError containment (wave 2):** ``emit`` can raise ``JournalError`` mid-Run
+and no inner caller catches it — colliding with "a Run never crashes / always ships
+a Verdict". ``triage`` catches it at this single boundary, degrades to a partial
+Verdict with ``terminated_reason="error"``, and makes a best-effort final
+``run_terminated`` emit (swallowing a secondary journal failure there). The CLI is
+already safe via its ``TriageError`` catch; this closes the in-``triage`` gap.
 """
 
 from __future__ import annotations
 
+import contextlib
+import json
 import uuid
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from triage.errors import LLMError
-from triage.executor import Executor
-from triage.models import RunResult
+from triage.errors import GateError, JournalError, LLMError
+from triage.executor import Executor, ObservationEntry
+from triage.gate import is_hold
+from triage.models import (
+    Action,
+    GateDecision,
+    InvestigationPlan,
+    PlanStep,
+    RunResult,
+    ToolResult,
+    Verdict,
+)
 from triage.planner import Planner
 from triage.tools.actions import block_user, block_user_target, is_targeted
-from triage.verdict import VerdictSynthesizer
+from triage.verdict import DEGRADED_CONFIDENCE, DEGRADED_SEVERITY, VerdictSynthesizer
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
-    from triage.gate import ApprovalGate, RiskPolicy
-    from triage.journal import Journal
+    from triage.gate import ApprovalGate, GateOutcome, RiskPolicy
+    from triage.journal import Journal, ReconstructedRun, StepObservation
     from triage.llm import LLM
+    from triage.memory import MemoryStore
     from triage.models import (
-        Action,
         Alert,
-        GateDecision,
         TerminatedReason,
-        ToolResult,
-        Verdict,
     )
     from triage.tools.base import DataSource
     from triage.tools.registry import ToolRegistry
-
-from dataclasses import dataclass, field
 
 SCHEMA_VERSION = 1
 """The run-record schema version stamped on ``run_started`` (lives only in the event)."""
@@ -96,6 +133,14 @@ class TriageDeps:
     ``run.py`` builds only the leaves and never reaches into the loop. ``max_steps``
     overrides the executor's ``MAX_STEPS`` guard (env / default 15 otherwise) —
     the seam the breach test drives cheaply.
+
+    ``memory`` is the entity-scoped Memory Store (RFC-0001 §Memory) — an optional
+    leaf collaborator. When present it is recalled into the planner context (recall
+    is untrusted, informs-never-dictates) and atoms are persisted at verdict time.
+    ``None`` (the deterministic-suite default) keeps the loop memory-free: no recall
+    block, no store writes — behavior identical to before the seam was wired. A
+    memory failure never crashes a Run (the store swallows its own IO faults), so no
+    new ``try/except`` is needed at this boundary.
     """
 
     llm: LLM
@@ -105,15 +150,25 @@ class TriageDeps:
     gate: ApprovalGate
     policy: RiskPolicy
     max_steps: int | None = field(default=None)
+    memory: MemoryStore | None = field(default=None)
 
 
-def triage(alert: Alert, deps: TriageDeps) -> RunResult:
+def triage(alert: Alert, deps: TriageDeps, *, run_id: str | None = None) -> RunResult:
     """Run one Alert through the full triage loop and return its ``RunResult``.
 
     Args:
         alert: The validated Alert envelope+payload under investigation.
         deps: The frozen dependency bundle (LLM, journal, registry, source, gate,
             policy, optional ``max_steps``).
+        run_id: The Run's identity. The adapter (``run.py``) mints it once and uses
+            the *same* id for the ``JsonlJournal`` directory (``runs/<run_id>``) and
+            this call, so ``journal.jsonl`` and ``result.json`` land together; a
+            ``JsonlJournal`` needs the run dir *before* ``triage`` runs (to emit
+            ``run_started``), so the id cannot originate inside ``triage`` once the
+            journal is real. Defaults to an internally-minted ``uuid4`` so existing
+            callers (and the deterministic suite) are untouched — run_id is Run
+            *identity*, not a collaborator, so it is a keyword param, not a
+            ``TriageDeps`` field.
 
     Returns:
         The versioned ``RunResult`` — verdict, gate decisions, executed actions,
@@ -121,28 +176,110 @@ def triage(alert: Alert, deps: TriageDeps) -> RunResult:
         partial verdict, tool/LLM failures convert to a ``terminated_reason``, and
         the gate decision either way still ships the verdict.
     """
-    run_id = str(uuid.uuid4())
-    deps.journal.emit(
-        "run_started",
-        {
-            "alert_id": alert.alert_id,
-            "config": {"max_steps": deps.max_steps},
-            "schema_version": SCHEMA_VERSION,
-        },
+    if run_id is None:
+        run_id = str(uuid.uuid4())
+    try:
+        deps.journal.emit(
+            "run_started",
+            {
+                "alert_id": alert.alert_id,
+                "config": {"max_steps": deps.max_steps},
+                "schema_version": SCHEMA_VERSION,
+            },
+        )
+        observations, terminated_reason = _investigate(alert, deps)
+        return _conclude_run(alert, deps, observations, terminated_reason, run_id=run_id)
+    except JournalError:
+        return _degraded_on_journal_error(deps, run_id)
+
+
+def _degraded_on_journal_error(deps: TriageDeps, run_id: str) -> RunResult:
+    """Contain a mid-Run ``JournalError`` into a partial Verdict (US-0001).
+
+    ``emit`` is the only inner call that raises ``JournalError`` and no inner caller
+    catches it; ``triage`` is the single boundary that does (triage-conventions
+    typed-errors seam). A failure can land *before* any Verdict exists (e.g. on
+    ``run_started``), so a degraded Verdict is built directly here — never routed
+    through the synthesizer, whose own ``verdict`` emit could re-raise. A Verdict
+    always ships regardless of where the journal broke.
+    """
+    verdict = Verdict(
+        severity=DEGRADED_SEVERITY,
+        findings=[],
+        recommended_actions=[],
+        confidence=DEGRADED_CONFIDENCE,
+        terminated_reason="error",
+    )
+    _best_effort_terminate(deps.journal, "error")
+    return RunResult(
+        run_id=run_id,
+        verdict=verdict,
+        gate_decisions=[],
+        executed_actions=[],
+        terminated_reason="error",
     )
 
-    observations, terminated_reason = _investigate(alert, deps)
+
+def _best_effort_terminate(journal: Journal, reason: TerminatedReason) -> None:
+    """Emit a final ``run_terminated`` on the degraded path, swallowing a re-failure.
+
+    The journal is already known-broken here (the containment branch), so a second
+    ``JournalError`` from this emit is expected and ignored — the in-memory
+    ``RunResult`` still ships (a Run never crashes).
+    """
+    # The journal is already known-broken; a secondary JournalError here has no
+    # recovery left and is deliberately suppressed (the in-memory RunResult ships).
+    with contextlib.suppress(JournalError):
+        journal.emit("run_terminated", {"reason": reason})
+
+
+def _conclude_run(
+    alert: Alert,
+    deps: TriageDeps,
+    observations: list[ToolResult],
+    terminated_reason: TerminatedReason,
+    *,
+    run_id: str,
+) -> RunResult:
+    """The shared run *tail*: synthesize the Verdict, gate, and terminate.
+
+    Reused by ``triage`` (fresh) and ``resume_investigation`` (interrupted Run) — it
+    never emits ``run_started`` (the reopened journal already has it). On a ``HOLD``
+    gate outcome the Run parks as ``awaiting_approval``: ``gate_requested`` was
+    emitted by the gate, no ``gate_decision`` follows, and the run-level
+    ``terminated_reason`` becomes ``awaiting_approval`` while the Verdict keeps its
+    investigation reason.
+    """
     synthesizer = VerdictSynthesizer(llm=deps.llm, journal=deps.journal)
     verdict = synthesizer.synthesize(
         alert,
         observations=observations,
         terminated_reason=terminated_reason,
     )
-
+    # Persist L1 atoms at verdict time (RFC-0001 §Memory: "finding atoms persisted at
+    # verdict time"). The guard is presence-only — any synthesized Verdict persists,
+    # degraded or not: atoms are per-(entity, finding), so a degraded-but-with-findings
+    # Verdict (e.g. a ``max_steps`` partial that still carried Findings through) writes
+    # its atoms, while an empty-findings Verdict no-ops in the store. This is the single
+    # persist point shared by ``triage`` (fresh) and ``resume_investigation`` (both
+    # funnel here); ``resume_approve`` / ``resume_deny`` never reach this tail, so a
+    # parked Run's Verdict (persisted here before it parked) is never re-persisted. The
+    # store is best-effort (swallows its own IO faults) — it cannot crash the Run.
+    if deps.memory is not None:
+        deps.memory.persist(run_id, alert, verdict)
     accepted = _accept_actions(alert, verdict.recommended_actions, deps.journal)
-    decision = deps.gate.request(accepted, deps.policy)
+    outcome = deps.gate.request(accepted, deps.policy)
+    if is_hold(outcome):
+        deps.journal.emit("run_terminated", {"reason": "awaiting_approval"})
+        return RunResult(
+            run_id=run_id,
+            verdict=verdict,
+            gate_decisions=[],
+            executed_actions=[],
+            terminated_reason="awaiting_approval",
+        )
+    decision = _as_decision(outcome)
     gate_decisions, executed = _resolve_gate(decision, accepted, deps)
-
     deps.journal.emit("run_terminated", {"reason": terminated_reason})
     return RunResult(
         run_id=run_id,
@@ -163,8 +300,13 @@ def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ToolResult], Term
     through.
     """
     planner = Planner(llm=deps.llm, journal=deps.journal, tool_specs=deps.registry.specs())
+    # Recall is entity-scoped and best-effort (the store never raises); ``None`` when
+    # no Memory Store is wired keeps the planner prompt memory-free. Recall feeds the
+    # plan call ONLY — ``resume_investigation`` reuses the journaled plan and never
+    # re-plans, so there is no recall to wire there.
+    recall = deps.memory.recall(alert) if deps.memory is not None else None
     try:
-        plan = planner.plan(alert)
+        plan = planner.plan(alert, recall=recall)
     except LLMError:
         return [], "error"
     executor = Executor(
@@ -226,6 +368,17 @@ def _accept_actions(
     return accepted
 
 
+def _as_decision(outcome: GateOutcome) -> GateDecision | None:
+    """Narrow a non-``HOLD`` gate outcome to ``GateDecision | None`` for the resolver.
+
+    ``_conclude_run`` handles ``HOLD`` before calling this, so the outcome here is
+    only a resolved ``GateDecision`` (approved / denied) or ``None`` (Zero-touch).
+    Returning ``None`` for anything else keeps the resolver's type honest without a
+    cast; a ``_Hold`` reaching here would be a caller bug.
+    """
+    return outcome if isinstance(outcome, GateDecision) else None
+
+
 def _resolve_gate(
     decision: GateDecision | None,
     accepted: Sequence[Action],
@@ -270,6 +423,227 @@ def _resolve_gate(
         deps.journal.emit("action_executed", {"action": action.model_dump(), "result": result})
         executed.append(action)
     return [decision], executed
+
+
+def resume_investigation(
+    alert: Alert,
+    deps: TriageDeps,
+    reconstructed: ReconstructedRun,
+    *,
+    run_id: str,
+) -> RunResult:
+    """Continue an interrupted Run from its rebuilt state (US-0002 AC3).
+
+    Precondition: the Run was killed mid-investigation — ``reconstructed`` has no
+    ``run_terminated`` (``is_interrupted()``). The reopened journal (passed in via
+    ``deps.journal``) already holds ``run_started`` and the recorded Tool Steps, so
+    this NEVER re-emits ``run_started`` and continues ``seq``.
+
+    What is **reused from the record vs re-run** (the resume contract):
+
+    * **Tool Steps — reused.** Each recorded ``tool_result`` rebuilt into an
+      ``ObservationEntry`` is seeded into ``Executor.resume`` as already-gathered
+      evidence, so no recorded ``tool_called`` / ``tool_result`` pair repeats — the
+      completed work is never re-executed.
+    * **Reasoner — re-run.** The reasoner's verb (``continue`` / ``revise`` /
+      ``conclude``) is *not* in the journal (``llm_call`` records only metadata), so
+      it is not reconstructable; ``Executor.resume`` re-fires the deferred reason
+      call over the rebuilt Observations with fresh LLM reasoning.
+
+    The investigation then continues into the shared run tail (synthesize -> gate ->
+    terminate), so a resumed Run reaches a Verdict exactly as a fresh one does.
+
+    Raises:
+        GateError: The Run is not interrupted (it already terminated or is pending)
+            — resuming an investigation that is not mid-flight is a misuse.
+    """
+    if not reconstructed.is_interrupted():
+        msg = (
+            f"cannot resume investigation of run {run_id}: it is not interrupted "
+            f"(terminated_reason={reconstructed.terminated_reason!r})"
+        )
+        raise GateError(msg)
+    plan = InvestigationPlan(steps=[PlanStep.model_validate(s) for s in reconstructed.plan_steps])
+    # Collapse the rebuilt Observations to ONE per executor Step: a transient tool
+    # retry records two ``tool_result`` events (two ``StepObservation`` rows) for a
+    # single Step (cf. AC2 retry visibility), and the executor keeps one Observation
+    # per Step. Last attempt wins (the recovered result, never the failed attempt),
+    # and ``next_step_index`` is the count of *Steps* consumed — never the row count,
+    # which a retry would inflate, silently dropping a remaining Plan Step.
+    by_step = {obs.step: obs for obs in reconstructed.observations}
+    pre_observations = [_rebuild_observation(by_step[step]) for step in sorted(by_step)]
+    next_step_index = max(by_step, default=0)
+    executor = Executor(
+        llm=deps.llm,
+        journal=deps.journal,
+        registry=deps.registry,
+        source=deps.source,
+        max_steps=deps.max_steps,
+    )
+    execution = executor.resume(
+        alert,
+        plan,
+        pre_observations=pre_observations,
+        next_step_index=next_step_index,
+    )
+    observations = [entry.result for entry in execution.observations]
+    return _conclude_run(alert, deps, observations, execution.terminated_reason, run_id=run_id)
+
+
+def resume_approve(
+    deps: TriageDeps,
+    reconstructed: ReconstructedRun,
+    *,
+    run_id: str,
+    by: str,
+) -> RunResult:
+    """Complete a pending Run by approving its parked High-risk batch (US-0002 AC6).
+
+    Precondition: the Run is ``awaiting_approval`` (``gate_requested`` recorded, no
+    ``gate_decision``). Emits the deferred ``gate_decision(approved, by=...)``, then
+    executes the batch **idempotently**: per Action, execute only if no
+    ``action_executed`` already exists for it (check -> execute -> record), so a kill
+    between execute and record reuses the recorded result on the next resume and
+    never double-executes. Needs no Alert — actions come from the recorded
+    ``gate_requested`` batch and the Verdict from the ``verdict`` event.
+
+    A ``JournalError`` here deliberately fail-stops (no containment): with a broken
+    journal the check -> execute -> record idempotency cannot be honored, so no
+    high-risk action may execute; the CLI converts it to a clean nonzero exit.
+
+    Raises:
+        GateError: The Run is not pending approval (no mutation occurs).
+    """
+    batch = _pending_batch(reconstructed, run_id)
+    deps.journal.emit("gate_decision", {"decision": "approved", "by": by})
+    decision = GateDecision(decision="approved", by=by)
+    already = _executed_targets(reconstructed)
+    executed: list[Action] = []
+    for action in batch:
+        if action.name in _ACTION_EXECUTORS and _action_key(action) in already:
+            # Recorded result reused (idempotency): the executor already ran for this
+            # action on a prior resume that was killed before recording completion.
+            executed.append(action)
+            continue
+        executed.extend(_execute_one(action, deps))
+    deps.journal.emit("run_terminated", {"reason": "completed"})
+    return _resumed_result(reconstructed, run_id, [decision], executed)
+
+
+def resume_deny(
+    deps: TriageDeps,
+    reconstructed: ReconstructedRun,
+    *,
+    run_id: str,
+    by: str,
+) -> RunResult:
+    """Complete a pending Run by denying its parked batch — the Verdict still ships.
+
+    Emits ``gate_decision(denied, by=...)`` then ``run_terminated(completed)``;
+    nothing executes. Needs no Alert (pure journal). A ``JournalError`` here
+    deliberately fail-stops (same posture as ``resume_approve``): the denial must be
+    durably recorded; the CLI converts it to a clean nonzero exit.
+
+    Raises:
+        GateError: The Run is not pending approval (no mutation occurs).
+    """
+    _pending_batch(reconstructed, run_id)
+    deps.journal.emit("gate_decision", {"decision": "denied", "by": by})
+    decision = GateDecision(decision="denied", by=by)
+    deps.journal.emit("run_terminated", {"reason": "completed"})
+    return _resumed_result(reconstructed, run_id, [decision], [])
+
+
+def _pending_batch(reconstructed: ReconstructedRun, run_id: str) -> list[Action]:
+    """Return the parked High-risk batch, or raise if the Run is not pending.
+
+    A pending Run is exactly ``awaiting_approval`` (``gate_requested`` recorded, no
+    ``gate_decision``); ``--approve|--deny`` on anything else is a misuse that must
+    mutate nothing.
+    """
+    if not reconstructed.is_awaiting_approval() or reconstructed.gate_requested is None:
+        msg = (
+            f"cannot approve/deny run {run_id}: it is not awaiting approval "
+            f"(terminated_reason={reconstructed.terminated_reason!r})"
+        )
+        raise GateError(msg)
+    raw_actions = reconstructed.gate_requested.get("actions", [])
+    return [Action.model_validate(a) for a in raw_actions]
+
+
+def _execute_one(action: Action, deps: TriageDeps) -> list[Action]:
+    """Execute one approved Action (or record ``action_skipped`` when unexecutable).
+
+    Mirrors ``_resolve_gate``'s post-gate dispatch for a single Action: an action
+    with a registered executor runs and records ``action_executed``; one without is
+    recorded ``action_skipped`` (a capability gap, never a crash) and not returned.
+    """
+    executor = _ACTION_EXECUTORS.get(action.name)
+    if executor is None:
+        deps.journal.emit(
+            "action_skipped",
+            {"action": action.model_dump(), "reason": "no executor for action"},
+        )
+        return []
+    result = executor(action)
+    deps.journal.emit("action_executed", {"action": action.model_dump(), "result": result})
+    return [action]
+
+
+def _executed_targets(reconstructed: ReconstructedRun) -> set[str]:
+    """Return the keys of Actions already recorded as ``action_executed``.
+
+    The idempotency ledger: an Action whose key is here was executed and recorded on
+    a prior resume, so it is reused (its recorded result stands), never re-applied.
+    """
+    executed = reconstructed.executed_actions()
+    return {_action_key(Action.model_validate(rec.action)) for rec in executed}
+
+
+def _action_key(action: Action) -> str:
+    """A stable identity for an Action for the idempotency check (name + params)."""
+    return json.dumps(
+        {"name": action.name, "params": action.params},
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+def _resumed_result(
+    reconstructed: ReconstructedRun,
+    run_id: str,
+    gate_decisions: list[GateDecision],
+    executed: list[Action],
+) -> RunResult:
+    """Build the ``RunResult`` for a completed resume from the recorded Verdict.
+
+    The Verdict is reconstructed from the ``verdict`` event (a pending Run always
+    shipped one before parking); ``terminated_reason`` is ``completed`` — the
+    resumed Run reached its conclusion.
+    """
+    verdict = Verdict.model_validate(reconstructed.verdict)
+    return RunResult(
+        run_id=run_id,
+        verdict=verdict,
+        gate_decisions=gate_decisions,
+        executed_actions=executed,
+        terminated_reason="completed",
+    )
+
+
+def _rebuild_observation(obs: StepObservation) -> ObservationEntry:
+    """Rebuild a recorded ``StepObservation`` into the executor's ``ObservationEntry``.
+
+    Reconstructs the ``ToolResult`` from the recorded ``ok`` + ``data``/``error`` so
+    the resumed executor reuses the exact recorded Observation — never re-running the
+    tool.
+    """
+    return ObservationEntry(
+        step=obs.step,
+        tool=obs.tool,
+        args=obs.args,
+        result=ToolResult(tool=obs.tool, ok=obs.ok, data=obs.data, error=obs.error),
+    )
 
 
 def summarize(result: RunResult) -> str:

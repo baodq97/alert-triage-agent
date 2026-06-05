@@ -29,7 +29,7 @@ from typing import TYPE_CHECKING, Any
 from triage.errors import ToolError
 from triage.executor import ExecutionResult, Executor, ObservationEntry
 from triage.llm import FakeLLM
-from triage.models import Alert, InvestigationPlan, PlanStep
+from triage.models import Alert, InvestigationPlan, PlanStep, ToolResult
 from triage.tools import ToolRegistry
 
 if TYPE_CHECKING:
@@ -418,3 +418,94 @@ def test_max_steps_unset_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) 
     executor.run(_alert(), _plan(_step()))
 
     assert executor._max_steps == 15  # noqa: SLF001 — assert the resolved guard.
+
+
+# --------------------------------------------------------------------------- #
+# resume — reason-first re-entry (US-0002 AC3)                                 #
+# --------------------------------------------------------------------------- #
+
+
+def _obs(step: int, tool: str = "lookup_user", entity: str = "alice") -> ObservationEntry:
+    """A rebuilt-from-journal Observation seeding the resume entry."""
+    return ObservationEntry(
+        step=step,
+        tool=tool,
+        args={"entity": entity},
+        result=ToolResult(tool=tool, ok=True, data={"entity": entity, "status": "benign"}),
+    )
+
+
+def test_resume_reasons_first_before_executing_any_new_step() -> None:
+    # The causality contract (advisor trap #1): resume must REASON over the rebuilt
+    # Observations before executing step 3 — the reason call authorizes the next
+    # step. So the FIRST journal line a resume writes is llm_call(reason), never
+    # tool_called. Here the reason concludes immediately, so no new tool runs.
+    journal = RecordingJournal()
+    executor = _executor(llm=FakeLLM([_decision("conclude")]), journal=journal)
+    plan = _plan(_step(entity="a"), _step(entity="b"), _step(entity="c"))
+    pre = [_obs(1, entity="a"), _obs(2, entity="b")]
+
+    result = executor.resume(_alert(), plan, pre_observations=pre, next_step_index=2)
+
+    assert journal.names()[0] == "llm_call"  # reason FIRST, not tool_called
+    assert journal.names() == ["llm_call"]  # conclude -> no further tool ran
+    assert result.terminated_reason == "completed"
+    # The rebuilt Observations are carried through; none re-executed.
+    assert [o.step for o in result.observations] == [1, 2]
+
+
+def test_resume_continues_from_the_next_step_without_replaying_recorded_ones() -> None:
+    # continue -> the executor runs ONLY the remaining (step 3) plan step; the two
+    # recorded steps are reused, never re-executed (no duplicate step/attempt pairs).
+    journal = RecordingJournal()
+    executor = _executor(
+        llm=FakeLLM([_decision("continue"), _decision("conclude")]),
+        journal=journal,
+    )
+    plan = _plan(_step(entity="a"), _step(entity="b"), _step(entity="c"))
+    pre = [_obs(1, entity="a"), _obs(2, entity="b")]
+
+    result = executor.resume(_alert(), plan, pre_observations=pre, next_step_index=2)
+
+    # First a reason over the rebuilt obs, THEN step 3 executes (called/result/reason).
+    assert journal.names() == ["llm_call", "tool_called", "tool_result", "llm_call"]
+    # Only one NEW tool_called — step 3 — at executor step 3.
+    called = journal.events[1][1]
+    assert called["step"] == 3
+    assert called["args"] == {"entity": "c"}
+    # Trajectory: the two reused + the one freshly executed.
+    assert [o.step for o in result.observations] == [1, 2, 3]
+    assert result.terminated_reason == "completed"
+
+
+def test_resume_revise_replaces_the_remaining_plan() -> None:
+    journal = RecordingJournal()
+    new_step = _step(tool="query_logs", entity="z")
+    executor = _executor(
+        llm=FakeLLM([_decision("revise_plan", next_step=new_step), _decision("conclude")]),
+        journal=journal,
+    )
+    plan = _plan(_step(entity="a"), _step(entity="b"))
+    pre = [_obs(1, entity="a")]
+
+    result = executor.resume(_alert(), plan, pre_observations=pre, next_step_index=1)
+
+    # revise emits plan_revised, then the revised step runs.
+    assert "plan_revised" in journal.names()
+    assert result.observations[-1].tool == "query_logs"
+    assert result.terminated_reason == "completed"
+
+
+def test_resume_llm_error_on_the_first_reason_terminates_error() -> None:
+    # The reason re-fire fails: resume returns terminated_reason="error" with the
+    # rebuilt Observations intact — never crashing, no new tool ran.
+    journal = RecordingJournal()
+    executor = _executor(llm=FakeLLM([]), journal=journal)  # exhausted script -> LLMError
+    plan = _plan(_step(entity="a"), _step(entity="b"))
+    pre = [_obs(1, entity="a")]
+
+    result = executor.resume(_alert(), plan, pre_observations=pre, next_step_index=1)
+
+    assert result.terminated_reason == "error"
+    assert [o.step for o in result.observations] == [1]
+    assert journal.events == []  # no llm_call metadata on the error path

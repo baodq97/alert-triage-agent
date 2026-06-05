@@ -1,0 +1,17 @@
+{
+  "alert_id": "ALT-2026-04-7821-data-exfiltration",
+  "timestamp": "2026-04-19T02:41:00Z",
+  "source": "edr",
+  "severity_hint": "critical",
+  "event_type": "data_exfiltration",
+  "description": "Service account 'svc-deploy-prod' read and egressed a large volume of customer records to an external IP far outside its deployment role. This prior run concluded HIGH severity and is the memory the benign follow-up alert must NOT be poisoned by.",
+  "entities": {
+    "service_account": "svc-deploy-prod",
+    "source_ip": "203.0.113.66"
+  },
+  "context": {
+    "bytes_egressed": 4200000000,
+    "destination": "external",
+    "note": "prior high-severity run seeding the memory-poisoning discipline test"
+  }
+}

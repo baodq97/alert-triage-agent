@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -134,6 +135,38 @@ class ExecutionResult(BaseModel):
     final_rationale: str | None = None
 
 
+@dataclass
+class _Dispatch:
+    """The internal result of applying one Reasoner decision in the loop.
+
+    Either ``terminated`` is set (the decision ended the Run — conclude or a
+    degenerate revision) or it is ``None`` and ``pending`` is the plan to walk next
+    (``continue`` keeps the current pending; ``revise_plan`` replaces it). Never
+    both — a private helper for the shared loop, not a public seam.
+    """
+
+    terminated: ExecutionResult | None = None
+    pending: list[PlanStep] = field(default_factory=list)
+
+
+@dataclass
+class _LoopState:
+    """The mutable bookkeeping the ReAct walk carries across Steps.
+
+    Bundled into one object so ``run`` and ``resume`` seed the shared ``_loop``
+    without a long keyword-argument list: ``pending`` is the plan still to walk,
+    ``observations`` the gathered trajectory, ``attempted`` the repeat-call-guard
+    set, ``guard_notes`` the off-trajectory nudges, and ``step`` the
+    ``MAX_STEPS``-counted iteration count (seeded to the rebuilt count on resume).
+    """
+
+    pending: list[PlanStep]
+    observations: list[ObservationEntry]
+    attempted: set[tuple[str, str]]
+    guard_notes: list[str]
+    step: int
+
+
 class Executor:
     """Walks an Investigation Plan as the ReAct loop, gathering Observations."""
 
@@ -178,66 +211,162 @@ class Executor:
             An ``ExecutionResult`` with the Observation trajectory and the
             ``terminated_reason`` — never raising on a tool or LLM failure.
         """
-        pending: list[PlanStep] = list(plan.steps)
-        observations: list[ObservationEntry] = []
-        attempted: set[tuple[str, str]] = set()
-        guard_notes: list[str] = []
-        step = 0
+        return self._loop(
+            alert,
+            _LoopState(
+                pending=list(plan.steps),
+                observations=[],
+                attempted=set(),
+                guard_notes=[],
+                step=0,
+            ),
+        )
 
-        while pending:
-            if step >= self._max_steps:
+    def resume(
+        self,
+        alert: Alert,
+        plan: InvestigationPlan,
+        *,
+        pre_observations: Sequence[ObservationEntry],
+        next_step_index: int,
+    ) -> ExecutionResult:
+        """Continue an interrupted investigation from its rebuilt Observations.
+
+        The single re-entry point for ``--resume`` on an interrupted Run (US-0002
+        AC3). Completed Tool Steps are **reused from the record, never re-executed**
+        — their ``ObservationEntry`` trajectory is rebuilt from the journal and
+        seeded here, so no recorded ``tool_called`` / ``tool_result`` pair repeats.
+
+        The executor loop is *execute-then-reason*: each fresh Step executes a tool
+        and only then reasons about whether to proceed. The reasoner's verb is
+        **not** in the journal (``llm_call`` records only metadata), so it is not
+        reconstructable and must be re-run. Resume therefore **reasons first** over
+        the rebuilt Observations — the deferred "what next?" decision over the last
+        recorded Step — and dispatches it (conclude -> done; revise -> the new Plan
+        Step is the only pending one; continue -> walk the remaining plan), *then*
+        drops into the same loop. This avoids the causality bug of executing the
+        next Step before the reason call that authorizes it.
+
+        Args:
+            alert: The Alert under investigation (re-validated by the adapter).
+            plan: The original ``InvestigationPlan`` (its Plan Steps index the
+                remaining work; rebuilt from the journal's ``plan_created``).
+            pre_observations: The Observation trajectory rebuilt from the journal,
+                **one entry per executor Step** (the caller collapses a retried
+                Step's multiple recorded results to its last attempt) — seeded as
+                already-gathered evidence (reused, not re-run). ``step`` seeds the
+                ``MAX_STEPS`` counter from this length.
+            next_step_index: The index into ``plan.steps`` of the first *unexecuted*
+                Plan Step (the count of completed executor Steps — not recorded
+                result rows, which a retry would inflate). ``continue`` walks from
+                here; ``revise`` discards it for the new step.
+
+        Returns:
+            An ``ExecutionResult`` whose trajectory includes the reused Observations
+            plus any new ones — never raising on a tool or LLM failure.
+        """
+        observations = list(pre_observations)
+        state = _LoopState(
+            pending=list(plan.steps[next_step_index:]),
+            observations=observations,
+            attempted={(o.tool, _args_key(o.args)) for o in observations},
+            guard_notes=[],
+            step=len(observations),
+        )
+
+        # Reason first over the rebuilt Observations — the deferred decision the
+        # killed Run never recorded. No fresh tool ran yet, so its first journal
+        # line is ``llm_call(reason)``, never ``tool_called`` (the causality fix).
+        try:
+            decision = self._reason(
+                alert=alert,
+                observations=state.observations,
+                guard_notes=state.guard_notes,
+            )
+        except LLMError:
+            return ExecutionResult(observations=state.observations, terminated_reason="error")
+        outcome = self._dispatch(decision, state.observations, pending=state.pending)
+        if outcome.terminated is not None:
+            return outcome.terminated
+        state.pending = outcome.pending
+        return self._loop(alert, state)
+
+    def _loop(self, alert: Alert, state: _LoopState) -> ExecutionResult:
+        """The shared ReAct walk — execute a Step, reason, dispatch, repeat.
+
+        Shared by ``run`` (fresh, ``step=0``) and ``resume`` (seeded with the rebuilt
+        Observations and the post-reason ``pending``). Each iteration executes the
+        next Plan Step, then reasons and dispatches the decision.
+        """
+        while state.pending:
+            if state.step >= self._max_steps:
                 return ExecutionResult(
-                    observations=observations,
+                    observations=state.observations,
                     terminated_reason="max_steps",
                 )
-            step += 1
-            plan_step = pending.pop(0)
+            state.step += 1
+            plan_step = state.pending.pop(0)
             self._execute_step(
-                step=step,
+                step=state.step,
                 plan_step=plan_step,
-                attempted=attempted,
-                observations=observations,
-                guard_notes=guard_notes,
+                attempted=state.attempted,
+                observations=state.observations,
+                guard_notes=state.guard_notes,
             )
             try:
                 decision = self._reason(
                     alert=alert,
-                    observations=observations,
-                    guard_notes=guard_notes,
+                    observations=state.observations,
+                    guard_notes=state.guard_notes,
                 )
             except LLMError:
-                return ExecutionResult(
-                    observations=observations,
-                    terminated_reason="error",
-                )
-            if decision.decision == "conclude":
-                return ExecutionResult(
-                    observations=observations,
-                    terminated_reason="completed",
-                    final_rationale=decision.rationale,
-                )
-            if decision.decision == "revise_plan" and decision.next_step is not None:
-                pending = [decision.next_step]
-                self._journal.emit(
-                    "plan_revised",
-                    {"steps": [decision.next_step.model_dump()]},
-                )
-            elif decision.decision == "revise_plan":
-                # ``revise_plan`` with no ``next_step`` is a degenerate revision —
-                # there is nothing to run next, so the loop ends like a conclude.
-                return ExecutionResult(
-                    observations=observations,
-                    terminated_reason="completed",
-                    final_rationale=decision.rationale,
-                )
-            # ``continue`` falls through: ``pending`` is walked as-is.
+                return ExecutionResult(observations=state.observations, terminated_reason="error")
+            outcome = self._dispatch(decision, state.observations, pending=state.pending)
+            if outcome.terminated is not None:
+                return outcome.terminated
+            state.pending = outcome.pending
 
         # The plan (and every revision) was exhausted without a ``conclude``: the
         # gathered Observations stand as a completed trajectory for the verdict.
-        return ExecutionResult(
-            observations=observations,
-            terminated_reason="completed",
-        )
+        return ExecutionResult(observations=state.observations, terminated_reason="completed")
+
+    def _dispatch(
+        self,
+        decision: ReasonerDecision,
+        observations: list[ObservationEntry],
+        *,
+        pending: list[PlanStep],
+    ) -> _Dispatch:
+        """Apply one Reasoner decision, returning either a terminal result or the next pending plan.
+
+        * ``conclude`` -> terminal ``completed`` with the rationale.
+        * ``revise_plan`` with a ``next_step`` -> that step replaces the remaining
+          plan (emits ``plan_revised``); without one it is a degenerate revision
+          (nothing to run next) and ends like a conclude.
+        * ``continue`` -> the current ``pending`` is walked as-is.
+        """
+        if decision.decision == "conclude":
+            return _Dispatch(
+                terminated=ExecutionResult(
+                    observations=observations,
+                    terminated_reason="completed",
+                    final_rationale=decision.rationale,
+                ),
+            )
+        if decision.decision == "revise_plan" and decision.next_step is not None:
+            self._journal.emit("plan_revised", {"steps": [decision.next_step.model_dump()]})
+            return _Dispatch(pending=[decision.next_step])
+        if decision.decision == "revise_plan":
+            # ``revise_plan`` with no ``next_step`` is a degenerate revision —
+            # there is nothing to run next, so the loop ends like a conclude.
+            return _Dispatch(
+                terminated=ExecutionResult(
+                    observations=observations,
+                    terminated_reason="completed",
+                    final_rationale=decision.rationale,
+                ),
+            )
+        return _Dispatch(pending=pending)  # ``continue`` — walk pending as-is.
 
     def _execute_step(
         self,

@@ -1,0 +1,18 @@
+{
+  "alert_id": "ALT-EVAL-UNKNOWN-0001",
+  "timestamp": "2026-05-01T08:22:10Z",
+  "source": "experimental-sensor",
+  "severity_hint": "unknown",
+  "event_type": "quantum_side_channel_emission",
+  "description": "Sensor 'lab-qsc-3' reported an unclassified electromagnetic emission pattern correlated with key-material access on host research-hsm-7. This event_type has never been seen before and has no predefined handler.",
+  "entities": {
+    "host": "research-hsm-7",
+    "sensor": "lab-qsc-3",
+    "operator": "dev-intern-jpark"
+  },
+  "context": {
+    "emission_band_mhz": 2401,
+    "correlation_score": 0.71,
+    "note": "novel category — must plan without code changes"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "alert_id": "ALT-EVAL-TOOLFAIL-0001",
+  "timestamp": "2026-05-03T09:30:00Z",
+  "source": "siem",
+  "severity_hint": "medium",
+  "event_type": "suspicious_outbound_connection",
+  "description": "Host 'ghost-host-unregistered' opened an outbound connection to external IP 198.51.100.250 on port 4444. The host does not appear in the CMDB and has no owner on record.",
+  "entities": {
+    "host": "ghost-host-unregistered",
+    "source_ip": "198.51.100.250"
+  },
+  "context": {
+    "dest_port": 4444,
+    "bytes_out": 1200,
+    "first_seen": "2026-05-03T09:28:41Z"
+  }
+}

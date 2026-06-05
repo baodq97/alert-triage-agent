@@ -33,16 +33,19 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from triage.core import SCHEMA_VERSION, TriageDeps, summarize, triage
-from triage.errors import ToolError
-from triage.gate import AutoGate, RiskPolicy
+from triage.errors import JournalError, ToolError
+from triage.gate import AutoGate, DeferredGate, RiskPolicy
 from triage.journal import NoopJournal
-from triage.llm import FakeLLM, OpenAICompatibleLLM
+from triage.llm import Completion, FakeLLM, OpenAICompatibleLLM
+from triage.memory import MemoryStore
 from triage.models import Alert
 from triage.tools import FixtureDataSource, ToolRegistry
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Mapping, Sequence
 
+    from triage.llm import Message
+    from triage.models import InvestigationPlan
     from triage.tools.base import DataSource
 
 # --- doubles -----------------------------------------------------------------
@@ -451,6 +454,133 @@ def test_summarize_renders_verdict_and_gate(tmp_path: Path) -> None:
     assert str(tmp_path) not in text  # sanity: summary is self-contained
 
 
+# --- memory seam: recall into the planner + persist at verdict time ----------
+
+
+class _CapturingLLM(FakeLLM):
+    """A FakeLLM that records the message list of EVERY ``complete`` call.
+
+    ``FakeLLM.last_messages`` is overwritten per call, so the first (plan) call's
+    rendered prompt is lost by the time the verdict call lands. This subclass keeps
+    the full history so a test can inspect the plan prompt specifically — the rendered
+    ``<recalled_memory>`` block is asserted on the prompt the planner actually sent.
+    """
+
+    def __init__(self, script: list[str]) -> None:
+        super().__init__(script)
+        self.all_messages: list[list[Message]] = []
+
+    def complete(
+        self,
+        messages: Sequence[Message],
+        response_model: type[InvestigationPlan],
+    ) -> Completion[InvestigationPlan]:
+        completion = super().complete(messages, response_model)
+        self.all_messages.append(list(messages))
+        return completion
+
+
+def test_recall_flows_into_the_planner_prompt(tmp_path: Path) -> None:
+    # A prior Run persists an atom for entity "alice"; the next Run over an alert that
+    # names "alice" recalls it, and the recalled content lands inside the labeled
+    # <recalled_memory> block of the plan prompt (untrusted context, ADR-0005).
+    store = MemoryStore(base_dir=tmp_path)
+    seed_llm = _CapturingLLM([_plan("lookup_user"), _conclude(), _verdict()])
+    seed_deps = TriageDeps(
+        llm=seed_llm,
+        journal=RecordingJournal(),
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(RecordingJournal()),
+        policy=RiskPolicy(),
+        memory=store,
+    )
+    triage(_alert(), seed_deps, run_id="seed-run")
+
+    capture = _CapturingLLM([_plan("lookup_user"), _conclude(), _verdict()])
+    deps = TriageDeps(
+        llm=capture,
+        journal=RecordingJournal(),
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(RecordingJournal()),
+        policy=RiskPolicy(),
+        memory=store,
+    )
+    triage(_alert(), deps, run_id="recall-run")
+
+    plan_prompt = capture.all_messages[0][0]["content"]
+    assert "<recalled_memory>" in plan_prompt
+    assert "</recalled_memory>" in plan_prompt
+    # The seeded finding statement is rendered inside the untrusted block.
+    assert "anomaly observed" in plan_prompt
+    assert "seed-run" in plan_prompt  # the source run-id travels with the recall item
+
+
+def test_persist_writes_atoms_after_a_run(tmp_path: Path) -> None:
+    # A Run with a Memory Store persists one L1 atom per (matchable entity, finding).
+    # The verdict ships a single finding; the alert names entities user=alice + ip,
+    # so recall over the same alert returns the atom afterward.
+    store = MemoryStore(base_dir=tmp_path)
+    deps = TriageDeps(
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict()]),
+        journal=RecordingJournal(),
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(RecordingJournal()),
+        policy=RiskPolicy(),
+        memory=store,
+    )
+    triage(_alert(), deps, run_id="persist-run")
+
+    recalled = store.recall(_alert())
+    assert recalled  # atoms were written and are recallable
+    assert any("anomaly observed" in item["content"] for item in recalled)
+    assert all(item["run_id"] == "persist-run" for item in recalled)
+
+
+def test_empty_findings_verdict_persists_nothing(tmp_path: Path) -> None:
+    # A degraded path that ships no findings writes no atoms (atoms are per-finding):
+    # the presence-only guard still calls persist, and the store no-ops on empty
+    # findings — recall stays empty.
+    store = MemoryStore(base_dir=tmp_path)
+    # Both plan and verdict fail (malformed + repair) -> degraded verdict, no findings.
+    deps = TriageDeps(
+        llm=FakeLLM(["bad", "bad", "bad", "bad"]),
+        journal=RecordingJournal(),
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(RecordingJournal()),
+        policy=RiskPolicy(),
+        memory=store,
+    )
+    result = triage(_alert(), deps, run_id="empty-run")
+
+    assert result.verdict.findings == []
+    assert store.recall(_alert()) == []
+
+
+def test_memory_none_no_recall_block_and_no_writes(tmp_path: Path) -> None:
+    # memory=None (the deterministic-suite default) keeps behavior identical: the plan
+    # prompt carries NO recalled_memory block, and nothing is written to a store.
+    capture = _CapturingLLM([_plan("lookup_user"), _conclude(), _verdict()])
+    deps = TriageDeps(
+        llm=capture,
+        journal=RecordingJournal(),
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(RecordingJournal()),
+        policy=RiskPolicy(),
+        memory=None,
+    )
+    triage(_alert(), deps, run_id="no-memory-run")
+
+    plan_prompt = capture.all_messages[0][0]["content"]
+    assert "<recalled_memory>" not in plan_prompt
+    # No store was constructed, so nothing landed under tmp_path.
+    assert list(tmp_path.iterdir()) == []
+
+
 # --- Tier B: live smoke (real LLM; auto-skipped without a key) ----------------
 
 
@@ -478,3 +608,159 @@ def test_live_real_llm_produces_verdict() -> None:  # pragma: no cover  # live-o
     result = triage(alert, deps)
     assert result.verdict is not None
     assert result.verdict.severity in {"low", "medium", "high", "critical"}
+
+
+# --- awaiting_approval: the DeferredGate parks the Run (wave 2) ---------------
+
+
+def test_deferred_gate_high_risk_parks_run_as_awaiting_approval() -> None:
+    # A high-risk action through the DeferredGate exits awaiting_approval:
+    # gate_requested emitted, NO gate_decision, run_terminated(awaiting_approval),
+    # RunResult reflects the pending state, the Verdict still shipped.
+    actions = [_block_user("alice")]
+    rec = RecordingJournal()
+    deps = TriageDeps(
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict(actions=actions)]),
+        journal=rec,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=DeferredGate(rec),
+        policy=RiskPolicy(),
+    )
+
+    result = triage(_alert(), deps)
+
+    assert result.terminated_reason == "awaiting_approval"
+    assert result.gate_decisions == []
+    assert result.executed_actions == []
+    assert "gate_requested" in rec.names()
+    assert "gate_decision" not in rec.names()
+    assert "action_executed" not in rec.names()
+    assert rec.names()[-1] == "run_terminated"
+    assert rec.payloads("run_terminated")[0]["reason"] == "awaiting_approval"
+    # The Verdict still ships; its own terminated_reason is the investigation reason.
+    assert result.verdict.findings
+    assert result.verdict.terminated_reason == "completed"
+
+
+def test_deferred_gate_zero_touch_completes_normally() -> None:
+    # No high-risk action -> the DeferredGate never parks; the Run completes.
+    rec = RecordingJournal()
+    deps = TriageDeps(
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict()]),
+        journal=rec,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=DeferredGate(rec),
+        policy=RiskPolicy(),
+    )
+
+    result = triage(_alert(), deps)
+
+    assert result.terminated_reason == "completed"
+    assert "gate_requested" not in rec.names()
+
+
+# --- JournalError containment at the triage() boundary (wave 2) --------------
+
+
+class _RaisingJournal:
+    """A Journal that raises JournalError on the Nth emit (and after, if asked)."""
+
+    def __init__(self, fail_on: str) -> None:
+        self._fail_on = fail_on
+        self.names: list[str] = []
+
+    def emit(
+        self,
+        event: str,
+        payload: Mapping[str, Any],  # noqa: ARG002 — protocol signature.
+        *,
+        agent: str = "triage",  # noqa: ARG002 — protocol signature.
+    ) -> None:
+        self.names.append(event)
+        if event == self._fail_on:
+            msg = f"simulated journal IO fault on {event!r}"
+            raise JournalError(msg)
+
+
+def test_journal_error_on_run_started_degrades_to_partial_verdict() -> None:
+    # The earliest possible failure: emit raises on run_started, before any verdict
+    # exists. triage contains it, ships a degraded partial verdict, terminated=error.
+    journal = _RaisingJournal(fail_on="run_started")
+    deps = TriageDeps(
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict()]),
+        journal=journal,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(journal),
+        policy=RiskPolicy(),
+    )
+
+    result = triage(_alert(), deps, run_id="run-jnl-fail")
+
+    assert result.run_id == "run-jnl-fail"
+    assert result.terminated_reason == "error"
+    assert result.verdict.terminated_reason == "error"
+    assert result.verdict.confidence == 0.0
+    assert result.gate_decisions == []
+    # Best-effort run_terminated was attempted after the failure.
+    assert "run_terminated" in journal.names
+
+
+def test_journal_error_mid_run_still_ships_a_verdict() -> None:
+    # A failure deeper in the run (on tool_result) is contained the same way — a
+    # Run never crashes; a verdict always ships (US-0001).
+    journal = _RaisingJournal(fail_on="tool_result")
+    deps = TriageDeps(
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict()]),
+        journal=journal,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(journal),
+        policy=RiskPolicy(),
+    )
+
+    result = triage(_alert(), deps)
+
+    assert result.terminated_reason == "error"
+    assert result.verdict is not None
+
+
+class _AlwaysFailingJournal:
+    """A Journal whose every emit raises — including the best-effort terminate."""
+
+    def __init__(self) -> None:
+        self.names: list[str] = []
+
+    def emit(
+        self,
+        event: str,
+        payload: Mapping[str, Any],  # noqa: ARG002 — protocol signature.
+        *,
+        agent: str = "triage",  # noqa: ARG002 — protocol signature.
+    ) -> None:
+        self.names.append(event)
+        msg = f"every emit fails — including the best-effort terminate ({event!r})"
+        raise JournalError(msg)
+
+
+def test_best_effort_terminate_swallows_a_secondary_journal_failure() -> None:
+    # The degraded path's final run_terminated can itself fail; that secondary
+    # JournalError is swallowed and the in-memory RunResult still ships.
+    journal = _AlwaysFailingJournal()
+    deps = TriageDeps(
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict()]),
+        journal=journal,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(journal),
+        policy=RiskPolicy(),
+    )
+
+    result = triage(_alert(), deps)
+
+    assert result.terminated_reason == "error"
+    assert result.verdict is not None
+    # Both the run_started failure AND the best-effort run_terminated were attempted.
+    assert journal.names == ["run_started", "run_terminated"]

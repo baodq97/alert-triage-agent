@@ -9,24 +9,31 @@ Three parts:
   so a new Response Action cannot slip past the gate by omission. A missing,
   malformed, or wrong-shape policy file is a configuration fault: ``ConfigError``.
 * ``ApprovalGate`` is the Protocol the run flow consumes; ``CLIGate`` (interactive
-  stdin) and ``AutoGate`` (config-driven, default-deny — tests / CI) implement it.
+  stdin), ``AutoGate`` (config-driven, default-deny — tests / CI), and
+  ``DeferredGate`` (the asynchronous-HITL seam — wave 2) implement it.
 * ONE gate per Run, after the Verdict: ``request`` takes the Verdict's full
   ``recommended_actions`` plus the ``RiskPolicy``, batches every High-risk Action
-  into a single approval request, and returns the ``GateDecision`` — or ``None``
-  when nothing is high-risk (a **Zero-touch** run, no gate events emitted). The
-  gate returns the decision; it never executes the actions — executing the
-  approved batch and recording denials is the run flow's job (RFC-0001 §Tools).
+  into a single approval request, and returns one of three outcomes — the
+  ``GateDecision`` (resolved in-process), ``None`` when nothing is high-risk (a
+  **Zero-touch** run, no gate events emitted), or the ``HOLD`` sentinel when the
+  gate cannot resolve interactively and the Run must park as ``awaiting_approval``
+  for ``--resume --approve|--deny`` (RFC-0001 §Runtime surfaces — the watch adapter
+  wires this resume-capable flow). The gate returns the outcome; it never executes
+  the actions — executing the approved batch and recording denials is the run
+  flow's job (RFC-0001 §Tools).
 
-Both implementations share ``_request`` so the emit ordering (``gate_requested``
-before asking, ``gate_decision`` after) lives in exactly one place: each impl
-supplies only how it *obtains* the human decision.
+Both resolving implementations share ``_BaseGate.request`` so the emit ordering
+(``gate_requested`` before asking, ``gate_decision`` after) lives in exactly one
+place: each impl supplies only how it *obtains* the human decision. ``DeferredGate``
+overrides ``request`` to emit ``gate_requested`` and then *stop* — no
+``gate_decision`` — which is exactly the journal shape Resume detects as pending.
 """
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast, get_args, runtime_checkable
+from typing import TYPE_CHECKING, Final, Literal, Protocol, cast, get_args, runtime_checkable
 
 import yaml
 
@@ -37,6 +44,35 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from triage.journal import Journal
+
+
+class _Hold:
+    """The gate-deferred sentinel: the High-risk batch needs an out-of-band human.
+
+    A distinct type (not ``None`` — that is Zero-touch — and not a ``GateDecision``
+    — that is resolved) so the core flow tells the three gate outcomes apart by
+    type, never by a magic value. One module-level instance, ``HOLD``, is the only
+    value; the class is private so callers compare against ``HOLD`` / ``is_hold``.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        """A stable repr for debugging / test output."""
+        return "HOLD"
+
+
+HOLD: Final[_Hold] = _Hold()
+"""The single gate-deferred sentinel — the Run parks as ``awaiting_approval``."""
+
+GateOutcome = GateDecision | _Hold | None
+"""What a gate's ``request`` returns: resolved decision, ``HOLD``, or Zero-touch ``None``."""
+
+
+def is_hold(outcome: GateOutcome) -> bool:
+    """Return whether a gate outcome is the deferred ``HOLD`` sentinel."""
+    return outcome is HOLD
+
 
 _DEFAULT_POLICY_PATH = Path(__file__).resolve().parents[2] / "config" / "risk_policy.yaml"
 
@@ -123,7 +159,7 @@ class ApprovalGate(Protocol):
         self,
         actions: Sequence[Action],
         policy: RiskPolicy,
-    ) -> GateDecision | None:
+    ) -> GateOutcome:
         """Batch the High-risk Actions in ``actions`` into one approval request.
 
         Args:
@@ -132,9 +168,12 @@ class ApprovalGate(Protocol):
             policy: The Risk Policy that classifies each action.
 
         Returns:
-            The ``GateDecision`` for the batch, or ``None`` for a Zero-touch run
-            (no High-risk Action — no gate events emitted). The gate never
-            executes the actions; the run flow does.
+            One of three outcomes — a ``GateDecision`` (resolved in-process),
+            ``None`` for a Zero-touch run (no High-risk Action — no gate events),
+            or ``HOLD`` when the decision must come out of band and the Run parks
+            as ``awaiting_approval`` (``gate_requested`` emitted, no
+            ``gate_decision``). The gate never executes the actions; the run flow
+            does.
         """
         ...  # pragma: no cover  # Protocol signature, never executed.
 
@@ -200,3 +239,43 @@ class CLIGate(_BaseGate):
         prompt = f"Approve {len(batch)} high-risk action(s) [{names}]? [y/N]: "
         reply = input(prompt).strip().lower()
         return "approved" if reply in self._APPROVALS else "denied"
+
+
+class DeferredGate:
+    """The asynchronous-HITL gate — defers the decision to a later ``--resume``.
+
+    Used where a Run cannot resolve the gate in-process (RFC-0001 §Runtime
+    surfaces: the watch adapter and any non-interactive ingestion). On a High-risk
+    batch it emits ``gate_requested`` and then returns ``HOLD`` *without* a
+    ``gate_decision`` — so the core flow parks the Run as ``awaiting_approval`` and
+    the journal carries exactly the pending shape Resume detects (a
+    ``gate_requested`` with no following ``gate_decision``). A Zero-touch run (no
+    High-risk Action) returns ``None`` and emits nothing, identical to the resolving
+    gates — deferral applies only when there is actually something to approve.
+
+    It does *not* extend ``_BaseGate``: the base couples ``gate_requested`` and
+    ``gate_decision`` around one ``_decide`` call, and the whole point here is to
+    emit the first and skip the second. Sharing batching is not worth re-coupling
+    the two emits the base deliberately pairs.
+    """
+
+    def __init__(self, journal: Journal) -> None:
+        """Bind the Journal the ``gate_requested`` event emits to."""
+        self._journal = journal
+
+    def request(self, actions: Sequence[Action], policy: RiskPolicy) -> GateOutcome:
+        """Emit ``gate_requested`` for the High-risk batch and defer (``HOLD``).
+
+        Returns ``None`` (emitting nothing) when the batch is empty — a Zero-touch
+        run never parks. Otherwise emits the single ``gate_requested`` and returns
+        ``HOLD``; no ``gate_decision`` is emitted, which is the pending journal
+        shape Resume completes on ``--approve|--deny``.
+        """
+        batch = policy.high_risk(actions)
+        if not batch:
+            return None
+        self._journal.emit(
+            "gate_requested",
+            {"actions": [action.model_dump() for action in batch], "risk": _HIGH_RISK},
+        )
+        return HOLD

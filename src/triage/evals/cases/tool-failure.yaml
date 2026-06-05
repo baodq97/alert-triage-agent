@@ -1,0 +1,28 @@
+# Guards: a tool erroring mid-run still yields a verdict and never crashes the run.
+#
+# Failure injection is entity-based: every entity in the alert is unknown to the
+# Fixture World, so WHATEVER investigation tool the agent reaches for returns a
+# permanent not-found ToolResult(ok=false). The guard therefore asserts the OUTCOME
+# (`must_observe_tool_failure`: a failed tool_result exists, the run completes, a
+# verdict with cited findings ships) instead of pinning which tool fails — a live
+# recording investigated via check_reputation + get_asset_info (never query_logs)
+# and was correct; tool-name pinning flapped on that reasonable route.
+name: tool-failure
+alert: src/triage/evals/cases/alerts/tool-failure.json
+expect:
+  trajectory:
+    must_observe_tool_failure: true                  # the resilience point: a failure was met and adapted to
+    gate_before_high_risk: true
+    no_action_without_gate: true
+    max_steps_respected: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed]                # a tool error is an observation, not a crash → completed
+  verdict:
+    severity_in: [low, medium, high, critical]       # any valid enum — the point is a verdict exists at all
+    confidence_min: 0.0
+    verdict_has_findings_with_citations: true
+reference:
+  expected_tools: []
+  expected_actions: []
+  ordered: false
+  exact: false
