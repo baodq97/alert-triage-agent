@@ -1,0 +1,48 @@
+[project]
+name = "alert-triage-agent"
+version = "0.1.0"
+description = "Autonomous security alert triage agent — plans investigations, chains tool reasoning, and gates high-risk actions behind human approval"
+readme = "README.md"
+authors = [
+    { name = "Bao Do", email = "bao.do@nois.vn" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=2.41.0",
+    "pydantic>=2.13.4",
+    "python-dotenv>=1.2.2",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+alert-triage-agent = "triage:main"
+
+[build-system]
+requires = ["uv_build>=0.11.18,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "triage"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "ruff>=0.15.16",
+    "ty>=0.0.44",
+]

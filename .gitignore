@@ -3,6 +3,16 @@ node_modules/
 dist/
 build/
 
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# agent runtime artifacts
+runs/
+
 # env / secrets
 .env
 .env.*
@@ -12,3 +22,4 @@ build/
 # os / editor
 .DS_Store
 Thumbs.db
+.raws
