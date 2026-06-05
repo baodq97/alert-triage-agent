@@ -38,6 +38,8 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 | **Recommended Action** | A response the Verdict proposes (e.g. `block_user`, `rotate_key`) | remediation, fix |
 | **Response Action** | An executable mutation (e.g. `block_user`) that runs ONLY in the post-Verdict gate flow — never callable as a Tool mid-investigation | tool (for mutations), remediation tool |
 | **High-risk Action** | A Recommended Action whose Risk Tier requires the Approval Gate before execution | dangerous action, critical action |
+| **Rejected Action** | A targeted Recommended Action dropped **before** the Approval Gate by the deterministic target-entity invariant (its target is missing or not an alert Entity); Journal Event `action_rejected` | filtered action, invalid action (alone) |
+| **Skipped Action** | An **approved** High-risk Action that could not be executed (no registered executor); recorded as Journal Event `action_skipped`, never silently dropped | failed action, unexecuted action (alone) |
 
 ## Human-in-the-loop
 
