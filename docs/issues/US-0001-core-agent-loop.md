@@ -26,3 +26,4 @@ As a SOC analyst, I want the agent to investigate any alert JSON end-to-end and 
 - [ ] `MAX_STEPS` (default 15) breach terminates gracefully with a partial verdict
 - [ ] Tool error returns as an observation — run never crashes
 - [ ] Tests: tool call, approval gate (deny path), tool-error edge case — all green under `make check`
+- [ ] A malformed LLM structured-output response triggers exactly one repair re-prompt; a second malformed response degrades to a lower-confidence/partial verdict — the run never crashes (deterministically testable with `FakeLLM`, no journal-event wording: US-0001 ships `NoopJournal` only)
