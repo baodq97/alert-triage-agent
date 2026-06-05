@@ -16,7 +16,7 @@ src/triage/
 ├── llm.py                  # OpenAI-compatible client: retry ×3 exp backoff, timeout, 1 repair attempt on bad structured output
 ├── planner.py              # alert (+ memory recall) → InvestigationPlan  (LLM, structured)
 ├── executor.py             # ReAct loop: step → tool → observation → reason (continue|revise|conclude); max-steps guard; repeat-call guard
-├── journal.py              # append-only JSONL emit + replay/rebuild state
+├── journal.py              # append-only JSONL emit + rebuild state for resume
 ├── gate.py                 # RiskPolicy (YAML config) + ApprovalGate Protocol + CLIGate + AutoGate
 ├── verdict.py              # findings → structured Verdict (LLM)
 ├── memory/                 # L1 atoms, L2 dossiers, L3 posture; entity-scoped recall
@@ -67,7 +67,7 @@ One JSON object per line, append-only, never mutated. Common fields: `seq` (mono
 
 A `tool_called`→`tool_result` pair shares the same `step` + `attempt` — reconstructable without positional inference (eval adapters depend on this).
 
-Renaming a field here is a breaking change for journal replay AND eval assertions — update all three together.
+Renaming a field here is a breaking change for resume rebuild AND eval assertions — update all three together.
 
 ## HITL gate
 

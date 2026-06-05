@@ -37,7 +37,7 @@ Append-only JSONL per run (`runs/<run_id>/journal.jsonl`): `run_started`, `llm_c
 
 1. **Audit trail** — every call captured, tamper-evident ordering (`seq`)
 2. **Retry visibility** — each attempt is an event; transient tool errors retry with backoff, permanent errors return to the agent as observations (it adapts or concludes with lower confidence; never crashes)
-3. **Resume/recovery** — `run.py --resume <run_id>` replays the journal to rebuild state and continues from the last incomplete step; completed steps are never re-run (LLM calls are non-deterministic). Approval flow rides on this: a pending gate exits as `awaiting_approval`; `--resume --approve|--deny` completes the run
+3. **Resume/recovery** — `run.py --resume <run_id>` rebuilds state from the journal and continues from the last incomplete step; completed steps are never re-run (LLM calls are non-deterministic). Approval flow rides on this: a pending gate exits as `awaiting_approval`; `--resume --approve|--deny` completes the run
 4. **Eval trace** — assertions read the journal directly; no extra instrumentation
 
 ### Memory (L0→L3, mirrors tencentdb-agent-memory)

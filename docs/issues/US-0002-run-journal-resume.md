@@ -15,7 +15,7 @@ As a security engineer, I want every agent action captured in an append-only jou
 
 ## Scope
 
-`journal.py` (emit + replay), retry instrumentation in `llm.py`/`tools/`, `run.py --resume <run_id> [--approve|--deny]`.
+`journal.py` (emit + rebuild for resume), retry instrumentation in `llm.py`/`tools/`, `run.py --resume <run_id> [--approve|--deny]`.
 
 ## Acceptance criteria
 
@@ -23,5 +23,5 @@ As a security engineer, I want every agent action captured in an append-only jou
 - [ ] A transient tool failure shows attempt 1 (error) + attempt 2 (retry) as separate journal events
 - [ ] Kill the process after step 2 → `--resume <run_id>` completes the run without re-executing recorded steps → verdict produced
 - [ ] Pending approval exits as `awaiting_approval`; `--resume --approve` executes the action, `--deny` records and concludes
-- [ ] Journal replay test green under `make check`
+- [ ] Journal resume/rebuild test green under `make check`
 - [ ] On `--resume --approve`, a high-risk action executes only if no `action_executed` event exists for it (check → execute → record); killing the process between execute and record never double-executes on the next resume
