@@ -21,8 +21,8 @@ Builds the product defined by PRD-0001/RFC-0001 using the project agents. **Exec
 | Wave | Scope | Definition of Done |
 |---|---|---|
 | 1 (D1–2) | `models` → `llm` → `tools` (registry + fixtures) → `planner` → `executor` → `gate` → `verdict` → `run.py --alert` | `make check` green; the 3 required tests exist (tool call, approval gate, tool error); both sample alerts produce a verdict end-to-end |
-| 2 (D2–3) | `journal` (emit + replay) → retry visibility → `--resume [--approve\|--deny]` | journal written per run; kill-after-step-2 → resume → correct verdict; gate rides on resume |
-| 3 (D3) | **eval harness (mandatory, not cuttable)** → memory L1–L2 + entity-scoped recall | `make eval` runs the 5-case golden set; replay mode works key-free |
+| 2 (D2–3) | `journal` (emit + rebuild for resume) → retry visibility → `--resume [--approve\|--deny]` | journal written per run; kill-after-step-2 → resume → correct verdict; gate rides on resume |
+| 3 (D3) | **eval harness (mandatory, not cuttable)** → memory L1–L2 + entity-scoped recall | `make eval` runs the 6-case golden set; replay mode works key-free |
 | 4 (D4) | L3 posture (degradable to deterministic) → `--watch` → README | full sweep QA; README sections per PRD (incl. assumptions, trade-offs, requirements traceability) |
 
 Within a wave, dispatch `triage-implementer` (model: opus) per module group sequentially when dependent, in parallel (background) when independent. After each module group lands, dispatch `triage-qa` (model: opus) scoped to the new seams (incremental QA). Both agents read `triage-conventions` themselves — do not paste conventions into prompts; pass module scope + RFC section + allowed files + acceptance criteria.

@@ -16,7 +16,7 @@ src/triage/
 ├── llm.py                  # OpenAI-compatible client: retry ×3 exp backoff, timeout, 1 repair attempt on bad structured output
 ├── planner.py              # alert (+ memory recall) → InvestigationPlan  (LLM, structured)
 ├── executor.py             # ReAct loop: step → tool → observation → reason (continue|revise|conclude); max-steps guard; repeat-call guard
-├── journal.py              # append-only JSONL emit + replay/rebuild state
+├── journal.py              # append-only JSONL emit + rebuild state for resume
 ├── gate.py                 # RiskPolicy (YAML config) + ApprovalGate Protocol + CLIGate + AutoGate
 ├── verdict.py              # findings → structured Verdict (LLM)
 ├── memory/                 # L1 atoms, L2 dossiers, L3 posture; entity-scoped recall
@@ -40,33 +40,40 @@ Typed envelope (required): `alert_id`, `timestamp`, `source`, `severity_hint`, `
 - The `ToolRegistry` exposes **read-only investigation tools only**: `lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`. The executor can never mutate anything mid-loop.
 - **`block_user` is a Response Action, not an investigation tool.** It is never callable by the executor; it executes only in the post-verdict flow: Verdict → RiskPolicy → Approval Gate → approved → execute (mock), denied → recorded. One gate per run.
 - This makes the eval assertion `gate_before_high_risk` structurally sound: a high-risk `action_executed` event without a preceding `gate_decision(approved)` is impossible by construction, not by prompt discipline.
+- **Target invariant:** `block_user` (and any targeted response action) must reference an entity present in the alert envelope/payload; a verdict whose action target is not an alert entity is rejected before the gate.
 
 ## Verdict contract
 
 `severity` (enum: `low|medium|high|critical`), `findings: list[Finding]` (each cites the tool observation it came from), `recommended_actions: list[Action]`, `confidence: float 0–1`, plus `terminated_reason` when ended early (max-steps, fatal error). Partial verdicts on graceful termination are mandatory — never exit without a verdict.
 
+`Action = {name, params?, description?}`. `RiskPolicy` classifies on exact `Action.name` match; unmatched names default to high-risk.
+
 ## Journal event schema
 
-One JSON object per line, append-only, never mutated. Common fields: `seq` (monotonic int), `ts` (ISO-8601), `event`. Event types and their payload fields:
+One JSON object per line, append-only, never mutated. Common fields: `seq` (monotonic int), `event_id` (uuid — adapters bind to ids, not log positions), `ts` (ISO-8601), `event`, `agent` (`"triage"` default; `"threat-intel"` for the US-0005 delegated loop). Event types and their payload fields:
 
 | event | payload |
 |---|---|
-| `run_started` | `alert_id`, `config` |
+| `run_started` | `alert_id`, `config`, `schema_version` |
 | `llm_call` | `purpose` (plan/reason/verdict/judge), `model`, `prompt_hash`, `tokens`, `latency_ms` |
 | `plan_created` / `plan_revised` | `steps` |
 | `tool_called` | `step`, `tool`, `args`, `attempt` |
-| `tool_result` | `step`, `ok`, `data` \| `error` |
+| `tool_result` | `step`, `attempt`, `ok`, `data` \| `error` |
 | `gate_requested` | `actions` (batched), `risk` |
 | `gate_decision` | `decision` (approved/denied), `by` |
 | `action_executed` | `action`, `result` |
 | `verdict` | full verdict object |
 | `run_terminated` | `reason` (completed/max_steps/awaiting_approval/error) |
 
-Renaming a field here is a breaking change for journal replay AND eval assertions — update all three together.
+A `tool_called`→`tool_result` pair shares the same `step` + `attempt` — reconstructable without positional inference (eval adapters depend on this).
+
+Renaming a field here is a breaking change for resume rebuild AND eval assertions — update all three together.
 
 ## HITL gate
 
 ONE gate per run, after verdict: all high-risk actions batched into a single approval request. Approved → execute immediately; denied → record, verdict still ships. Risk tiers come from `config/risk_policy.yaml` (action → tier); **unclassified actions default to high-risk**. `ApprovalGate` is a Protocol; impls: `CLIGate` (interactive), `AutoGate` (config-driven, default-deny — used in tests/CI). The gate is enforced by the run flow in code, never delegated to LLM judgment.
+
+**Resume idempotency:** on `--resume --approve`, execute a high-risk action only if no `action_executed` event exists for it; order is check → execute → record, so a recorded result is reused, never re-applied.
 
 ## Ports-first (wave 1 lays every seam; later waves swap implementations only)
 
@@ -75,10 +82,14 @@ Wave 1 MUST define these boundaries even where the real implementation comes lat
 - **`LLM` port**: one Protocol the whole agent talks to; impls: `OpenAICompatibleLLM` (real) and `FakeLLM` (tests — see Test architecture).
 - **`Journal` port + `NoopJournal`**: the executor/planner/gate emit events from day one; wave 2 only adds `JsonlJournal`. Never add emit calls retroactively.
 - **`planner(alert, recall=None)`**: the recall parameter exists from wave 1 (always `None` until wave 3).
-- **Contracts in `models.py`**: `ReasonerDecision` (`continue | revise_plan | conclude` + rationale + next-step payload), `RunResult` (verdict + gate_decisions + executed_actions + run_id + terminated_reason — what `run.py` prints and evals read), alongside Alert/InvestigationPlan/PlanStep/Finding/Verdict/ToolResult.
+- **Contracts in `models.py`**: `ReasonerDecision` (`continue | revise_plan | conclude` + rationale + next-step payload), `RunResult` (verdict + gate_decisions + executed_actions + run_id + terminated_reason — what `run.py` prints and evals read; persisted as a **versioned run record** at `runs/<run_id>/result.json`, which external eval adapters read instead of importing `src/triage`), `Action`, alongside Alert/InvestigationPlan/PlanStep/Finding/Verdict/ToolResult.
 - **Structured output**: request `response_format` JSON schema when the endpoint supports it, ALWAYS with the prompt-instructed-JSON + parse + one-repair-attempt fallback. The fallback is load-bearing (Ollama/some vLLM lack json_schema — it is how the local-model bonus works), not a rare path.
 - **Risk policy file**: `config/risk_policy.yaml`, overridable via `RISK_POLICY_PATH` env.
 - **`prompt_hash`**: sha256 over the full rendered message list (model-agnostic); used in `llm_call` events and as the Replay Mode key.
+
+## Prompt-file rules (ADR-0005)
+
+All prompts live in `prompts/*.md` — never inline strings. Every template that includes alert content **delimits and labels the untrusted payload apart from instructions** (a generic labeled block, e.g. `<alert_payload>…</alert_payload>`; no per-event-type schema). Recalled memory gets the same labeling (untrusted context, with source run-id + confidence). Verdict safety is never delegated to prompt discipline — the deterministic checks (severity enum, RiskPolicy allowlist, target-entity invariant) enforce it in code.
 
 ## Test architecture (resolves the 100%-coverage × real-LLM × no-key triangle)
 
@@ -89,7 +100,7 @@ Wave 1 MUST define these boundaries even where the real implementation comes lat
 ## Reliability rules
 
 - LLM calls: retry ×3 exponential backoff + per-call timeout + exactly 1 repair attempt on malformed structured output, then raise.
-- Tool errors: transient → retry per tool policy (each attempt journaled); permanent → return as `ToolResult(ok=False, error=...)` observation — the agent adapts; tool errors never crash the run.
+- Tool errors: transient (timeout / 5xx / connection reset) → exactly 1 retry (2 attempts total) with short backoff, each attempt journaled; permanent (schema / not-found / auth) → no retry, return as `ToolResult(ok=False, error=...)` observation — the agent adapts; tool errors never crash the run.
 - `MAX_STEPS` (env, default **15**): on breach, emit partial verdict + `run_terminated(reason="max_steps")`.
 - Repeat-call guard: identical tool+args twice → force the reasoner to change course.
 

@@ -15,7 +15,7 @@ As a detection engineer, I want the agent to consume alerts autonomously from a 
 
 ## Scope
 
-`run.py --watch <dir>`, L3 posture synthesis (config cadence `MEMORY_SYNTHESIZE_EVERY_N_RUNS`, 0 = disabled, degradable to deterministic top-N), README, final QA sweep.
+`run.py --watch <dir>` + `--synthesize-posture` (on-demand L3 trigger), L3 posture synthesis (config cadence `MEMORY_SYNTHESIZE_EVERY_N_RUNS`, 0 = disabled, degradable to deterministic top-N), README, final QA sweep.
 
 ## Acceptance criteria
 
@@ -24,3 +24,5 @@ As a detection engineer, I want the agent to consume alerts autonomously from a 
 - [ ] README covers: what/why, architecture (+ diagram), setup, single-command run, assumptions (per PRD), evals, trade-offs & what-I'd-do-differently (router, LangGraph, connector roadmap, production HITL), requirements-traceability table
 - [ ] No secrets anywhere in the repo; `.env.example` complete and in sync
 - [ ] Full-sweep QA: `make check` + `make eval` + `npx govkit verify` all green
+- [ ] Recommend-and-hold: a high-risk action in a watch-mode run never auto-executes — the run exits `awaiting_approval` (the watch adapter wires the resume-capable gate flow, not AutoGate's silent default-deny) and queues for a human `--resume --approve|--deny`
+- [ ] `run.py --synthesize-posture` regenerates the L3 posture brief immediately, regardless of cadence — including when `MEMORY_SYNTHESIZE_EVERY_N_RUNS=0`

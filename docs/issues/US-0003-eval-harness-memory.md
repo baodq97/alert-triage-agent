@@ -15,12 +15,14 @@ As the maintainer, I want behavioral evals over agent trajectories and entity-sc
 
 ## Scope
 
-`evals/` (runner + 5 golden cases + replay mode), `memory/` (L1 finding atoms, L2 entity dossiers, entity-scoped recall into planner context).
+`evals/` (runner + 6 golden cases + replay mode + read-only `evals/adapters/` seam — external eval tools are optional consumers, never dependencies), `memory/` (L1 finding atoms, L2 entity dossiers, entity-scoped recall into planner context).
 
 ## Acceptance criteria
 
-- [ ] `make eval` runs the 5-case golden set (2 samples, unknown-event-type, benign, tool-failure) — all Tier-1 assertions pass
+- [ ] `make eval` runs the 6-case golden set (2 samples, unknown-event-type, benign, tool-failure, benign-after-flagged) — all Tier-1 assertions pass
 - [ ] Replay mode reruns evals key-free from recorded journals; a replay miss fails loudly
 - [ ] Verdict findings persist as entity-keyed L1 atoms; L2 dossiers aggregate deterministically
 - [ ] A second run mentioning a previously-flagged entity shows the prior finding in its planner context (visible in journal) — recall is entity-scoped, never the whole store
 - [ ] Eval-runner and memory tests green under `make check`
+- [ ] Golden case `benign-after-flagged`: a benign alert for a previously-high-flagged entity still concludes low severity — recalled memory informs, never dictates
+- [ ] Tier-1 assertions are declarative data consumed by a pure `assert(case, run_record) -> list[ScoreResult]`; the runner only orchestrates (a foreign tool reuses the checks without importing the runner)

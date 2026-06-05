@@ -16,12 +16,12 @@ Four needs point at runtime state: an audit trail of every LLM/tool call, retry 
 
 ## Decision
 
-One append-only JSONL journal per run (`runs/<run_id>/journal.jsonl`) is the single runtime record. Every LLM call, plan, tool attempt, gate event, and verdict is an ordered event (`seq`). Resume replays the journal to rebuild state — completed steps are never re-executed (LLM calls are non-deterministic; recorded results are replayed). The approval flow rides on it: a pending gate exits as `awaiting_approval`; `--resume --approve|--deny` completes the run. Eval assertions read the journal directly.
+One append-only JSONL journal per run (`runs/<run_id>/journal.jsonl`) is the single runtime record. Every LLM call, plan, tool attempt, gate event, and verdict is an ordered event (`seq`). Resume rebuilds state from the journal — completed steps are never re-executed (LLM calls are non-deterministic; recorded results are reused). A step counts as completed only when its result event is written; a started step with no recorded result is the single re-entry point on resume; a torn final JSONL line is discarded. The approval flow rides on it: a pending gate exits as `awaiting_approval`; `--resume --approve|--deny` completes the run. Eval assertions read the journal directly.
 
 ## Alternatives considered
 
 - **Framework checkpointing (LangGraph SqliteSaver)** — opaque snapshots; satisfies resume but not audit-grade readability or eval consumption. Rejected with ADR-0001.
-- **Plain logging + separate state file** — two mechanisms that drift; logs are not replayable state. Rejected.
+- **Plain logging + separate state file** — two mechanisms that drift; logs alone cannot rebuild state. Rejected.
 - **SQLite event store** — same model, heavier surface for a 4-day scope; JSONL is diffable, greppable, and reviewer-readable. Revisit for production retention/query needs.
 
 ## Consequences
@@ -30,3 +30,4 @@ One append-only JSONL journal per run (`runs/<run_id>/journal.jsonl`) is the sin
 - (+) Replay mode gives key-free CI eval runs (cached LLM responses keyed by prompt hash).
 - (−) Journal schema is a load-bearing contract: a renamed field breaks replay and evals together — schema lives in `triage-conventions` and QA checks emitter/reader lockstep.
 - (−) Single-writer assumption (no concurrent runs on one run_id); acceptable, documented.
+- (−) `seq` gives ordering, not tamper-evidence — a writer with access to `runs/` can renumber undetectably; per-entry hash-chaining (`prev_hash`) is a roadmap item for a future ADR.

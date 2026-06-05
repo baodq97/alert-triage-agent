@@ -24,6 +24,8 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 | **Observation** | The result of one tool call as seen by the agent, including errors (`ToolResult`) | output, response |
 | **Reasoner** | The LLM decision after each Observation: continue, revise the plan, or conclude | judge (reserved for evals) |
 | **Fixture World** | The internally-consistent mock dataset behind all tools — every Entity tells the same story everywhere | stub data, mocks (alone) |
+| **TI Agent** | The delegated specialist mini-loop a Reasoner may invoke for an external IOC Entity — own prompt, own read-only TI tools, Journal Events tagged `agent: "threat-intel"` | sub-agent, second agent |
+| **TIReport** | The schema-validated structured result a TI Agent returns, consumed by the primary loop as one Observation (untrusted context) | intel report, enrichment (alone) |
 
 ## Verdict and actions
 
@@ -33,7 +35,7 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 | **Verdict** | The structured conclusion of a Run: Severity, Findings, Recommended Actions, Confidence (and `terminated_reason` when early) | report, summary, output |
 | **Severity** | The agent's concluded rating: `low / medium / high / critical` | priority, level |
 | **Confidence** | The agent's 0–1 self-assessment attached to the Verdict | certainty, score (alone) |
-| **Recommended Action** | A response the Verdict proposes (e.g. `block_user`, rotate key) | remediation, fix |
+| **Recommended Action** | A response the Verdict proposes (e.g. `block_user`, `rotate_key`) | remediation, fix |
 | **Response Action** | An executable mutation (e.g. `block_user`) that runs ONLY in the post-Verdict gate flow — never callable as a Tool mid-investigation | tool (for mutations), remediation tool |
 | **High-risk Action** | A Recommended Action whose Risk Tier requires the Approval Gate before execution | dangerous action, critical action |
 
@@ -61,6 +63,7 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 
 | Term | Definition | Aliases to avoid |
 | --- | --- | --- |
+| **Run Journal (L0)** | The raw telemetry of a Run — every recorded event (LLM requests/responses, tool calls/results, gate decisions, lifecycle) as written to the Journal; the substrate L1–L3 derive from | logs, trace (alone) |
 | **Finding Atom (L1)** | One Entity-keyed fact persisted from a Verdict's Findings | memory, note |
 | **Entity Dossier (L2)** | The deterministic aggregation of all Finding Atoms for one Entity | profile, history |
 | **Threat Posture (L3)** | The org-level synthesized brief (known-bad entities, recurring patterns), cadence set by config | global memory, summary |
@@ -102,4 +105,4 @@ Canonical vocabulary for the alert-triage-agent. Every doc, prompt, identifier, 
 - **"eval"** means the agent eval harness (`make eval`). The docs-governance gate is always called **govkit eval** in full.
 - **"severity"** alone was ambiguous between intake hint and conclusion. Canonical: **Severity Hint** (input, free string — never validated against an enum) vs **Severity** (Verdict field, strict enum).
 - **"tool" vs "action"** collided on `block_user`: a **Tool** is read-only investigation; a **Response Action** mutates and runs only post-gate (decided 2026-06-05). `block_user` is a Response Action, never a Tool.
-- **"memory"** means the product's L1–L3 layer; the developer-tooling memory plugin is out of domain scope and always named in full (tencentdb-agent-memory).
+- **"memory"** means the product's L0–L3 layer (L0 = Run Journal telemetry); the developer-tooling memory plugin is out of domain scope and always named in full (tencentdb-agent-memory).

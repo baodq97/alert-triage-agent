@@ -29,15 +29,15 @@ alert.json → validate → PLANNER (LLM: structured InvestigationPlan)
 - **Alert contract:** Pydantic envelope (6 typed fields: `alert_id`, `timestamp`, `source`, `severity_hint`, `event_type`, `description`) + `entities`/`context` as pass-through dicts. New event types parse without code changes; the planner reads whatever keys exist. Strict per-event-type schemas were **rejected** — they reintroduce the hardcoding the exercise forbids.
 - **LLM boundary:** the `openai` SDK as the single wire format; provider, base URL, and model are env config (`LLM_BASE_URL`, `LLM_MODEL`). Swapping in DeepSeek/Ollama/vLLM is configuration, not code (covers the local-model bonus). Retries ×3 with exponential backoff, per-call timeout, one repair attempt on malformed structured output.
 - **Tools:** `ToolRegistry` of `Tool` (name, JSON schema, `risk_tier`) over a `DataSource` interface — **read-only investigation tools only** (`lookup_user`, `query_logs`, `check_reputation`, `get_asset_info`); the executor can never mutate state mid-loop. `block_user` is a **response action**, executed exclusively in the post-verdict gate flow (decided 2026-06-05). The exercise ships `FixtureDataSource` — a consistent fixture world (the same entity tells the same story across every tool). Real connectors (Splunk, VirusTotal, Okta, CMDB) are an OSS roadmap item, interface-ready but explicitly not built.
-- **HITL:** `RiskPolicy` is a config file mapping actions to risk tiers (unclassified ⇒ high-risk). `ApprovalGate` is a Protocol with two implementations: `CLIGate` (interactive) and `AutoGate` (policy-driven, default-deny — CI/headless). Production surfaces (ticket comment, Slack) are roadmap.
+- **HITL:** `RiskPolicy` is a config file mapping actions to risk tiers (unclassified ⇒ high-risk). Verdict actions are `Action {name, params?, description?}`; the policy classifies on exact `Action.name` match. `ApprovalGate` is a Protocol with two implementations: `CLIGate` (interactive) and `AutoGate` (policy-driven, default-deny — CI/headless). Production surfaces (ticket comment, Slack) are roadmap.
 
 ### Run journal (one mechanism, four jobs)
 
 Append-only JSONL per run (`runs/<run_id>/journal.jsonl`): `run_started`, `llm_call` (model, tokens, latency, prompt hash), `plan_created`, `tool_called` (per attempt), `tool_result`, `gate_requested`, `gate_decision`, `verdict`, `run_terminated`.
 
-1. **Audit trail** — every call captured, tamper-evident ordering (`seq`)
+1. **Audit trail** — every call captured, append-only with monotonic ordering (`seq`)
 2. **Retry visibility** — each attempt is an event; transient tool errors retry with backoff, permanent errors return to the agent as observations (it adapts or concludes with lower confidence; never crashes)
-3. **Resume/recovery** — `run.py --resume <run_id>` replays the journal to rebuild state and continues from the last incomplete step; completed steps are never re-run (LLM calls are non-deterministic). Approval flow rides on this: a pending gate exits as `awaiting_approval`; `--resume --approve|--deny` completes the run
+3. **Resume/recovery** — `run.py --resume <run_id>` rebuilds state from the journal and continues from the last incomplete step; completed steps are never re-run (LLM calls are non-deterministic). Approval flow rides on this: a pending gate exits as `awaiting_approval`; `--resume --approve|--deny` completes the run
 4. **Eval trace** — assertions read the journal directly; no extra instrumentation
 
 ### Memory (L0→L3, mirrors tencentdb-agent-memory)
@@ -51,15 +51,18 @@ Append-only JSONL per run (`runs/<run_id>/journal.jsonl`): `run_started`, `llm_c
 
 Recall is **entity-scoped**, not a monolithic blob: alert entities → matching atoms/dossiers + L3 brief (~hundreds of tokens) into the planner context. A repeat offender IP measurably sharpens the second run's plan.
 
+Recalled atoms/dossiers are **untrusted context**: labeled and delimited like raw alert payload (ADR-0005), carrying source run-id + verdict confidence so the planner can discount them — memory informs, never dictates. L2 dossier injection is capped top-N per alert.
+
 ### Eval (two tiers, mirrors govkit's gate/eval split)
 
 - **Tier 1 — blocking behavioral assertions:** golden cases (`evals/cases/*.yaml`) assert on trajectory (must-call tools, gate-before-high-risk, max-steps respected, no repeated identical calls) and verdict (severity range, entities referenced, confidence floor, schema validity). Ranges, not exact matches — LLM output varies.
-- **Tier 2 — advisory LLM judge:** scores reasoning quality from the trace; tracked as trend, never blocks.
-- Golden set: 2 sample alerts + 1 unknown event type + 1 benign (false-positive discipline) + 1 tool-failure. Prompts live in `prompts/*.md` files; `make eval` is the regression gate for any prompt change. Replay mode (cached LLM responses from journals) keeps CI key-free.
+- **Tier 2 — advisory LLM judge:** scores reasoning quality from the trace; tracked as trend, never blocks. The judge reads the agent's own narration, so the trend is directional only — spot-checked against a few human-labeled traces; Tier-1 carries all acceptance weight.
+- Golden set: 2 sample alerts + 1 unknown event type + 1 benign (false-positive discipline) + 1 tool-failure + 1 benign-after-flagged (memory-poisoning discipline). Prompts live in `prompts/*.md` files; `make eval` is the regression gate for any prompt change. Replay mode (cached LLM responses from journals) keeps CI key-free.
+- The versioned run record (`runs/<run_id>/result.json`) + Replay Mode form a tool-neutral recorded-experiment substrate: external evaluators (deepeval et al.) re-score frozen runs deterministically and key-free via the read-only `evals/adapters/` seam — optional consumers, never dependencies.
 
 ### Runtime surfaces
 
-`triage(alert, deps)` is transport-agnostic. Adapters: CLI one-shot (`python run.py --alert …`, satisfies single-command run), watch mode (`--watch dir/` — autonomous folder ingestion), resume (`--resume <id> [--approve|--deny]`). Queue/webhook consumers are roadmap.
+`triage(alert, deps)` is transport-agnostic. Adapters: CLI one-shot (`python run.py --alert …`, satisfies single-command run), watch mode (`--watch dir/` — autonomous folder ingestion; **serial**, one run at a time, preserving the single-writer journal/memory posture — concurrent ingestion is roadmap; the watch adapter wires the resume-capable gate flow: a high-risk action exits as `awaiting_approval` for `--resume --approve|--deny`, never auto-executed), resume (`--resume <id> [--approve|--deny]`). Queue/webhook consumers are roadmap.
 
 ## Alternatives considered
 
@@ -75,11 +78,11 @@ Recall is **entity-scoped**, not a monolithic blob: alert entities → matching 
 ## Open questions
 
 - ~~Execute-after-approval vs recommend-only~~ — **resolved 2026-06-05: approved actions execute immediately** (PRD assumption 1)
-- ~~Gate topology: how many approval gates?~~ — **resolved 2026-06-05: one gate.** A single gate point after verdict batches all high-risk actions into one approval request. Per-action and tiered gates (approver level scales with risk tier / blast radius) stay on the roadmap — the `ApprovalGate` Protocol is the extension seam.
+- ~~Gate topology: how many approval gates?~~ — **resolved 2026-06-05: one gate.** A single gate point after verdict batches all high-risk actions into one approval request. Per-action and tiered gates (approver level scales with action reversibility, blast radius, and AI confidence) stay on the roadmap — the `ApprovalGate` Protocol is the extension seam.
 - ~~L3 synthesis cadence (every N runs vs on-demand)~~ — **resolved 2026-06-05: configuration-driven.** Cadence is config (e.g. `MEMORY_SYNTHESIZE_EVERY_N_RUNS`, `0` = disabled), plus an explicit on-demand trigger (CLI flag) — the same knob pattern as `MAX_STEPS`.
 - ~~Whether eval replay mode ships in v1 or README-only~~ — **resolved 2026-06-05: the eval harness is a MANDATORY v1 deliverable and runs locally** (`make eval`). It is the functional acceptance gate — no submission without the golden set passing. Replay mode (cached LLM responses from journals) ships with it so eval runs deterministically and key-free; live mode remains for grading prompt changes.
 
 ## Security & operational risks
 
-- Prompt injection via alert `description` is acknowledged and out of scope for the exercise (mock data); a production note in the README covers input sanitization and tool-result quoting.
+- Adversarial alert content (prompt injection via `description` and any `entities`/`context` value) is a real product threat: containment posture is recorded in **ADR-0005** (separation, deterministic verdict validation, read-only mid-loop, untrusted recall). Fixture World data is benign; roadmap connectors ingest hostile input.
 - The journal contains investigation data — `runs/` is gitignored; production would need retention/PII policy.
