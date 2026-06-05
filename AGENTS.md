@@ -51,3 +51,7 @@ front-matter, sets `owner: TBD` + the start status, updates `INDEX.md`, and self
 | Date | Change | Target | Reason |
 |------|--------|--------|--------|
 | 2026-06-05 | Initial harness: 2 agents + 3 skills | agents/, skills/ | build phase start |
+
+## Commit messages
+
+Do not include `Co-Authored-By: Claude ...` (or any AI attribution trailer) in commit messages.

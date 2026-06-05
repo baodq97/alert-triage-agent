@@ -14,9 +14,6 @@ dependencies = [
     "pyyaml>=6.0.3",
 ]
 
-[project.scripts]
-alert-triage-agent = "triage:main"
-
 [build-system]
 requires = ["uv_build>=0.11.18,<0.12.0"]
 build-backend = "uv_build"
@@ -29,7 +26,24 @@ target-version = "py311"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+select = ["ALL"]
+ignore = [
+    "D203",   # one-blank-line-before-class — conflicts with D211 (no-blank-line-before-class)
+    "D213",   # multi-line-summary-second-line — conflicts with D212 (summary on first line)
+    "COM812", # missing-trailing-comma — conflicts with the ruff formatter
+    "ISC001", # single-line-implicit-string-concatenation — conflicts with the ruff formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # assert is the test mechanism in pytest
+    "PLR2004", # magic values are expected in test assertions
+    "D",       # docstrings on every test add noise, test names carry intent
+    "INP001",  # tests/ is intentionally not a package (pytest rootdir discovery)
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ty.environment]
 python-version = "3.11"
@@ -37,12 +51,21 @@ python-version = "3.11"
 [tool.ty.src]
 include = ["src", "tests"]
 
+[tool.ty.terminal]
+error-on-warning = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "--cov=triage --cov-branch --cov-report=term-missing"
+
+[tool.coverage.report]
+fail_under = 100
+show_missing = true
 
 [dependency-groups]
 dev = [
     "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
     "ruff>=0.15.16",
     "ty>=0.0.44",
 ]

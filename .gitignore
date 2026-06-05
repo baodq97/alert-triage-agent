@@ -22,4 +22,8 @@ runs/
 # os / editor
 .DS_Store
 Thumbs.db
-.raws
+.raws/
+
+# test artifacts
+.coverage
+htmlcov/

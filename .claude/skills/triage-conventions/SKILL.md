@@ -76,10 +76,18 @@ ONE gate per run, after verdict: all high-risk actions batched into a single app
 
 L0 = journals (free). L1 = finding atoms persisted at verdict time, keyed by entity. L2 = entity dossiers (deterministic group-by, no LLM). L3 = threat posture brief (LLM, cadence by config; degradation path = deterministic top-N). Recall is **entity-scoped**: only atoms/dossiers matching the current alert's entities + the L3 brief go into planner context — never the whole store.
 
+## Quality bar (ADR-0004 — machine-enforced, read before coding)
+
+- **Coverage 100% + branch**, gated in `make check` (`fail_under=100`, `--cov-branch`). `# pragma: no cover` ONLY on `__main__` guards / `TYPE_CHECKING` / defensive-unreachable, each with a one-line reason — QA audits every pragma. Integration tests via replay count toward coverage where unit mocks are meaningless.
+- **ruff `ALL`**: write code that passes it; if a rule must be ignored, add it to the pyproject ignore list WITH a reason comment — never inline `# noqa` without a rule code and reason.
+- **ty `error-on-warning`**: warnings are errors. Fix types, don't suppress; `ty: ignore[rule]` needs the same justification discipline as pragmas.
+- **Pydantic strict mode** on alert envelope fields (no implicit coercion); payload dicts stay flexible.
+- **Typed errors with boundary conversion** (`errors.py`: `TriageError` → `LLMError`, `ToolError(transient|permanent)`, `GateError`, `JournalError`, `ConfigError`). Raise only inside the owning module; convert at every seam (tool failure → `ToolResult(ok=False)`; LLM retries exhausted → `run_terminated(error)` + partial verdict). No exception crosses two module boundaries — QA checks this seam.
+
 ## Style
 
 - Python ≥3.11 syntax only (ruff/ty target py311 even though dev runs 3.12).
-- `make check` green is the definition of "compiles": ruff + ty + pytest.
+- `make check` green is the definition of "compiles": ruff + format + ty + pytest-with-coverage.
 - English everywhere: code, comments, docstrings, commit messages, docs.
 - No secrets in the repo, ever; `runs/` and `.env` are gitignored.
 
