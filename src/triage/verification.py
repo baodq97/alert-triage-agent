@@ -13,11 +13,12 @@ see RFC-0003 §Calibration findings):
 1. **Citation validity** — every ``finding.evidence`` either (a) contains the name
    of a tool the run actually called, (b) contains a data value present in the
    run's observation set, (c) is an alert-correlation citation (references alert
-   fields — sanctioned by verdict.md for zero-evidence runs), or (d) is a
-   failure citation (references ``ok:false`` when the run actually has failed
-   observations — Phase-1 calibration: summary findings over all-failed
-   trajectories legitimately cite the failure shape, not a single tool).
-   Fails only when evidence matches none of the four.
+   fields by value or by variable-field key — sanctioned by verdict.md for
+   zero-evidence runs), or (d) is a failure citation (uses a recognized
+   negative-evidence phrase while the run actually has failed observations —
+   Phase-1 calibration: summary and limitation findings legitimately cite the
+   failure shape, not a single tool).  Fails only when evidence matches none
+   of the four.
 
 2. **Confidence-evidence consistency** — ``ok_count == 0`` → confidence must be in
    ``[0.30, 0.40]`` (the existing clamp band); ``confidence >= 0.8`` requires
@@ -67,6 +68,21 @@ if TYPE_CHECKING:
 _ZERO_EVIDENCE_CONF_MIN = 0.30
 _ZERO_EVIDENCE_CONF_MAX = 0.40
 
+# Negative-evidence renderings a finding may use to cite the failure trajectory
+# (check 1 branch (d)).  Deliberately unambiguous phrases only — bare "failed"/
+# "failure" is excluded because it also appears in CONTENT claims ("user failed
+# login 50 times"), which must still cite a tool or data value.
+_FAILURE_PHRASES = (
+    "ok:false",
+    "no successful",
+    "0 successful",
+    "zero successful",
+    "no fixture record",
+    "could not be verified",
+    "not investigated",
+    "unverified",
+)
+
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -110,11 +126,13 @@ def check_citation_validity(
     A finding's evidence passes if it:
     (a) contains the name of a tool the run actually called,
     (b) contains a data value present in the observation set (scanned as strings),
-    (c) references an alert field value (alert-correlation exemption —
-       sanctioned for zero-evidence runs where evidence cites the alert itself),
-    or (d) cites the failure trajectory (``ok:false`` appears in the evidence
-       and the run actually has ≥1 failed observation — summary findings over
-       failed trajectories are grounded in the run, not hallucinated).
+    (c) references an alert field value or variable-field key (alert-correlation
+       exemption — sanctioned for zero-evidence runs where evidence cites the
+       alert itself),
+    or (d) cites the failure trajectory (a ``_FAILURE_PHRASES`` rendering
+       appears in the evidence and the run actually has ≥1 failed observation —
+       summary and limitation findings over failed trajectories are grounded in
+       the run, not hallucinated).
 
     Returns:
         (passed, failed_indices) — passed is True iff every finding passes;
@@ -129,9 +147,14 @@ def check_citation_validity(
         if obs.ok and obs.data:
             _collect_string_values(obs.data, obs_data_values)
 
-    # Collect all alert field values for the alert-correlation exemption.
+    # Collect all alert field values for the alert-correlation exemption, plus the
+    # KEYS of the alert's variable fields (entities/context) — a finding may
+    # reference an alert field by name (e.g. "deploy_ticket_match is false").
+    # Envelope schema keys (id, source, ...) are excluded and short keys skipped:
+    # generic words would whitelist nearly any evidence via substring match.
     alert_values: set[str] = set()
     _collect_string_values(alert.model_dump(), alert_values)
+    _collect_string_keys({"e": alert.entities, "c": alert.context}, alert_values)
 
     has_failed_observation = any(not obs.ok for obs in observations)
 
@@ -147,8 +170,9 @@ def check_citation_validity(
         # (c) some alert field value appears in evidence (alert-correlation)
         if any(val.lower() in evidence_lower for val in alert_values if val):
             continue
-        # (d) failure citation — evidence cites ok:false and failures really happened
-        if has_failed_observation and "ok:false" in evidence_lower:
+        # (d) failure citation — evidence cites the failure trajectory in any of
+        # its recognized renderings, and failures really happened
+        if has_failed_observation and any(p in evidence_lower for p in _FAILURE_PHRASES):
             continue
         failed.append(idx)
 
@@ -364,6 +388,28 @@ def _collect_string_values(obj: Any, out: set[str]) -> None:  # noqa: ANN401
     elif isinstance(obj, list):
         for item in obj:
             _collect_string_values(item, out)
+
+
+_MIN_KEY_LENGTH = 6
+"""Minimum alert-field key length for the correlation corpus — shorter keys
+("user", "ip") are generic words that would match nearly any evidence text."""
+
+
+def _collect_string_keys(obj: Any, out: set[str]) -> None:  # noqa: ANN401
+    """Recursively collect dict KEYS (≥ ``_MIN_KEY_LENGTH`` chars) from a JSON-like structure.
+
+    Alert-correlation findings may reference an alert field by its name rather
+    than its value (e.g. "deploy_ticket_match is false") — field names are part
+    of the alert and citing them is grounded, not hallucinated.
+    """
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and len(k) >= _MIN_KEY_LENGTH:
+                out.add(k)
+            _collect_string_keys(v, out)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_string_keys(item, out)
 
 
 def _entity_scalars(alert: Alert) -> list[str]:

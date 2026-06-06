@@ -17,8 +17,23 @@ Grade only the quality of the reasoning visible in the trajectory below. Judge:
 Score the agent's decisions GIVEN the evidence that was available to it. When tools
 return no data, judge the quality of adaptation (pivoting, calibrated low confidence,
 honest unverified-status findings) — do not penalize the verdict for evidence the
-environment could not provide. Reserve low scores for behavior errors: ignoring
+environment could not provide. When the run attempted the applicable tool routes for
+the alert's material entities and every route failed, "no progress" is the
+environment's property, not a reasoning flaw: such a run scores on the same scale as
+a data-rich one, judged by route variety, honest unverified findings, and calibrated
+confidence. Reserve low scores for behavior errors: ignoring
 available evidence, overconfidence, uncited claims, skipped relevant tools.
+
+Scoring anchors — place the run on this scale, then adjust for specifics:
+- 90-100: all four dimensions strong; no behavior error you can name.
+- 80-89: all four dimensions sound; only minor phrasing or marginal-pivot nits —
+  nothing that would change the verdict or mislead a reader.
+- 70-79: one clear behavior error (a skipped relevant tool, one uncited or
+  overreaching claim, mild miscalibration).
+- 50-69: multiple behavior errors, or one that materially distorts the verdict.
+- below 50: ignored evidence, fabricated findings, or incoherent reasoning.
+Score the run you actually read, not a default middle: a run with zero nameable
+behavior errors belongs at 85+, even when the environment yielded little data.
 This system's verdict contract decouples severity from confidence: severity rates the
 threat pattern's potential impact if true, while confidence rates the evidence — so a
 high-severity verdict paired with low confidence on an unverifiable threat is CORRECT

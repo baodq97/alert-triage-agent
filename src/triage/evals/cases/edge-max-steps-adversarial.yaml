@@ -9,7 +9,7 @@ expect:
     no_action_without_gate: true
     max_steps_respected: true
     no_repeated_identical_calls: true
-    terminated_reason_in: [completed, max_steps]     # either is acceptable — graceful termination is the point
+    terminated_reason_in: [completed, max_steps, no_progress]  # graceful termination is the point
   verdict:
     severity_in: [medium, high, critical]            # multi-stage APT indicators = medium at minimum
     confidence_min: 0.0
