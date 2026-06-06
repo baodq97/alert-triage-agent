@@ -36,6 +36,7 @@ adapter.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -54,7 +55,8 @@ from triage.errors import TriageError
 from triage.gate import CLIGate, DeferredGate, RiskPolicy
 from triage.journal import JsonlJournal, rebuild
 from triage.llm import OpenAICompatibleLLM
-from triage.memory import MemoryStore
+from triage.memory import MemoryStore, PostureSynthesizer
+from triage.memory.posture import synthesize_posture_if_due
 from triage.models import Alert, RunResult
 from triage.tools import FixtureDataSource, ToolRegistry
 
@@ -63,11 +65,16 @@ _RESUME_BY = "cli-resume"
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    """Parse the CLI arguments — ``--alert <file>`` XOR ``--resume <run_id>``.
+    """Parse the CLI arguments — ``--alert``, ``--resume``, or ``--synthesize-posture``.
 
     ``--approve`` / ``--deny`` are mutually exclusive and only meaningful with
-    ``--resume`` (a pending Run); argparse enforces the alert/resume choice and the
-    approve/deny exclusivity so the adapter never reaches an ambiguous combination.
+    ``--resume`` (a pending Run); argparse enforces the alert/resume/synthesize-posture
+    choice and the approve/deny exclusivity so the adapter never reaches an ambiguous
+    combination.
+
+    ``--synthesize-posture``: regenerate the L3 posture brief immediately, regardless
+    of the configured cadence (including when ``MEMORY_SYNTHESIZE_EVERY_N_RUNS=0``).
+    This satisfies US-0004 AC "on-demand CLI trigger".
     """
     parser = argparse.ArgumentParser(
         prog="run.py",
@@ -76,6 +83,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--alert", type=Path, help="Path to the alert JSON file to investigate.")
     mode.add_argument("--resume", metavar="RUN_ID", help="Resume a prior run by its run id.")
+    mode.add_argument(
+        "--synthesize-posture",
+        action="store_true",
+        default=False,
+        help=(
+            "Regenerate the L3 org-level threat posture brief immediately, "
+            "regardless of the configured cadence (including cadence=0)."
+        ),
+    )
     decision = parser.add_mutually_exclusive_group()
     decision.add_argument(
         "--approve",
@@ -178,6 +194,48 @@ def _run_resume(run_id: str, runs_dir: Path, *, approve: bool, deny: bool) -> Ru
     return resume_investigation(alert, deps, reconstructed, run_id=run_id)
 
 
+def _maybe_synthesize_posture() -> None:
+    """Increment the posture run counter and synthesize if the cadence is reached.
+
+    Reads ``MEMORY_SYNTHESIZE_EVERY_N_RUNS`` from the environment (after
+    :func:`load_dotenv` has already run in ``main``). Any failure is swallowed —
+    a memory operation must never crash or delay a Run's exit.
+
+    The broad ``except Exception`` below is intentional: the docstring promises "any
+    failure is swallowed."  The callees (``PostureSynthesizer``, ``synthesize_posture_if_due``)
+    are total by construction (each swallows its own IO), but a future edit to either could
+    introduce a raise.  Catching here gives defensive depth so a memory-housekeeping step
+    can never crash a Run that has already shipped its verdict.  No re-raise, no log —
+    silence is correct: the run completed successfully and the memory miss is best-effort.
+    """
+    try:
+        cadence = int(os.environ.get("MEMORY_SYNTHESIZE_EVERY_N_RUNS", "0"))
+    except ValueError:
+        cadence = 0
+    try:
+        synth = PostureSynthesizer()
+        synthesize_posture_if_due(synth, cadence=cadence)
+    except Exception:  # noqa: BLE001,S110 — intentional broad catch + silent pass; see docstring rationale above
+        pass
+
+
+def _run_synthesize_posture() -> int:
+    """Regenerate the L3 posture brief immediately (the ``--synthesize-posture`` path).
+
+    Uses the deterministic synthesis path — no LLM key required.  The brief is
+    written to ``$MEMORY_DIR/posture.md`` (or ``.memory/posture.md`` when unset).
+    An empty store yields an empty-but-valid brief (no crash).  Write failures are
+    swallowed by :meth:`PostureSynthesizer.write` — a memory failure never crashes a
+    Run.  Always returns ``0``: the caller decides whether to surface the path.
+    """
+    synth = PostureSynthesizer()
+    brief = synth.synthesize_deterministic()
+    synth.write(brief)
+    posture_path = synth.base_dir / "posture.md"
+    print(f"Posture brief written to: {posture_path}")  # noqa: T201 — CLI adapter output.
+    return 0
+
+
 def main(argv: list[str] | None = None, *, runs_dir: Path = _RUNS_DIR) -> int:
     """Run the adapter end-to-end (``--alert`` or ``--resume``) and return the exit code.
 
@@ -198,6 +256,11 @@ def main(argv: list[str] | None = None, *, runs_dir: Path = _RUNS_DIR) -> int:
     load_dotenv()
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
+    # --synthesize-posture is key-free and never constructs an LLM, so it bypasses
+    # the TriageError catch block (no ConfigError possible on that path).
+    if args.synthesize_posture:
+        return _run_synthesize_posture()
+
     try:
         # Each path builds the LLM first, so an unset LLM_API_KEY (ConfigError) is
         # raised before any journal directory is created or reopened.
@@ -217,6 +280,10 @@ def main(argv: list[str] | None = None, *, runs_dir: Path = _RUNS_DIR) -> int:
     record_path = _persist(result, runs_dir)
     print(summarize(result))  # noqa: T201 — CLI adapter: user-facing stdout is the point.
     print(f"\nRun record: {record_path}")  # noqa: T201 — CLI adapter output.
+    # L3 cadence trigger: after a run persists, check if synthesis is due.
+    # ``MEMORY_SYNTHESIZE_EVERY_N_RUNS=0`` (the default) disables this silently.
+    # A write failure is swallowed by synthesize_posture_if_due; it never crashes.
+    _maybe_synthesize_posture()
     return 0
 
 
