@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from triage.memory.atoms import FindingAtom, atom_id_for
+from triage.memory.posture import load_posture_brief
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -121,13 +122,27 @@ class MemoryStore:
         exactly the ``Planner.plan`` recall keys (``run_id`` / ``confidence`` /
         ``content``). Items are ranked confidence-desc (then recency) and capped at
         :attr:`RECALL_TOP_N`. An empty/missing/corrupt store recalls ``[]``.
+
+        **L3 posture (Wave 4):** if ``.memory/posture.md`` exists, one extra item is
+        appended *after* the entity-scoped atoms — the org-level posture brief,
+        labeled as untrusted context from ``"posture-brief"`` with ``confidence=0.0``
+        (the lowest possible, so the planner discounts it appropriately).  When no
+        posture file exists the output is byte-identical to pre-L3 behavior, keeping
+        the 34 replay caches valid.
         """
         atoms: dict[str, FindingAtom] = {}
         for entity_type, entity_value in _matchable_entities(alert.entities):
             for atom in self._read_atoms(entity_type, entity_value):
                 atoms.setdefault(atom.atom_id, atom)
         ranked = sorted(atoms.values(), key=_recall_sort_key)[: self.RECALL_TOP_N]
-        return [_to_recall_item(atom) for atom in ranked]
+        items: list[Mapping[str, Any]] = [_to_recall_item(atom) for atom in ranked]
+        # Append the L3 posture brief as an extra non-entity-scoped item — only when
+        # the file exists (the default state is absent, preserving replay-cache
+        # compatibility).
+        brief = load_posture_brief(self.base_dir)
+        if brief is not None:
+            items.append(_to_posture_item(brief))
+        return items
 
     def _path_for(self, entity_type: str, entity_value: str) -> Path:
         """Map an entity key to its (hashed, traversal-safe) JSONL file path."""
@@ -234,3 +249,14 @@ def _to_recall_item(atom: FindingAtom) -> dict[str, Any]:
     """
     content = f"[{atom.severity}] {atom.statement} (evidence: {atom.evidence})"
     return {"run_id": atom.run_id, "confidence": atom.confidence, "content": content}
+
+
+def _to_posture_item(brief: str) -> dict[str, Any]:
+    """Shape the L3 posture brief into a recall seam item (same three keys).
+
+    ``run_id="posture-brief"`` identifies this as the org-level synthesis rather
+    than an entity-scoped atom from a specific run. ``confidence=0.0`` signals the
+    planner to treat this as low-certainty context — the brief aggregates many runs
+    and is deliberately coarser than per-run atoms.
+    """
+    return {"run_id": "posture-brief", "confidence": 0.0, "content": brief}
