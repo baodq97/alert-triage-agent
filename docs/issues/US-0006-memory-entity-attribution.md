@@ -23,11 +23,16 @@ precision improves as the store grows instead of degrading.
 Apply ADR-0006's resolution order to the persist path:
 
 - `Finding.related_entities: list[str]` (optional) on the LLM output model; prompt
-  (`verdict.md`) instructs attribution; values validated ∩ alert entities in code.
-- Deterministic text-scan fallback for undeclared findings — extracted into ONE shared
-  attribution helper reused by `_filter_traceable_actions` (no second substring
-  implementation).
+  (`verdict.md`) instructs attribution; values validated in code against the known entity
+  values — `entities` ∪ scalar string values of `context` (per ADR-0006; envelope-only
+  validation strips legitimate context entities).
+- Deterministic text-scan fallback for undeclared findings via the shared
+  `attribution.py` leaf (landed by US-0008; this story adds `attribute_finding` and the
+  persist wiring — no second substring implementation).
 - Unattributed findings persist nothing and emit `finding_unattributed` (journal).
+- **Measure and report** the attribution reality on the recorded suite (atoms persisted
+  and `finding_unattributed` count, before vs after) — ADR-0006 documents the rate is
+  non-trivial by design; the wave report carries the numbers.
 - Both persist callers thread the same path: `_conclude_run` (core) and the eval seeder
   `_seed_memory` (runner) — eval `prior_runs` seeds declare entities explicitly.
 - Existing stores: no migration (atoms are append-only facts; old cartesian atoms age out

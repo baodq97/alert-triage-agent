@@ -24,10 +24,13 @@ distinct, overridable signal.
 - **`judge_min` (per-case, opt-in)** verdict-tier assertion: a case may declare a minimum
   Tier-2 score (median-of-3). Failing `judge_min` NEVER affects Tier-1: the runner exits
   with a DISTINCT code (2) and a clearly-separated WARN section in the report; Tier-1
-  failures keep exit 1 and always win. CI treats exit 2 as overridable.
-  Wire point: `evaluate_case` (the single seam where assertions and judge meet) + `main`'s
-  exit-code logic. Choose initial `judge_min` values only for cases whose scores are
-  stable (≥ 60 band, per the 2026-06-06 sweep); never for the known-hard tail.
+  failures keep exit 1 and always win. **Consumer scope: `make eval` (the local/developer
+  gate) — the repo's CI runs only the govkit doc gates today and does not invoke the
+  Python eval suite; wiring the suite into CI is out of scope** (the exit-code contract is
+  designed for it when that lands). Wire point: `evaluate_case` (the single seam where
+  assertions and judge meet) + `main`'s exit-code logic. Choose initial `judge_min` values
+  only for cases whose scores are stable (≥ 60 band, per the 2026-06-06 sweep); never for
+  the known-hard tail.
 - **exfil-prod live-flake hardening:** one planner-prompt line — network entities (IPs)
   warrant log/reputation coverage — closing the observed trajectory variance (1 failure in
   6 logged live runs) where the IP was never queried and `must_reference_entities` failed.
@@ -41,9 +44,9 @@ new golden cases (US-0008 adds the verify-hook cases).
 
 ## Acceptance criteria
 
-- [ ] A case with `judge_min: 50` whose median-of-3 score is below 50 → runner exit 2,
-      WARN section names the case and scores; Tier-1-only failures still exit 1; both
-      failing → exit 1 (Tier-1 wins); all passing → exit 0
+- [ ] A case with `judge_min: 50` whose median-of-3 score is below 50 → `make eval`
+      exits 2, WARN section names the case and scores; Tier-1-only failures still exit 1;
+      both failing → exit 1 (Tier-1 wins); all passing → exit 0
 - [ ] `judge_min` absent → zero behavior change (gating identical to today)
 - [ ] exfil-prod: 5 consecutive live runs pass `must_reference_entities` (was 1 failure
       in 6 logged live runs); no other case's Tier-1 regresses on the shared re-record

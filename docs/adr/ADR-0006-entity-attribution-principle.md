@@ -37,14 +37,22 @@ One principle, applied at every seam that binds a claim to an entity:
 Resolution order, deterministic and code-enforced:
 
 1. **Declared:** `Finding.related_entities` (new optional field on the LLM output model) —
-   accepted only after validation against the alert's entities (declared ∩ alert entities;
-   hallucinated entity names are dropped).
+   accepted only after validation against the alert's **known entity values: the
+   `entities` dict ∪ scalar string values of `context`** (recorded verdicts legitimately
+   name context entities — e.g. a pipeline name — that the envelope does not carry;
+   validating against `entities` alone would strip them as hallucinations). Names matching
+   neither are dropped.
 2. **Detected (fallback):** when a finding declares nothing, a deterministic text-scan of
-   the finding's statement + evidence for alert-entity values (the same substring machinery
-   the action-traceability filter uses — one shared helper, not a second implementation).
+   the finding's statement + evidence for those same known entity values (the substring
+   machinery extracted from the action-traceability filter into a shared helper — one
+   implementation, not two).
 3. **Unattributed (no silent path):** when neither yields an entity, no atom is persisted
    and a `finding_unattributed` journal event records the finding — visible in the audit
    trail, never silently lost, never cartesian-fanned.
+
+The shared helper lives in a new leaf module `attribution.py` importing only `models` —
+the only home serving all three callers (verdict's traceability filter, the persist path,
+the eval seeder) while keeping `memory/` a leaf with no cycle.
 
 The verify hook's entity-grounding check (RFC-0003) applies the same rule at verdict time,
 so attribution quality is corrected by re-entry before persist ever sees the finding.
@@ -72,7 +80,17 @@ so attribution quality is corrected by re-entry before persist ever sees the fin
   re-records once (batched with the other improvement-wave prompt edits).
 - (−) Substring detection has false positives on overlapping entity values (e.g. an IP
   that is a substring of another string in evidence) — accepted: matches are validated
-  against alert entities only, and the declared path is preferred; revisit with
+  against known entity values only, and the declared path is preferred; revisit with
   tokenized matching if real collisions appear.
+- (−) **The unattributed rate on real data is not marginal** (adversarial review,
+  2026-06-06, against the 35 recorded verdicts): some whole verdicts name no entity in
+  any finding (the zero-evidence shape persists zero atoms where cartesian persisted
+  many), and 12+ cases contain entity values no finding names. This is the designed
+  trade — fewer, correct atoms over many noisy ones — but it must be **measured and
+  reported** in the implementing wave (count of atoms persisted and `finding_unattributed`
+  events across the suite, before vs after), not assumed small. The verify hook's
+  coverage check (RFC-0003) pushes findings to name their entities, which lifts
+  attribution over time; the declared field gives capable models a precision path.
 - (−) `_seed_memory` (eval prior_runs) and persist share the attribution path — eval
-  seeds must be updated to declare entities explicitly.
+  seeds must be updated to declare entities explicitly. (Verified safe for the two
+  seeded golden cases: their prior findings name the entity verbatim.)
