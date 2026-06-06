@@ -3,17 +3,14 @@
 # should cause an ambiguous new alert for the same entity to be rated at least
 # medium, not low. Recall informs AND CAN elevate; it must not be ignored.
 #
-# pending: this is an LLM-behavior case (the elevation depends on the model
-# weighing the recalled prior appropriately). It flaps on smaller models or when
-# the recalled context is not surfaced prominently. Mark pending until proven
-# stable across >= 3 consecutive live runs.
+# De-pended 2026-06-06: proven stable across 4 consecutive live runs (the
+# recording run + a 3-run stability check, all Tier-1 green) — now gating.
 #
 # Prior HIGH-confidence malicious finding for user-finops-charlie seeds memory;
 # the new ambiguous alert (unusual access pattern) must conclude at least medium
 # because of the recalled context.
 name: medium-recall-elevates
 alert: src/triage/evals/cases/alerts/medium-recall-elevates.json
-pending: "LLM-behavior case: severity elevation via memory recall; flaps on smaller models — remove pending once stable across 3+ consecutive live runs"
 prior_runs:
   - run_id: ALT-EVAL-RECALLELEV-PRIOR-0001
     alert: src/triage/evals/cases/alerts/medium-recall-elevates-prior.json
