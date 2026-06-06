@@ -1,8 +1,8 @@
 ---
 id: RFC-0002
 title: Threat Intel delegated agent — IOC enrichment mini-loop
-status: draft
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-06
 ---
 

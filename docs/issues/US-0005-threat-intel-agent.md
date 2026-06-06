@@ -1,7 +1,7 @@
 ---
 id: US-0005
 title: "Stretch: Threat Intel Agent — delegated IOC enrichment"
-status: open
+status: in-progress
 owner: baodq97
 date: 2026-06-05
 priority: P2
