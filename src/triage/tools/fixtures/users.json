@@ -18,5 +18,15 @@
     "created_days_ago": 12,
     "mfa_enrolled": true,
     "manager": "lchen"
+  },
+  "svc-ml-pipeline": {
+    "entity": "svc-ml-pipeline",
+    "kind": "service_account",
+    "status": "active",
+    "role": "ml-training-runner",
+    "owner_team": "ml-platform",
+    "created_days_ago": 210,
+    "mfa_enrolled": false,
+    "expected_caller_ips": ["10.60.1.0/24", "10.60.2.0/24"]
   }
 }

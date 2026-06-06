@@ -174,7 +174,24 @@ def test_empty_recall_renders_no_recall_block() -> None:
     assert "<recalled_memory>" not in rendered
 
 
-def test_llm_error_propagates_and_emits_nothing() -> None:
+def test_render_falls_back_to_single_message_when_sentinel_absent() -> None:
+    """If the template has no {{END_OF_STABLE}}, a single message is returned."""
+    llm = FakeLLM([_PLAN_JSON])
+    planner = Planner(llm=llm, journal=RecordingJournal(), tool_specs=_specs())
+    planner._template = "No sentinel here. {{TOOLS}} {{ALERT_PAYLOAD}} {{RECALL}}"  # noqa: SLF001
+
+    planner.plan(_alert())
+
+    assert len(llm.last_messages) == 1
+
+
+def test_llm_error_propagates_and_emits_nothing_except_repair() -> None:
+    """On a double-malformed plan reply (repair also fails), only llm_repair fires.
+
+    The planner emits llm_repair when the repair re-prompt is attempted, but never
+    emits llm_call (no Completion exists) and never emits plan_created.  The
+    LLMError still propagates (the caller degrades to a partial verdict).
+    """
     journal = RecordingJournal()
     # A malformed reply, repeated, exhausts the one repair attempt -> LLMError.
     planner = Planner(
@@ -186,4 +203,27 @@ def test_llm_error_propagates_and_emits_nothing() -> None:
     with pytest.raises(LLMError):
         planner.plan(_alert())
 
-    assert journal.events == []
+    names = [event for event, _, _ in journal.events]
+    # The repair was attempted: llm_repair emitted; llm_call and plan_created NOT.
+    assert "llm_repair" in names
+    assert "llm_call" not in names
+    assert "plan_created" not in names
+
+
+def test_repair_fires_llm_repair_event() -> None:
+    """On a malformed first reply, the planner emits llm_repair before llm_call."""
+    journal = RecordingJournal()
+    planner = Planner(
+        llm=FakeLLM(["not json", _PLAN_JSON]),
+        journal=journal,
+        tool_specs=_specs(),
+    )
+
+    planner.plan(_alert())
+
+    names = [event for event, _, _ in journal.events]
+    assert "llm_repair" in names
+    assert names.index("llm_repair") < names.index("llm_call")
+    repair_payload = next(p for e, p, _ in journal.events if e == "llm_repair")
+    assert repair_payload["purpose"] == "plan"
+    assert "error" in repair_payload

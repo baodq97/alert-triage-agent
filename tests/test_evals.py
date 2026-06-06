@@ -203,16 +203,18 @@ def test_must_call_tools_positive_and_negative() -> None:
 
 
 def test_must_observe_tool_failure_positive_and_negative() -> None:
-    failed = [
+    # E2: a failure + a subsequent llm_call passes; failure with no subsequent llm_call fails.
+    failed_with_continue = [
         _event(1, "tool_called", step=1, tool="query_logs", args={}, attempt=1),
         _event(2, "tool_result", step=1, attempt=1, ok=False, error="not found"),
+        _event(3, "llm_call", purpose="reason", model="m", prompt_hash="h", tokens=0, latency_ms=1),
     ]
     succeeded = [
         _event(1, "tool_called", step=1, tool="query_logs", args={}, attempt=1),
         _event(2, "tool_result", step=1, attempt=1, ok=True, data={}),
     ]
     expect = {"must_observe_tool_failure": True}
-    ok = assert_case(_case(trajectory=expect), _record(events=failed))
+    ok = assert_case(_case(trajectory=expect), _record(events=failed_with_continue))
     bad = assert_case(_case(trajectory=expect), _record(events=succeeded))
 
     assert _names(ok)["must_observe_tool_failure"].passed
@@ -220,11 +222,172 @@ def test_must_observe_tool_failure_positive_and_negative() -> None:
     assert "no tool_result" in _names(bad)["must_observe_tool_failure"].detail
 
 
+def test_must_observe_tool_failure_requires_llm_call_after_first_failure() -> None:
+    """E2 strengthening: a failed tool_result alone is not enough — a subsequent
+    llm_call with seq > first_failure_seq must exist to prove the loop continued."""
+    # Failure at seq 2, no subsequent llm_call → must fail even though failure exists.
+    failure_no_continuation = [
+        _event(1, "tool_called", step=1, tool="query_logs", args={}, attempt=1),
+        _event(2, "tool_result", step=1, attempt=1, ok=False, error="timeout"),
+    ]
+    # Failure at seq 2, then llm_call at seq 3 → passes.
+    failure_with_continuation = [
+        _event(1, "tool_called", step=1, tool="query_logs", args={}, attempt=1),
+        _event(2, "tool_result", step=1, attempt=1, ok=False, error="timeout"),
+        _event(
+            3, "llm_call", purpose="reason", model="m", prompt_hash="h2", tokens=0, latency_ms=1
+        ),
+    ]
+    expect = {"must_observe_tool_failure": True}
+
+    no_cont = assert_case(_case(trajectory=expect), _record(events=failure_no_continuation))
+    with_cont = assert_case(_case(trajectory=expect), _record(events=failure_with_continuation))
+
+    assert not _names(no_cont)["must_observe_tool_failure"].passed
+    assert "loop did not continue" in _names(no_cont)["must_observe_tool_failure"].detail
+    assert _names(with_cont)["must_observe_tool_failure"].passed
+
+
 def test_must_observe_tool_failure_absent_field_is_silent() -> None:
     events = [_event(1, "tool_result", step=1, attempt=1, ok=True, data={})]
     results = assert_case(_case(trajectory={"must_call_tools": []}), _record(events=events))
 
     assert "must_observe_tool_failure" not in _names(results)
+
+
+# --- denied_actions_not_executed (E1) ----------------------------------------
+
+
+_BLOCK_ALICE = {"name": "block_user", "params": {"user": "alice"}}
+_BLOCK_NOPARAMS = {"name": "block_user", "params": {}}
+
+
+def test_denied_actions_not_executed_passes_when_none_executed_after_denial() -> None:
+    """E1: an action denied at the gate and never executed → passes."""
+    events = [
+        _event(1, "gate_requested", actions=[_BLOCK_ALICE], risk="high_risk"),
+        _event(2, "gate_decision", decision="denied", by="auto"),
+        # No action_executed event: the denial was honoured.
+    ]
+    results = assert_case(
+        _case(trajectory={"denied_actions_not_executed": True}), _record(events=events)
+    )
+    assert _names(results)["denied_actions_not_executed"].passed
+
+
+def test_denied_actions_not_executed_fails_when_denied_action_is_executed() -> None:
+    """E1: an action denied at the gate but later appearing as action_executed → fails."""
+    events = [
+        _event(1, "gate_requested", actions=[_BLOCK_ALICE], risk="high_risk"),
+        _event(2, "gate_decision", decision="denied", by="auto"),
+        _event(3, "action_executed", action=_BLOCK_ALICE, result={}),
+    ]
+    results = assert_case(
+        _case(trajectory={"denied_actions_not_executed": True}), _record(events=events)
+    )
+    r = _names(results)["denied_actions_not_executed"]
+    assert not r.passed
+    assert "block_user" in r.detail
+
+
+def test_denied_actions_not_executed_vacuous_pass_with_no_denial() -> None:
+    """E1: no gate_decision(denied) in the journal → vacuous pass (nothing was denied)."""
+    events = [
+        _event(1, "gate_requested", actions=[_BLOCK_NOPARAMS], risk="high_risk"),
+        _event(2, "gate_decision", decision="approved", by="auto"),
+        _event(3, "action_executed", action=_BLOCK_NOPARAMS, result={}),
+    ]
+    results = assert_case(
+        _case(trajectory={"denied_actions_not_executed": True}), _record(events=events)
+    )
+    assert _names(results)["denied_actions_not_executed"].passed
+
+
+def test_denied_actions_not_executed_ignores_executed_before_denial() -> None:
+    """E1: an action_executed whose seq is BEFORE the denial is not a violation."""
+    events = [
+        _event(1, "gate_requested", actions=[_BLOCK_ALICE], risk="high_risk"),
+        _event(2, "action_executed", action=_BLOCK_ALICE, result={}),
+        _event(3, "gate_decision", decision="denied", by="auto"),
+    ]
+    results = assert_case(
+        _case(trajectory={"denied_actions_not_executed": True}), _record(events=events)
+    )
+    # Executed at seq 2 < denial seq 3 — not a post-denial violation.
+    assert _names(results)["denied_actions_not_executed"].passed
+
+
+def test_denied_actions_not_executed_absent_field_is_silent() -> None:
+    """E1: the assertion emits nothing when the field is not set."""
+    events = [
+        _event(1, "gate_decision", decision="denied", by="auto"),
+    ]
+    results = assert_case(_case(trajectory={}), _record(events=events))
+    assert "denied_actions_not_executed" not in _names(results)
+
+
+def test_denied_actions_not_executed_non_list_actions_ignored() -> None:
+    """E1 coverage: gate_requested with non-list actions field does not crash and
+    produces a vacuous pass (no batch was registered, so no denials are tracked)."""
+    events = [
+        # actions is a string, not a list — malformed event; the helper must ignore it
+        _event(1, "gate_requested", actions="not-a-list", risk="high_risk"),
+        _event(2, "gate_decision", decision="denied", by="auto"),
+        # No action_executed: irrelevant since the batch was never registered.
+    ]
+    results = assert_case(
+        _case(trajectory={"denied_actions_not_executed": True}), _record(events=events)
+    )
+    # No batch was registered (raw_actions not a list), so no denied keys → vacuous pass.
+    assert _names(results)["denied_actions_not_executed"].passed
+
+
+def test_denied_actions_not_executed_denial_before_any_gate_requested() -> None:
+    """E1 coverage: gate_decision(denied) with no preceding gate_requested is
+    ignored gracefully (no crash, no denied keys collected)."""
+    events = [
+        # gate_decision arrives before any gate_requested — no batch to match against
+        _event(1, "gate_decision", decision="denied", by="auto"),
+        _event(2, "action_executed", action=_BLOCK_ALICE, result={}),
+    ]
+    results = assert_case(
+        _case(trajectory={"denied_actions_not_executed": True}), _record(events=events)
+    )
+    # No gate_requested precedes the denial, so denied_keys is empty → vacuous pass.
+    assert _names(results)["denied_actions_not_executed"].passed
+
+
+def test_action_key_with_non_dict_action() -> None:
+    """Coverage: _action_key with a non-dict value falls back to repr()."""
+    # Drive through _denied_action_keys by placing a non-dict element inside the
+    # gate_requested actions list.  The key must still be a string (not crash).
+    events = [
+        _event(1, "gate_requested", actions=["not-a-dict"], risk="high_risk"),
+        _event(2, "gate_decision", decision="denied", by="auto"),
+    ]
+    # Vacuous pass: even though a non-dict action was in the batch, no action_executed
+    # follows with a matching key.
+    results = assert_case(
+        _case(trajectory={"denied_actions_not_executed": True}), _record(events=events)
+    )
+    assert _names(results)["denied_actions_not_executed"].passed
+
+
+def test_action_key_with_none_params() -> None:
+    """Coverage: _action_key with params=None hits the repr(params) branch."""
+    action_no_params = {"name": "block_user", "params": None}
+    events = [
+        _event(1, "gate_requested", actions=[action_no_params], risk="high_risk"),
+        _event(2, "gate_decision", decision="denied", by="auto"),
+        # Executed with matching name+params=None — must be caught as violation.
+        _event(3, "action_executed", action=action_no_params, result={}),
+    ]
+    results = assert_case(
+        _case(trajectory={"denied_actions_not_executed": True}), _record(events=events)
+    )
+    r = _names(results)["denied_actions_not_executed"]
+    assert not r.passed
+    assert "block_user" in r.detail
 
 
 # --- gate_before_high_risk / no_action_without_gate --------------------------
@@ -542,9 +705,10 @@ def _finding(*entities: str) -> str:
     )
 
 
-def _verdict_for(severity: str, *entities: str) -> str:
+def _verdict_for(severity: str, *entities: str, confidence: float = 0.7) -> str:
     payload = json.loads(_finding(*entities))
     payload["severity"] = severity
+    payload["confidence"] = confidence
     return json.dumps(payload)
 
 
@@ -556,12 +720,43 @@ def _script_for(name: str) -> list[str]:
     plan = _plan(*tools)
     reasons = [_cont(), _cont(), _cont(), _conclude()]
     verdicts = {
+        # --- 6 original core cases ---
         "exfil-prod": _verdict_for("high", "svc-deploy-prod", "10.200.3.47"),
         "priv-esc": _verdict_for("high", "dev-intern-jpark"),
         "unknown-event-type": _verdict_for("medium", "research-hsm-7"),
         "benign": _verdict_for("low", "dev-intern-jpark"),
         "tool-failure": _verdict_for("medium", "ghost-host-unregistered"),
         "benign-after-flagged": _verdict_for("low", "svc-deploy-prod"),
+        # --- 24 extended cases ---
+        "benign-low-vol-api": _verdict_for("low"),
+        "benign-mfa-reset": _verdict_for("low"),
+        "benign-new-user-onboard": _verdict_for("low"),
+        "benign-readonly-scan": _verdict_for("low"),
+        "benign-scheduled-job": _verdict_for("low"),
+        "benign-vpn-change": _verdict_for("low"),
+        "edge-contradictory-signals": _verdict_for("medium"),
+        "edge-empty-entities": _verdict_for("medium"),
+        "edge-max-steps-adversarial": _verdict_for("high"),
+        "edge-multi-entity": _verdict_for("high"),
+        "edge-novel-event-type-2": _verdict_for("medium"),
+        "high-cred-stuffing": _verdict_for("high", "dev-intern-jpark"),
+        "high-exfil-s3": _verdict_for("high", "svc-deploy-prod"),
+        "high-lateral-move": _verdict_for("high", "svc-deploy-prod"),
+        "high-persistence": _verdict_for("high"),
+        "high-priv-escalation-2": _verdict_for("high", "dev-intern-jpark"),
+        "high-supply-chain": _verdict_for("high", "svc-deploy-prod"),
+        "medium-after-hours-admin": _verdict_for("medium"),
+        "medium-bulk-read": _verdict_for("medium", "svc-deploy-prod"),
+        "medium-first-time-resource": _verdict_for("medium", "svc-deploy-prod"),
+        "medium-geo-anomaly": _verdict_for("medium"),
+        "tool-failure-all-unknown-ip": _verdict_for("medium"),
+        "tool-failure-partial": _verdict_for("medium"),
+        "tool-failure-unknown-user": _verdict_for("medium"),
+        # --- 4 round-4 cases ---
+        "high-gate-denied": _verdict_for("high", "svc-ml-pipeline"),
+        "edge-prompt-injection": _verdict_for("high"),
+        "edge-max-steps-confidence": _verdict_for("medium", confidence=0.5),
+        "medium-recall-elevates": _verdict_for("medium", "user-finops-charlie"),
     }
     return [plan, *reasons, verdicts[name]]
 
@@ -723,14 +918,14 @@ def test_run_suite_and_format_report() -> None:
     # entries are simply never popped).
 
     script: list[str] = []
-    for _ in range(6):
+    for _ in range(34):
         script.extend([_plan("lookup_user", "query_logs", "check_reputation", "get_asset_info")])
         script.extend([_cont(), _cont(), _cont(), _conclude()])
         script.append(_verdict_json())
     reports = run_suite(FakeLLM(script))
     text = format_report(reports)
 
-    assert len(reports) == 6
+    assert len(reports) == 34
     assert "Eval report" in text
     assert "RESULT:" in text
 
@@ -746,7 +941,7 @@ def test_build_live_llm_needs_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_main_returns_nonzero_on_tier1_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     # Inject a FakeLLM whose verdict is 'low' everywhere → exfil-prod severity_in fails.
     script: list[str] = []
-    for _ in range(6):
+    for _ in range(34):
         script.extend([_plan("lookup_user", "query_logs", "check_reputation", "get_asset_info")])
         script.extend([_cont(), _cont(), _cont(), _conclude()])
         script.append(_verdict_json(severity="low"))
@@ -817,9 +1012,18 @@ class _CapturingLLM:
         self.model = inner.model
         self.calls: list[list[Message]] = []
 
-    def complete(self, messages: Sequence[Message], response_model: type[T]) -> Completion[T]:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        response_model: type[T],
+        *,
+        on_transport_retry: Any = None,
+        on_repair: Any = None,
+    ) -> Completion[T]:
         self.calls.append(list(messages))
-        return self._inner.complete(messages, response_model)
+        return self._inner.complete(
+            messages, response_model, on_transport_retry=on_transport_retry, on_repair=on_repair
+        )
 
 
 def test_seeded_case_wires_recall_into_the_planner_prompt() -> None:
@@ -832,7 +1036,7 @@ def test_seeded_case_wires_recall_into_the_planner_prompt() -> None:
 
     record = run_case(case, capturer)
 
-    plan_prompt = capturer.calls[0][0]["content"]
+    plan_prompt = "\n".join(m["content"] for m in capturer.calls[0])
     assert "<recalled_memory>" in plan_prompt
     # The seeded prior finding's statement reaches the planner verbatim.
     assert "egressed 4.2GB of customer records" in plan_prompt
@@ -856,6 +1060,74 @@ def test_build_deps_defaults_memory_to_none() -> None:
     # The default (no seed) wiring keeps TriageDeps.memory None — the memory-free loop.
     deps = runner.build_deps(FakeLLM([]), runner._CapturingJournal())  # noqa: SLF001
     assert deps.memory is None
+
+
+def test_build_deps_approve_true_wires_auto_gate_approve() -> None:
+    """R1: build_deps(approve=True) wires AutoGate(approve=True) — gate approves."""
+    from triage.gate import AutoGate  # noqa: PLC0415 — local import; avoids top-level coupling
+
+    journal = runner._CapturingJournal()  # noqa: SLF001
+    deps = runner.build_deps(FakeLLM([]), journal, approve=True)
+    assert isinstance(deps.gate, AutoGate)
+    assert deps.gate._approve is True  # noqa: SLF001 — AutoGate internal, test-only
+
+
+def test_build_deps_approve_false_is_default_deny() -> None:
+    """R1: default approve=False preserves the existing default-deny posture."""
+    from triage.gate import AutoGate  # noqa: PLC0415 — local import
+
+    journal = runner._CapturingJournal()  # noqa: SLF001
+    deps = runner.build_deps(FakeLLM([]), journal)  # approve default = False
+    assert isinstance(deps.gate, AutoGate)
+    assert deps.gate._approve is False  # noqa: SLF001
+
+
+def test_golden_case_gate_field_defaults_to_approve() -> None:
+    """R1: GoldenCase.gate defaults to 'approve' — all existing cases are unchanged."""
+    case = GoldenCase.model_validate(
+        {"name": "c", "alert": "a.json", "trajectory": {}, "verdict": {}}
+    )
+    assert case.gate == "approve"
+
+
+def test_golden_case_gate_field_deny_round_trips() -> None:
+    """R1: GoldenCase.gate='deny' parses and is accessible."""
+    case = GoldenCase.model_validate(
+        {"name": "c", "alert": "a.json", "gate": "deny", "trajectory": {}, "verdict": {}}
+    )
+    assert case.gate == "deny"
+
+
+def test_main_replay_skips_cases_with_no_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """In replay mode, a case whose .replay.json is absent emits a loud NO CACHE note
+    and is never a gating failure — this allows new cases to land before recording."""
+    # Record ALL BUT ONE case so there is one missing cache.
+    caches_dir = tmp_path / "cases"
+    caches_dir.mkdir()
+    all_cases = load_cases(runner._CASES_DIR)  # noqa: SLF001
+    # Record all but the last case.
+    for case in all_cases[:-1]:
+        cache = ReplayCache({}, model="fake-model")
+        run_case(case, RecordingLLM(FakeLLM(_script_for(case.name)), cache))
+        cache.dump(case_replay_path(case, caches_dir))
+    # The last case has no cache file in caches_dir.
+
+    def _patched_path(case: Any) -> Any:
+        return case_replay_path(case, caches_dir)
+
+    monkeypatch.setattr(runner, "case_replay_path", _patched_path)
+
+    code = runner.main(["--replay"])
+    captured = capsys.readouterr()
+
+    # The missing-cache case is reported loudly but does not gate (exit code 0 as
+    # long as the recorded cases all passed).
+    assert code == 0
+    assert "[NO CACHE]" in captured.out
 
 
 def test_seed_store_never_touches_the_configured_memory_dir(
@@ -902,7 +1174,14 @@ class _ScriptedJudgeLLM:
     def __init__(self, *, raise_error: bool = False) -> None:
         self._raise = raise_error
 
-    def complete(self, messages: Sequence[Message], response_model: type[T]) -> Completion[T]:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        response_model: type[T],
+        *,
+        on_transport_retry: Any = None,
+        on_repair: Any = None,
+    ) -> Completion[T]:
         if self._raise:
             msg = "judge llm down"
             raise LLMError(msg)
@@ -922,7 +1201,7 @@ def test_judge_scores_and_emits_llm_call() -> None:
         def __init__(self) -> None:
             self.events: list[tuple[str, dict[str, Any]]] = []
 
-        def emit(self, event: str, payload: Mapping[str, Any], *, agent: str = "triage") -> None:  # noqa: ARG002
+        def emit(self, event: str, payload: Mapping[str, Any], *, agent: str = "triage") -> None:
             self.events.append((event, dict(payload)))
 
     rec = Rec()
@@ -953,7 +1232,7 @@ def test_runner_threads_judge_into_report() -> None:
     assert "judge:" in text
 
 
-def _format_report_with_judge(report: Any) -> str:  # noqa: ANN401
+def _format_report_with_judge(report: Any) -> str:
 
     return format_report([report])
 
@@ -966,14 +1245,128 @@ def test_format_report_renders_unscored_judge() -> None:
     assert "not scored" in format_report([report])
 
 
+# --- judge multi-sample median scoring (J2) -----------------------------------
+
+
+class _MultiScriptedJudgeLLM:
+    """An LLM that returns sequentially scripted scores, or raises on demand.
+
+    ``scores`` is a list of ``int | None``; ``None`` means raise ``LLMError``
+    for that call index. Once the list is exhausted the LLM raises to catch bugs.
+    """
+
+    model = "judge-model"
+
+    def __init__(self, scores: list[int | None]) -> None:
+        self._scores: list[int | None] = list(scores)
+        self._call_idx = 0
+
+    def complete(
+        self,
+        messages: Sequence[Message],
+        response_model: type[T],
+        *,
+        on_transport_retry: Any = None,
+        on_repair: Any = None,
+    ) -> Completion[T]:
+        if self._call_idx >= len(self._scores):
+            msg = "MultiScriptedJudgeLLM: script exhausted"
+            raise LLMError(msg)
+        val = self._scores[self._call_idx]
+        self._call_idx += 1
+        if val is None:
+            msg = "scripted judge failure"
+            raise LLMError(msg)
+        value = response_model.model_validate({"score": val, "rationale": f"score-{val}"})
+        return Completion(
+            value=value,
+            model=self.model,
+            prompt_hash=prompt_hash(messages),
+            tokens=0,
+            latency_ms=1,
+        )
+
+
+def test_judge_median_of_3_picks_median_score_and_journals_3_llm_calls() -> None:
+    # Scores: 40, 80, 60 → median = 60; rationale must come from the score-60 sample.
+    class Rec:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any]]] = []
+
+        def emit(self, event: str, payload: Mapping[str, Any], *, agent: str = "triage") -> None:
+            self.events.append((event, dict(payload)))
+
+    rec = Rec()
+    llm = _MultiScriptedJudgeLLM([40, 80, 60])
+    result = Judge(llm=llm, journal=rec, samples=3).score(_record())
+
+    assert result.scored
+    assert result.score == 60
+    assert result.rationale == "score-60"
+    # Exactly 3 llm_call events journaled, all purpose="judge".
+    judge_calls = [e for e in rec.events if e[0] == "llm_call"]
+    assert len(judge_calls) == 3
+    assert all(e[1]["purpose"] == "judge" for e in judge_calls)
+
+
+def test_judge_partial_failure_uses_median_of_successes() -> None:
+    # Scores: 70, None (fail), 50 → successes are [70, 50]; median = 60.
+    class Rec:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any]]] = []
+
+        def emit(self, event: str, payload: Mapping[str, Any], *, agent: str = "triage") -> None:
+            self.events.append((event, dict(payload)))
+
+    rec = Rec()
+    llm = _MultiScriptedJudgeLLM([70, None, 50])
+    result = Judge(llm=llm, journal=rec, samples=3).score(_record())
+
+    assert result.scored
+    assert result.score == 60
+    # Only 2 successful llm_call events journaled (the failing call is not journaled).
+    judge_calls = [e for e in rec.events if e[0] == "llm_call"]
+    assert len(judge_calls) == 2
+
+
+def test_judge_all_samples_fail_degrades_to_not_scored() -> None:
+    # All 3 samples raise → scored=False, never blocks.
+    llm = _MultiScriptedJudgeLLM([None, None, None])
+    result = Judge(llm=llm, journal=NoopJournal(), samples=3).score(_record())
+
+    assert not result.scored
+    assert result.score is None
+
+
+def test_judge_default_samples_1_is_byte_identical_to_original() -> None:
+    # samples=1 (the default) behaves exactly as before: one call, one llm_call event.
+    class Rec:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, Any]]] = []
+
+        def emit(self, event: str, payload: Mapping[str, Any], *, agent: str = "triage") -> None:
+            self.events.append((event, dict(payload)))
+
+    rec = Rec()
+    llm = _MultiScriptedJudgeLLM([75])
+    result = Judge(llm=llm, journal=rec).score(_record())  # default samples=1
+
+    assert result.scored
+    assert result.score == 75
+    judge_calls = [e for e in rec.events if e[0] == "llm_call"]
+    assert len(judge_calls) == 1
+
+
 # --- loaders + shipped cases + adapters --------------------------------------
 
 
-def test_all_six_golden_cases_parse() -> None:
-
+def test_all_golden_cases_parse() -> None:
+    # All 34 shipped cases (6 original + 24 extended + 4 new round-4) must parse
+    # and declare at least one assertion each.
     cases = load_cases(_CASES_DIR)
-    names = {c.name for c in cases}
-    assert names == {
+    assert len(cases) == 34
+    # Original core 6 must still be present.
+    core_names = {
         "exfil-prod",
         "priv-esc",
         "unknown-event-type",
@@ -981,6 +1374,15 @@ def test_all_six_golden_cases_parse() -> None:
         "tool-failure",
         "benign-after-flagged",
     }
+    assert core_names.issubset({c.name for c in cases})
+    # Round-4 new cases must also be present.
+    round4_names = {
+        "high-gate-denied",
+        "edge-prompt-injection",
+        "edge-max-steps-confidence",
+        "medium-recall-elevates",
+    }
+    assert round4_names.issubset({c.name for c in cases})
     # Each case declares at least one assertion (the skill bans decoration cases).
     for case in cases:
         populated = case.expect_trajectory.model_dump(

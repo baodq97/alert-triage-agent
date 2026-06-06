@@ -14,6 +14,7 @@ Tier A only: every test runs against ``FakeLLM`` or a mocked ``openai`` transpor
   ``LLMError`` at this seam — no other exception escapes.
 """
 
+import json as _json
 from typing import Any
 
 import pytest
@@ -21,11 +22,13 @@ from pydantic import BaseModel
 
 from triage.errors import ConfigError, LLMError
 from triage.llm import (
+    _REPAIR_ERROR_MAX_CHARS,
     LLM,
     Completion,
     FakeLLM,
     Message,
     OpenAICompatibleLLM,
+    _truncate_error,
     prompt_hash,
 )
 from triage.models import Verdict
@@ -252,7 +255,7 @@ class _FakeCompletions:
         self._script = list(script)
         self.requests: list[dict[str, Any]] = []
 
-    def create(self, **kwargs: Any) -> Any:  # noqa: ANN401 — mirrors the SDK signature
+    def create(self, **kwargs: Any) -> Any:
         self.requests.append(kwargs)
         item = self._script.pop(0)
         if isinstance(item, Exception):
@@ -414,3 +417,150 @@ def test_constructing_from_env_defaults_model_when_unset(monkeypatch: pytest.Mon
     monkeypatch.delenv("LLM_MODEL", raising=False)
     llm = OpenAICompatibleLLM()
     assert llm.model  # a non-empty default model name is set
+
+
+# --------------------------------------------------------------------------- #
+# _truncate_error: repair nudge error truncation (A5 / M4)                    #
+# --------------------------------------------------------------------------- #
+
+
+def test_truncate_error_short_string_unchanged() -> None:
+    """A string under the limit is returned as-is."""
+    short = "parse error"
+    assert _truncate_error(short) == short
+
+
+def test_truncate_error_exactly_at_limit_unchanged() -> None:
+    """A string exactly at the limit is not truncated."""
+    at_limit = "x" * _REPAIR_ERROR_MAX_CHARS
+    assert _truncate_error(at_limit) == at_limit
+
+
+def test_truncate_error_over_limit_truncates_with_marker() -> None:
+    """A string over the limit is cut and a trailing marker appended."""
+    long_error = "e" * (_REPAIR_ERROR_MAX_CHARS + 100)
+    result = _truncate_error(long_error)
+    assert result.endswith("…")
+    assert len(result) < len(long_error)
+    assert result[:_REPAIR_ERROR_MAX_CHARS] == "e" * _REPAIR_ERROR_MAX_CHARS
+
+
+def test_truncated_error_reaches_repair_nudge_in_correct_form() -> None:
+    """A long first_error causes the repair message to carry a truncated error."""
+    long_reply = "x" * (_REPAIR_ERROR_MAX_CHARS + 200) + '{"verdict":"ok","confidence":0.5}'
+
+    class _M(BaseModel):
+        verdict: str
+        confidence: float
+
+    llm = FakeLLM([long_reply, '{"verdict":"ok","confidence":0.5}'])
+    completion = llm.complete([Message(role="user", content="test")], _M)
+    # The repair call was made: two raw calls consumed.
+    assert llm.calls == 2
+    # The repair message's error is truncated.
+    repair_msg = llm.messages_by_call[1][-1]["content"]
+    # The repair message contains the truncated error, not the full long_reply.
+    assert "Error: " in repair_msg
+    error_part = repair_msg.split("Error: ", 1)[1]
+    assert len(error_part) <= _REPAIR_ERROR_MAX_CHARS + 1  # +1 for the "…" char
+    assert completion.value.verdict == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# B1 (M1) — per-attempt callbacks: on_transport_retry / on_repair             #
+# --------------------------------------------------------------------------- #
+
+
+def test_on_repair_callback_fires_when_first_reply_is_malformed() -> None:
+    """on_repair is called exactly once when the repair re-prompt fires."""
+    repairs: list[tuple[str, str]] = []
+    llm = FakeLLM(["not json", _valid_json()])
+
+    llm.complete(_MESSAGES, _Reply, on_repair=lambda p, e: repairs.append((p, e)))
+
+    assert len(repairs) == 1
+    _purpose, error = repairs[0]
+    assert "not" in error or "JSON" in error or "parse" in error.lower() or error
+
+
+def test_on_repair_callback_not_fired_on_clean_parse() -> None:
+    """on_repair is NOT called when the first reply parses cleanly."""
+    repairs: list[tuple[str, str]] = []
+    llm = FakeLLM([_valid_json()])
+
+    llm.complete(_MESSAGES, _Reply, on_repair=lambda p, e: repairs.append((p, e)))
+
+    assert repairs == []
+
+
+def test_on_transport_retry_fires_on_transport_failures() -> None:
+    """on_transport_retry is called once per retried transport failure."""
+    retries: list[tuple[str, int, str]] = []
+    llm, _ = _make_llm([RuntimeError("flaky"), RuntimeError("flaky2"), _Response(_valid_json())])
+
+    llm.complete(
+        _MESSAGES,
+        _Reply,
+        on_transport_retry=lambda p, a, e: retries.append((p, a, e)),
+    )
+
+    # Two failures, each retried once, so two callback invocations.
+    assert len(retries) == 2
+    attempts = [a for _, a, _ in retries]
+    assert attempts == [1, 2]
+
+
+def test_on_transport_retry_not_fired_when_first_attempt_succeeds() -> None:
+    """on_transport_retry is NOT called when transport succeeds on the first try."""
+    retries: list[Any] = []
+    llm, _ = _make_llm([_Response(_valid_json())])
+
+    llm.complete(
+        _MESSAGES,
+        _Reply,
+        on_transport_retry=lambda p, a, e: retries.append((p, a, e)),
+    )
+
+    assert retries == []
+
+
+def test_callbacks_default_to_none_and_complete_works_without_them() -> None:
+    """complete() without optional callbacks behaves identically to the old signature."""
+    llm = FakeLLM([_valid_json()])
+    result = llm.complete(_MESSAGES, _Reply)
+    assert result.value.verdict == "benign"
+
+
+# --------------------------------------------------------------------------- #
+# F1 — on_repair callback receives the TRUNCATED error, not the full string    #
+# --------------------------------------------------------------------------- #
+
+
+def test_on_repair_callback_receives_truncated_error_not_full_string() -> None:
+    """F1: on_repair is called with the already-truncated error string.
+
+    The callback payload must be bounded by ``_REPAIR_ERROR_MAX_CHARS`` + the
+    length of the ``"…"`` marker (1 char), never the full oversized error.
+    This ensures callers that journal the callback payload (planner, executor,
+    verdict) never persist a multi-KB Pydantic dump that may embed untrusted
+    model output.
+    """
+    # A reply that is valid JSON but violates the schema AND is over the error
+    # limit when Pydantic stringifies it.  We produce a reply that will cause a
+    # large Pydantic validation error by passing a string where a float is needed
+    # and a large garbage value to pad the error message.
+    large_garbage = "x" * (_REPAIR_ERROR_MAX_CHARS + 500)
+    # bad_reply: "confidence" is not a float and "verdict" carries the garbage.
+    bad_reply = _json.dumps({"verdict": large_garbage, "confidence": "not-a-float"})
+    # second reply succeeds
+    repairs: list[tuple[str, str]] = []
+    llm = FakeLLM([bad_reply, _valid_json()])
+
+    llm.complete(_MESSAGES, _Reply, on_repair=lambda p, e: repairs.append((p, e)))
+
+    assert len(repairs) == 1
+    _, error = repairs[0]
+    # The callback payload must be bounded — at most max_chars + the "…" marker.
+    assert len(error) <= _REPAIR_ERROR_MAX_CHARS + 1, (
+        f"on_repair received {len(error)} chars; expected at most {_REPAIR_ERROR_MAX_CHARS + 1}"
+    )

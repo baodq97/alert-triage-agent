@@ -1,0 +1,17 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0022",
+  "timestamp": "2026-05-10T17:00:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "medium",
+  "event_type": "quantum_key_rotation_anomaly",
+  "description": "Service account 'svc-deploy-prod' triggered a 'quantum_key_rotation_anomaly' event — a never-before-seen event type from a new hardware security module integration. The agent has no prior schema for this event type and must plan sensibly based solely on the entity and description.",
+  "entities": {
+    "service_account": "svc-deploy-prod"
+  },
+  "context": {
+    "hsm_id": "HSM-PROD-42",
+    "rotation_attempt_count": 7,
+    "success": false,
+    "note": "unknown event type — agent must not fail or skip planning"
+  }
+}

@@ -181,11 +181,15 @@ def _conclude() -> str:
     return json.dumps({"decision": "conclude", "rationale": "enough evidence"})
 
 
-def _verdict(*, actions: list[dict[str, Any]] | None = None) -> str:
+def _verdict(
+    *, actions: list[dict[str, Any]] | None = None, finding_entity: str | None = None
+) -> str:
+    statement = f"anomaly detected for user {finding_entity}" if finding_entity else "anomaly"
+    evidence = f"lookup_user confirmed {finding_entity}" if finding_entity else "lookup_user"
     return json.dumps(
         {
             "severity": "high",
-            "findings": [{"statement": "anomaly", "evidence": "lookup_user"}],
+            "findings": [{"statement": statement, "evidence": evidence}],
             "recommended_actions": actions or [],
             "confidence": 0.8,
         },
@@ -207,8 +211,13 @@ def test_jsonl_journal_covers_a_full_run_end_to_end(tmp_path: Path) -> None:
     run_dir = tmp_path / "run-e2e"
     journal = JsonlJournal(run_dir)
     actions = [{"name": "block_user", "params": {"user": "alice"}, "description": "block"}]
+    e2e_replies = [
+        _plan("lookup_user"),
+        _conclude(),
+        _verdict(actions=actions, finding_entity="alice"),
+    ]
     deps = TriageDeps(
-        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict(actions=actions)]),
+        llm=FakeLLM(e2e_replies),
         journal=journal,
         registry=ToolRegistry(),
         source=_BenignSource(),
@@ -314,8 +323,13 @@ def test_rebuild_reconstructs_views_from_a_full_run(tmp_path: Path) -> None:
     run_dir = tmp_path / "run-rebuild"
     journal = JsonlJournal(run_dir)
     actions = [{"name": "block_user", "params": {"user": "alice"}, "description": "block"}]
+    rebuild_replies = [
+        _plan("lookup_user"),
+        _conclude(),
+        _verdict(actions=actions, finding_entity="alice"),
+    ]
     deps = TriageDeps(
-        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict(actions=actions)]),
+        llm=FakeLLM(rebuild_replies),
         journal=journal,
         registry=ToolRegistry(),
         source=_BenignSource(),
@@ -425,6 +439,32 @@ def test_rebuild_ignores_an_llm_call_without_a_purpose(tmp_path: Path) -> None:
     path.write_text("".join(json.dumps(item) + "\n" for item in lines), encoding="utf-8")
     run = rebuild(path)
     assert run.llm_purposes == ["plan"]
+
+
+def test_rebuild_steps_after_last_revision_counts_steps_not_attempts(tmp_path: Path) -> None:
+    # A transient retry after a revision records TWO tool_result events for the same
+    # step (attempt 1 fails, attempt 2 succeeds).  steps_after_last_revision must
+    # count that as ONE step, not two, so resume does not inflate next_step_index and
+    # accidentally skip the revised step.
+    path = tmp_path / "journal.jsonl"
+    lines = [
+        {"seq": 1, "event": "run_started", "alert_id": "ALT-1"},
+        {"seq": 2, "event": "plan_created", "steps": [{"tool": "lookup_user"}]},
+        # Step 1 runs before the revision.
+        {"seq": 3, "event": "tool_called", "step": 1, "attempt": 1, "tool": "lookup_user"},
+        {"seq": 4, "event": "tool_result", "step": 1, "attempt": 1, "ok": True},
+        # Revision fires; the revised step would be step 2.
+        {"seq": 5, "event": "plan_revised", "steps": [{"tool": "check_reputation"}]},
+        # Step 2: attempt 1 fails (transient), attempt 2 recovers.
+        {"seq": 6, "event": "tool_called", "step": 2, "attempt": 1, "tool": "check_reputation"},
+        {"seq": 7, "event": "tool_result", "step": 2, "attempt": 1, "ok": False, "error": "t/o"},
+        {"seq": 8, "event": "tool_called", "step": 2, "attempt": 2, "tool": "check_reputation"},
+        {"seq": 9, "event": "tool_result", "step": 2, "attempt": 2, "ok": True, "data": {}},
+    ]
+    path.write_text("".join(json.dumps(item) + "\n" for item in lines), encoding="utf-8")
+    run = rebuild(path)
+    # The retry must count as 1 step, not 2.
+    assert run.steps_after_last_revision == 1
 
 
 def test_rebuild_event_without_seq_does_not_advance_last_seq(tmp_path: Path) -> None:

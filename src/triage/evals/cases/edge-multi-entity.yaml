@@ -1,0 +1,23 @@
+# Guards: an alert referencing 3+ entities simultaneously must not cause the agent to
+# stall or crash — all known entities get investigated and a coherent verdict is produced.
+name: edge-multi-entity
+alert: src/triage/evals/cases/alerts/edge-multi-entity.json
+expect:
+  trajectory:
+    must_call_tools: [lookup_user]                   # at minimum one known entity must be looked up
+    gate_before_high_risk: true
+    no_action_without_gate: true
+    max_steps_respected: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed, max_steps]     # complex multi-entity may hit max_steps
+  verdict:
+    severity_in: [medium, high, critical]            # coordinated multi-entity access = medium at minimum
+    confidence_min: 0.3
+    verdict_has_findings_with_citations: true
+reference:
+  expected_tools:
+    - name: lookup_user
+  expected_severity: high
+  expected_actions: []
+  ordered: false
+  exact: false

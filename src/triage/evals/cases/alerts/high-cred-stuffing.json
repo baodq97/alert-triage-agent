@@ -1,0 +1,20 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0009",
+  "timestamp": "2026-05-10T05:45:00Z",
+  "source": "siem",
+  "severity_hint": "high",
+  "event_type": "brute_force_then_success",
+  "description": "IAM user 'dev-intern-jpark' account recorded 58 consecutive failed login attempts from foreign IP 198.51.200.77 (AS: TOR exit node) over 4 minutes, followed by a successful authentication. The successful login did not prompt for MFA — MFA step was bypassed. This pattern is consistent with credential stuffing followed by MFA bypass.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "source_ip": "198.51.200.77"
+  },
+  "context": {
+    "failed_attempts": 58,
+    "success_after_failures": true,
+    "mfa_bypassed": true,
+    "ip_classification": "tor_exit_node",
+    "window_minutes": 4,
+    "note": "high-confidence credential stuffing with MFA bypass"
+  }
+}

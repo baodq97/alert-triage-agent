@@ -103,11 +103,24 @@ def _continue() -> str:
     return json.dumps({"decision": "continue", "rationale": "keep going"})
 
 
-def _verdict(*, actions: list[dict[str, Any]] | None = None, severity: str = "medium") -> str:
+def _verdict(
+    *,
+    actions: list[dict[str, Any]] | None = None,
+    severity: str = "medium",
+    finding_entity: str | None = None,
+) -> str:
+    # ``finding_entity`` plants the entity name in the finding corpus so
+    # ``_filter_traceable_actions`` (F5) can match action params to findings.
+    # When an action targets an entity, the finding must name that entity for
+    # the action to survive the traceability backstop.
+    statement = (
+        f"anomaly observed for user {finding_entity}" if finding_entity else "anomaly observed"
+    )
+    evidence = f"lookup_user confirmed {finding_entity}" if finding_entity else "lookup_user"
     return json.dumps(
         {
             "severity": severity,
-            "findings": [{"statement": "anomaly observed", "evidence": "lookup_user"}],
+            "findings": [{"statement": statement, "evidence": evidence}],
             "recommended_actions": actions or [],
             "confidence": 0.8,
         },
@@ -179,7 +192,7 @@ def test_tool_call_observation_reaches_verdict() -> None:
 def test_gate_deny_path_records_decision_and_ships_verdict() -> None:
     actions = [_block_user("alice")]
     deps, rec = _deps(
-        [_plan("lookup_user"), _conclude(), _verdict(actions=actions)],
+        [_plan("lookup_user"), _conclude(), _verdict(actions=actions, finding_entity="alice")],
         approve=False,
     )
     result = triage(_alert(), deps)
@@ -254,7 +267,7 @@ def test_max_steps_breach_ships_partial_verdict() -> None:
 def test_approve_path_executes_block_user() -> None:
     actions = [_block_user("alice")]
     deps, rec = _deps(
-        [_plan("lookup_user"), _conclude(), _verdict(actions=actions)],
+        [_plan("lookup_user"), _conclude(), _verdict(actions=actions, finding_entity="alice")],
         approve=True,
     )
     result = triage(_alert(), deps)
@@ -270,10 +283,11 @@ def test_approve_path_executes_block_user() -> None:
 
 
 def test_target_invariant_rejects_non_entity_action_before_gate() -> None:
-    # 'mallory' is not an alert entity value: the action is rejected before the gate.
+    # 'mallory' is not an alert entity value: the action passes F5 (mallory is in the
+    # finding corpus) but is rejected by the target-entity invariant before the gate.
     actions = [_block_user("mallory")]
     deps, rec = _deps(
-        [_plan("lookup_user"), _conclude(), _verdict(actions=actions)],
+        [_plan("lookup_user"), _conclude(), _verdict(actions=actions, finding_entity="mallory")],
         approve=True,
     )
     result = triage(_alert(), deps)
@@ -359,9 +373,11 @@ def test_malformed_targeted_action_rejected_with_missing_target_reason() -> None
 def test_valid_targeted_unknown_entity_rejected_with_not_an_entity_reason() -> None:
     # A `block_user` whose target is a real string but NOT an alert entity value is
     # rejected with the accurate "target is not an alert entity" reason.
+    # finding_entity="mallory" ensures the action survives F5 (mallory in findings)
+    # so the target-entity invariant can fire as the deciding check.
     actions = [_block_user("mallory")]
     deps, rec = _deps(
-        [_plan("lookup_user"), _conclude(), _verdict(actions=actions)],
+        [_plan("lookup_user"), _conclude(), _verdict(actions=actions, finding_entity="mallory")],
         approve=True,
     )
     triage(_alert(), deps)
@@ -382,7 +398,7 @@ def test_rejected_is_pre_gate_and_skipped_is_post_gate_in_one_batch() -> None:
     # one overloaded event discriminated by a free-text reason.
     actions = [_block_user("mallory"), _advisory()]  # rejected (bad target) + skipped (no executor)
     deps, rec = _deps(
-        [_plan("lookup_user"), _conclude(), _verdict(actions=actions)],
+        [_plan("lookup_user"), _conclude(), _verdict(actions=actions, finding_entity="mallory")],
         approve=True,
     )
     triage(_alert(), deps)
@@ -441,7 +457,7 @@ def test_zero_touch_run_emits_no_gate_events() -> None:
 def test_summarize_renders_verdict_and_gate(tmp_path: Path) -> None:
     actions = [_block_user("alice")]
     deps, _ = _deps(
-        [_plan("lookup_user"), _conclude(), _verdict(actions=actions)],
+        [_plan("lookup_user"), _conclude(), _verdict(actions=actions, finding_entity="alice")],
         approve=True,
     )
     result = triage(_alert(), deps)
@@ -474,8 +490,16 @@ class _CapturingLLM(FakeLLM):
         self,
         messages: Sequence[Message],
         response_model: type[InvestigationPlan],
+        *,
+        on_transport_retry: Any = None,
+        on_repair: Any = None,
     ) -> Completion[InvestigationPlan]:
-        completion = super().complete(messages, response_model)
+        completion = super().complete(
+            messages,
+            response_model,
+            on_transport_retry=on_transport_retry,
+            on_repair=on_repair,
+        )
         self.all_messages.append(list(messages))
         return completion
 
@@ -509,7 +533,7 @@ def test_recall_flows_into_the_planner_prompt(tmp_path: Path) -> None:
     )
     triage(_alert(), deps, run_id="recall-run")
 
-    plan_prompt = capture.all_messages[0][0]["content"]
+    plan_prompt = "\n".join(m["content"] for m in capture.all_messages[0])
     assert "<recalled_memory>" in plan_prompt
     assert "</recalled_memory>" in plan_prompt
     # The seeded finding statement is rendered inside the untrusted block.
@@ -575,7 +599,7 @@ def test_memory_none_no_recall_block_and_no_writes(tmp_path: Path) -> None:
     )
     triage(_alert(), deps, run_id="no-memory-run")
 
-    plan_prompt = capture.all_messages[0][0]["content"]
+    plan_prompt = "\n".join(m["content"] for m in capture.all_messages[0])
     assert "<recalled_memory>" not in plan_prompt
     # No store was constructed, so nothing landed under tmp_path.
     assert list(tmp_path.iterdir()) == []
@@ -620,7 +644,9 @@ def test_deferred_gate_high_risk_parks_run_as_awaiting_approval() -> None:
     actions = [_block_user("alice")]
     rec = RecordingJournal()
     deps = TriageDeps(
-        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict(actions=actions)]),
+        llm=FakeLLM(
+            [_plan("lookup_user"), _conclude(), _verdict(actions=actions, finding_entity="alice")]
+        ),
         journal=rec,
         registry=ToolRegistry(),
         source=StubSource(),
@@ -674,9 +700,9 @@ class _RaisingJournal:
     def emit(
         self,
         event: str,
-        payload: Mapping[str, Any],  # noqa: ARG002 — protocol signature.
+        payload: Mapping[str, Any],
         *,
-        agent: str = "triage",  # noqa: ARG002 — protocol signature.
+        agent: str = "triage",
     ) -> None:
         self.names.append(event)
         if event == self._fail_on:
@@ -736,9 +762,9 @@ class _AlwaysFailingJournal:
     def emit(
         self,
         event: str,
-        payload: Mapping[str, Any],  # noqa: ARG002 — protocol signature.
+        payload: Mapping[str, Any],
         *,
-        agent: str = "triage",  # noqa: ARG002 — protocol signature.
+        agent: str = "triage",
     ) -> None:
         self.names.append(event)
         msg = f"every emit fails — including the best-effort terminate ({event!r})"

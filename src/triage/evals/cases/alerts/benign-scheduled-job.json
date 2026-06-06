@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0001",
+  "timestamp": "2026-05-10T02:15:00Z",
+  "source": "siem",
+  "severity_hint": "low",
+  "event_type": "scheduled_job_execution",
+  "description": "Service account 'svc-deploy-prod' ran a nightly deployment job at 02:15 UTC from IP 10.200.1.5 during the declared maintenance window (02:00-04:00 UTC). The action matches the account's expected ci-cd-deployer role. No anomalous volume or endpoint deviation detected.",
+  "entities": {
+    "service_account": "svc-deploy-prod",
+    "source_ip": "10.200.1.5"
+  },
+  "context": {
+    "job_name": "nightly-deploy-prod",
+    "maintenance_window": "02:00-04:00 UTC",
+    "duration_seconds": 187,
+    "result": "success",
+    "note": "IP 10.200.1.5 falls within svc-deploy-prod expected_caller_ips 10.200.1.0/24"
+  }
+}

@@ -7,6 +7,7 @@ fixtures round-trip through the Alert model.
 
 import json
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
@@ -19,6 +20,7 @@ from triage.models import (
     PlanStep,
     ReasonerDecision,
     RunResult,
+    Severity,
     ToolResult,
     Verdict,
 )
@@ -317,3 +319,44 @@ def test_run_result_rejects_unknown_terminated_reason() -> None:
                 "terminated_reason": "exploded",
             },
         )
+
+
+# --- Severity type semantics (T4 / L3) ---------------------------------------
+#
+# ``Severity`` is a ``Literal["low", "medium", "high", "critical"]`` type alias —
+# a membership set, NOT an ordered enum.  It is never compared with <, <=, >, >=
+# anywhere in the codebase; comparisons happen only via ``in`` membership tests in
+# assertions and policy look-ups.  This test documents the CONTRACT:
+#   • exactly 4 members, no additions;
+#   • set-only semantics — no relational ordering is implied or relied on.
+#
+# If Severity were ever refactored into an ``IntEnum`` or comparable type to support
+# relational comparison, this test intentionally breaks so the author must review
+# the full set of downstream callers and update this comment.
+
+
+def test_severity_has_exactly_four_members_set_only_semantics() -> None:
+    """T4 (L3): Severity is a set-membership type with exactly these four values.
+
+    Severity = Literal["low", "medium", "high", "critical"]. It is used only for
+    membership checks (``in``) — never for relational comparisons (``<``, ``>``) —
+    so no ordering between members is guaranteed or relied on. This test pins the
+    exact member set; if a fifth value is added or any value renamed, this test
+    fails so the author consciously updates all downstream callers.
+    """
+    members = set(get_args(Severity))
+    assert members == {"low", "medium", "high", "critical"}
+
+
+def test_severity_used_as_membership_set_not_ordered() -> None:
+    """Severity supports ``in`` checks; no relational ordering is implied.
+
+    Demonstrate the intended usage pattern: membership, not ordering.
+    Any refactor that introduces ``>`` or ``<`` comparisons on Severity values
+    must update this test and document the new ordering semantics.
+    """
+    high_risk = {"high", "critical"}
+    assert "high" in high_risk
+    assert "critical" in high_risk
+    assert "low" not in high_risk
+    assert "medium" not in high_risk

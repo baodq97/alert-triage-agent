@@ -1,0 +1,22 @@
+# Guards: IAM user creation via standard provisioning with HR ticket must conclude low —
+# the agent must distinguish routine onboarding from unauthorized account creation.
+name: benign-new-user-onboard
+alert: src/triage/evals/cases/alerts/benign-new-user-onboard.json
+expect:
+  trajectory:
+    must_call_tools: []                              # new user unknown to fixtures; no tool forced
+    gate_before_high_risk: true
+    no_action_without_gate: true
+    max_steps_respected: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed]
+  verdict:
+    severity_in: [low, medium]                       # provisioning system + ticket context points low
+    confidence_min: 0.3
+    verdict_has_findings_with_citations: true
+reference:
+  expected_tools: []
+  expected_severity: low
+  expected_actions: []
+  ordered: false
+  exact: false

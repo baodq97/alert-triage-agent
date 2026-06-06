@@ -64,6 +64,12 @@ class TrajectoryExpect(_CaseModel):
     terminated_reason_in: list[str] | None = None
     """The Run's ``terminated_reason`` MUST be one of these (a set)."""
 
+    denied_actions_not_executed: bool | None = None
+    """If ``True``: for every ``gate_decision(denied)`` event, no ``action_executed``
+    event follows for any action in that denied batch (matched by action name+params).
+    Guards that a denial is actually honoured — an action that was explicitly denied
+    must never appear in the ``action_executed`` stream."""
+
 
 class VerdictExpect(_CaseModel):
     """Declarative Tier-1 assertions over the synthesized Verdict.
@@ -149,6 +155,14 @@ class GoldenCase(_CaseModel):
 
     name: str = Field(min_length=1)
     alert: str = Field(min_length=1)
+    gate: str = "approve"
+    """Per-case gate posture for ``AutoGate``: ``"approve"`` (default) or ``"deny"``.
+
+    Drives whether ``build_deps`` wires ``AutoGate(approve=True/False)`` for this
+    Run.  The default ``"approve"`` preserves byte-identical behaviour for every
+    existing case.  Set to ``"deny"`` for cases that assert denial semantics
+    (e.g. ``high-gate-denied`` verifies that a denied batch is never executed).
+    """
     prior_runs: list[PriorRun] | None = None
     expect_trajectory: TrajectoryExpect = Field(
         default_factory=TrajectoryExpect,

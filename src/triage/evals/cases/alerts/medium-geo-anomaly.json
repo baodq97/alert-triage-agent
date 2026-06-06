@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0014",
+  "timestamp": "2026-05-10T10:15:00Z",
+  "source": "edr",
+  "severity_hint": "medium",
+  "event_type": "geo_anomaly_login",
+  "description": "IAM user 'dev-intern-jpark' successfully authenticated from IP 91.108.4.22, geolocated to Warsaw, Poland. The account's previous logins were all from the US. MFA was satisfied. The user has not filed a travel notice. This may be a legitimate remote session or an account takeover attempt.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "source_ip": "91.108.4.22"
+  },
+  "context": {
+    "geolocation": "Warsaw, Poland",
+    "previous_login_countries": ["US"],
+    "mfa_satisfied": true,
+    "travel_notice": false,
+    "note": "unusual country with MFA — ambiguous; could be travel or account takeover"
+  }
+}

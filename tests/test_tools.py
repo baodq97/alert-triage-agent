@@ -62,7 +62,7 @@ class _ScriptedSource:
         self._script = list(script)
         self.calls = 0
 
-    def fetch(self, tool: str, args: Mapping[str, Any]) -> dict[str, Any]:  # noqa: ARG002
+    def fetch(self, tool: str, args: Mapping[str, Any]) -> dict[str, Any]:
         self.calls += 1
         outcome = self._script.pop(0)
         if isinstance(outcome, ToolError):

@@ -20,10 +20,14 @@ src/triage/
 ├── journal.py              # append-only JSONL emit + rebuild state for resume
 ├── gate.py                 # RiskPolicy (YAML config) + ApprovalGate Protocol + CLIGate + AutoGate
 ├── verdict.py              # findings → structured Verdict (LLM)
+├── rendering.py            # shared LLM-facing rendering primitives (leaf — no journal calls, no LLM calls):
+│                           #   truncate, dump_compact, dump_alert, split_stable_dynamic,
+│                           #   observation_tag (with tool-name attribute sanitization), journal_llm_callbacks.
+│                           #   Rule: rendering helpers live here; journal keeps full data.
 ├── memory/                 # L1 atoms, L2 dossiers, L3 posture; entity-scoped recall
 ├── tools/                  # registry.py (4 read-only investigation tools), base.py (Tool + DataSource Protocol),
 │                           # actions.py (response actions: block_user — post-gate only), fixture_source.py, fixtures/*.json
-└── evals/                  # runner.py, cases/*.yaml, replay
+└── evals/                  # runner.py, cases/*.yaml (one dir, 34+ golden cases), assertions.py, replay.py, judge.py
 prompts/*.md                # ALL LLM prompts (planner.md, reasoner.md, verdict.md, judge.md)
 tests/test_{module}.py
 alerts/*.json               # sample inputs
@@ -31,7 +35,9 @@ runs/<run_id>/              # runtime artifacts (gitignored): journal.jsonl (app
                             # result.json (versioned run record), alert.json (input copy — resume rebuilds without the original path)
 ```
 
-Dependency direction: `models` ← everything; `journal`/`llm`/`tools`/`gate` are leaves consumed by `planner`/`executor`/`verdict`; nothing imports `run.py`. The core entrypoint `triage(alert, deps)` is transport-agnostic — adapters live only in `run.py`.
+Dependency direction: `models` ← everything; `journal`/`llm`/`tools`/`gate`/`rendering` are leaves consumed by `planner`/`executor`/`verdict`; nothing imports `run.py`. The core entrypoint `triage(alert, deps)` is transport-agnostic — adapters live only in `run.py`.
+
+**Where does this go?** LLM-facing text transformations (truncation, compact JSON serialization, observation tag generation, prompt splitting, callback factories) live in `rendering.py`. Callers (`planner`, `executor`, `verdict`) import from there; they never re-implement these primitives. Journal *data* (full un-truncated payloads) stays in journal events — rendering may truncate for the *prompt* only.
 
 ## Alert contract
 
@@ -51,6 +57,11 @@ Typed envelope (required): `alert_id`, `timestamp`, `source`, `severity_hint`, `
 
 `Action = {name, params?, description?}`. `RiskPolicy` classifies on exact `Action.name` match; unmatched names default to high-risk.
 
+**Severity / confidence decoupling contract:** severity rates the *threat pattern's potential impact if true*; confidence rates the *quality of gathered evidence*. They are independent axes. A high-severity verdict with low confidence is CORRECT calibration for an unverifiable threat — it is never a miscalibration. Case authors and the judge must apply this:
+
+- `_clamp_by_evidence` (binary contract): when `ok_count == 0` (every tool returned `ok=False`), confidence is clamped to `[0.30, 0.40]` and all recommended actions are stripped. When `ok_count >= 1`, the LLM calibrates freely — no clamp applies.
+- `_filter_traceable_actions` (quality heuristic, NOT a security boundary): for targeted actions (those in `TARGETED_ACTIONS`), at least one string param value must appear as a case-insensitive substring in some finding statement or evidence. Actions that fail this check are dropped and logged as `action_dropped_untraceable`. Untargeted advisory actions (e.g. `notify_soc`) are always passed through unchanged. This backstop drops ungrounded hallucinations; it does not defend against adversarial alert payloads (the actual security boundary is the target-entity invariant at the gate).
+
 ## Journal event schema
 
 One JSON object per line, append-only, never mutated. Common fields: `seq` (monotonic int), `event_id` (uuid — adapters bind to ids, not log positions), `ts` (ISO-8601), `event`, `agent` (`"triage"` default; `"threat-intel"` for the US-0005 delegated loop). Event types and their payload fields:
@@ -62,17 +73,24 @@ One JSON object per line, append-only, never mutated. Common fields: `seq` (mono
 | `plan_created` / `plan_revised` | `steps` |
 | `tool_called` | `step`, `tool`, `args`, `attempt` |
 | `tool_result` | `step`, `attempt`, `ok`, `data` \| `error` |
+| `llm_transport_retry` | `purpose`, `attempt` (1-based, matches the retry counter), `error` (string) — fired before each sleep in the retry loop; journaled via `journal_llm_callbacks` from `rendering.py` |
+| `llm_repair` | `purpose`, `error` (string, truncated to 500 chars before journal emit) — fired once when the one-repair-attempt fires on malformed structured output |
 | `action_rejected` | `action`, `reason` — PRE-gate only: target-entity invariant ("missing required target" \| "target is not an alert entity"); always precedes `gate_requested` |
 | `gate_requested` | `actions` (batched), `risk` |
 | `gate_decision` | `decision` (approved/denied), `by` |
 | `action_executed` | `action`, `result` |
 | `action_skipped` | `action`, `reason` — POST-gate only: an approved action with no registered executor ("no executor for action"); per approved action, `action_executed` XOR `action_skipped` follows `gate_decision(approved)` |
+| `action_dropped_untraceable` | `action`, `reason` — emitted by `verdict.py`'s `_filter_traceable_actions` when a targeted action's entity param cannot be found in any finding statement/evidence; this is a quality backstop (not a security boundary), applied on the `ok_count >= 1` path only |
 | `verdict` | full verdict object |
 | `run_terminated` | `reason` (completed/max_steps/awaiting_approval/error) |
 
 A `tool_called`→`tool_result` pair shares the same `step` + `attempt` — reconstructable without positional inference (eval adapters depend on this).
 
 Renaming a field here is a breaking change for resume rebuild AND eval assertions — update all three together.
+
+**Resume forward compatibility:** `_RunBuilder.fold` dispatches on known event names only; an unknown event type (e.g. `llm_transport_retry`, `llm_repair`, `action_dropped_untraceable`) is stored in `ReconstructedRun.events` (the raw audit trail) but folds into no typed view. Resume never crashes on forward-compatible journal additions.
+
+**`ReconstructedRun.steps_after_last_revision`:** the count of completed Tool Steps (i.e. `tool_result` events) recorded strictly after the last `plan_revised` event. Zero when no revision was recorded (the linear case). Resume uses this to index into the last revision's plan steps instead of the broken `steps_executed − n_revisions` arithmetic, which fails when a single revision fires at step ≥ 2. `_RunBuilder` resets this counter each time a new `plan_revised` event is seen.
 
 ## HITL gate
 
@@ -95,6 +113,18 @@ Wave 1 MUST define these boundaries even where the real implementation comes lat
 ## Prompt-file rules (ADR-0005)
 
 All prompts live in `prompts/*.md` — never inline strings. Every template that includes alert content **delimits and labels the untrusted payload apart from instructions** (a generic labeled block, e.g. `<alert_payload>…</alert_payload>`; no per-event-type schema). Recalled memory gets the same labeling (untrusted context, with source run-id + confidence). Verdict safety is never delegated to prompt discipline — the deterministic checks (severity enum, RiskPolicy allowlist, target-entity invariant) enforce it in code.
+
+**`{{END_OF_STABLE}}` placement contract (prefix-cache boundary):**
+
+- `planner.md`: sentinel goes BEFORE `<alert_payload>` — the stable part is the full instruction block including tool specs; the per-call data (alert + memory recall) is the dynamic part. Stable prefix is instructions-only (~constant across all runs).
+- `reasoner.md` and `verdict.md`: sentinel goes AFTER `<alert_payload>` — the stable part includes instructions AND the alert payload (which is fixed for the duration of one run); per-step observations / findings are the dynamic part. This extends the effective cache hit for the many reasoner calls within a single run.
+- Tests in `tests/test_prompts.py` pin the sentinel invariant for all three prompts — any placement change must update those tests.
+
+**Rendering conventions (quality-wave standards):**
+- JSON payloads rendered with `dump_compact` (no indent, `sort_keys=True`) — stable bytes, smaller prompts.
+- Tool observations rendered as `<observation step="N" tool="T" ok="B">…</observation>` tags via `rendering.observation_tag`; the `tool` attribute value is sanitized to `[A-Za-z0-9_-]` before interpolation (XSS/attribute-injection guard — ADR-0005 threat).
+- Observation body data is truncated to 4000 chars at the render seam (via `rendering.truncate`) before being embedded in the prompt; the journal stores the full un-truncated data.
+- Tool lists wrapped in `<tools>…</tools>`; output schema wrapped in `<output_schema>…</output_schema>` for unambiguous untrusted-content boundaries.
 
 ## Test architecture (resolves the 100%-coverage × real-LLM × no-key triangle)
 

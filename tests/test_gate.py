@@ -304,6 +304,51 @@ def test_cli_gate_accepts_whitespace_and_case_insensitive_yes(
     assert decision == GateDecision(decision="approved", by="cli")
 
 
+# --------------------------------------------------------------------------- #
+# B3 (M3) — EOF-safe CLIGate                                                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_gate_eof_denies_and_run_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EOFError from input() (e.g. piped stdin) must produce denied, not crash."""
+
+    def _raise_eof(_prompt: str = "") -> str:
+        raise EOFError
+
+    journal = RecordingJournal()
+    gate = CLIGate(journal)
+    policy = _high_risk_policy(tmp_path)
+    monkeypatch.setattr("builtins.input", _raise_eof)
+
+    decision = gate.request([Action(name="block_user")], policy)
+
+    assert decision == GateDecision(decision="denied", by="cli")
+    names = [event for event, _, _ in journal.events]
+    assert "gate_decision" in names
+    gd = next(p for e, p, _ in journal.events if e == "gate_decision")
+    assert gd["decision"] == "denied"
+
+
+def test_cli_gate_keyboard_interrupt_denies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """KeyboardInterrupt (Ctrl-C) must produce denied, not crash."""
+
+    def _raise_kbi(_prompt: str = "") -> str:
+        raise KeyboardInterrupt
+
+    journal = RecordingJournal()
+    gate = CLIGate(journal)
+    policy = _high_risk_policy(tmp_path)
+    monkeypatch.setattr("builtins.input", _raise_kbi)
+
+    decision = gate.request([Action(name="block_user")], policy)
+
+    assert decision == GateDecision(decision="denied", by="cli")
+
+
 def test_a_plain_object_is_not_an_approval_gate() -> None:
     assert not isinstance(object(), ApprovalGate)
 

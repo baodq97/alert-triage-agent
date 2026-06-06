@@ -1,0 +1,17 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0017",
+  "timestamp": "2026-05-10T12:00:00Z",
+  "source": "siem",
+  "severity_hint": "medium",
+  "event_type": "suspicious_api_access",
+  "description": "Entity 'phantom-user-zx9k' attempted to access an admin endpoint. The entity is not registered in any known identity provider. All investigation tools return not-found for this entity. The agent must adapt and still produce a verdict.",
+  "entities": {
+    "iam_user": "phantom-user-zx9k",
+    "source_ip": "203.0.113.99"
+  },
+  "context": {
+    "endpoint": "/admin/system/config",
+    "auth_result": "unauthorized",
+    "note": "completely unknown entity — all fixture lookups will return not-found"
+  }
+}

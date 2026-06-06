@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0004",
+  "timestamp": "2026-05-10T13:45:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "low",
+  "event_type": "iam_user_created",
+  "description": "A new IAM user 'dev-intern-alice' was created by administrator 'admin-lchen' following standard onboarding procedure. The user was assigned the standard 'developer-readonly' role and MFA enrollment was initiated. HR ticket HR-4521 covers this hire.",
+  "entities": {
+    "iam_user": "dev-intern-alice",
+    "actor": "admin-lchen"
+  },
+  "context": {
+    "assigned_role": "developer-readonly",
+    "mfa_enrollment_initiated": true,
+    "hr_ticket": "HR-4521",
+    "provisioning_system": "okta-scim",
+    "note": "normal onboarding flow, expected by HR record"
+  }
+}

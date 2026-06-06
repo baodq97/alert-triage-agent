@@ -187,8 +187,8 @@ def triage(alert: Alert, deps: TriageDeps, *, run_id: str | None = None) -> RunR
                 "schema_version": SCHEMA_VERSION,
             },
         )
-        observations, terminated_reason = _investigate(alert, deps)
-        return _conclude_run(alert, deps, observations, terminated_reason, run_id=run_id)
+        observation_entries, terminated_reason = _investigate(alert, deps)
+        return _conclude_run(alert, deps, observation_entries, terminated_reason, run_id=run_id)
     except JournalError:
         return _degraded_on_journal_error(deps, run_id)
 
@@ -236,7 +236,7 @@ def _best_effort_terminate(journal: Journal, reason: TerminatedReason) -> None:
 def _conclude_run(
     alert: Alert,
     deps: TriageDeps,
-    observations: list[ToolResult],
+    observation_entries: list[ObservationEntry],
     terminated_reason: TerminatedReason,
     *,
     run_id: str,
@@ -249,11 +249,17 @@ def _conclude_run(
     emitted by the gate, no ``gate_decision`` follows, and the run-level
     ``terminated_reason`` becomes ``awaiting_approval`` while the Verdict keeps its
     investigation reason.
+
+    ``observation_entries`` carries the full ``ObservationEntry`` list so the verdict
+    renderer can use real executor step numbers (``entry.step``) instead of
+    re-deriving them from position — preserving step fidelity when guard-refused
+    steps create numbering gaps in the journal.
     """
     synthesizer = VerdictSynthesizer(llm=deps.llm, journal=deps.journal)
     verdict = synthesizer.synthesize(
         alert,
-        observations=observations,
+        observations=[entry.result for entry in observation_entries],
+        observation_steps=[entry.step for entry in observation_entries],
         terminated_reason=terminated_reason,
     )
     # Persist L1 atoms at verdict time (RFC-0001 §Memory: "finding atoms persisted at
@@ -290,14 +296,14 @@ def _conclude_run(
     )
 
 
-def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ToolResult], TerminatedReason]:
-    """Plan and execute, returning the Observations and the terminated reason.
+def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ObservationEntry], TerminatedReason]:
+    """Plan and execute, returning the ObservationEntry list and the terminated reason.
 
     A planner ``LLMError`` means the plan never happened: execution is skipped and
     the reason is ``"error"`` with no gathered material. Otherwise the executor's
-    ``ObservationEntry`` trajectory is adapted to the verdict seam (the bare
-    ``ToolResult`` list Findings cite) and its ``terminated_reason`` carries
-    through.
+    ``ObservationEntry`` trajectory carries through — including each entry's real
+    ``step`` number — so the verdict renderer can use the journal-faithful step
+    attributes rather than re-deriving them from position.
     """
     planner = Planner(llm=deps.llm, journal=deps.journal, tool_specs=deps.registry.specs())
     # Recall is entity-scoped and best-effort (the store never raises); ``None`` when
@@ -317,8 +323,7 @@ def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ToolResult], Term
         max_steps=deps.max_steps,
     )
     execution = executor.run(alert, plan)
-    observations = [entry.result for entry in execution.observations]
-    return observations, execution.terminated_reason
+    return execution.observations, execution.terminated_reason
 
 
 def _accept_actions(
@@ -379,6 +384,28 @@ def _as_decision(outcome: GateOutcome) -> GateDecision | None:
     return outcome if isinstance(outcome, GateDecision) else None
 
 
+def _dispatch_action(action: Action, deps: TriageDeps) -> Action | None:
+    """Execute one approved Action and emit its journal event; return it or ``None``.
+
+    The single post-gate dispatch helper shared by ``_resolve_gate`` and
+    ``_execute_one``: an action with a registered executor runs and emits
+    ``action_executed``; one without emits ``action_skipped`` (a capability gap, not
+    a denial) and returns ``None``.  This is the single source of truth for the
+    post-gate emit pattern — neither ``_resolve_gate`` nor ``_execute_one`` duplicate
+    it.
+    """
+    executor = _ACTION_EXECUTORS.get(action.name)
+    if executor is None:
+        deps.journal.emit(
+            "action_skipped",
+            {"action": action.model_dump(), "reason": "no executor for action"},
+        )
+        return None
+    result = executor(action)
+    deps.journal.emit("action_executed", {"action": action.model_dump(), "result": result})
+    return action
+
+
 def _resolve_gate(
     decision: GateDecision | None,
     accepted: Sequence[Action],
@@ -412,16 +439,9 @@ def _resolve_gate(
         return [decision], []
     executed: list[Action] = []
     for action in deps.policy.high_risk(accepted):
-        executor = _ACTION_EXECUTORS.get(action.name)
-        if executor is None:
-            deps.journal.emit(
-                "action_skipped",
-                {"action": action.model_dump(), "reason": "no executor for action"},
-            )
-            continue
-        result = executor(action)
-        deps.journal.emit("action_executed", {"action": action.model_dump(), "result": result})
-        executed.append(action)
+        dispatched = _dispatch_action(action, deps)
+        if dispatched is not None:
+            executed.append(dispatched)
     return [decision], executed
 
 
@@ -449,6 +469,11 @@ def resume_investigation(
       ``conclude``) is *not* in the journal (``llm_call`` records only metadata), so
       it is not reconstructable; ``Executor.resume`` re-fires the deferred reason
       call over the rebuilt Observations with fresh LLM reasoning.
+    * **Plan revisions — honoured.** When ``plan_revisions`` is non-empty, the
+      remaining work is rebuilt from the *last revision's* steps indexed by the
+      steps executed after that revision — so a kill-after-revision resumes on the
+      revised step, not on the original plan's next step.  The original plan is used
+      only when no revision was recorded (the common linear case).
 
     The investigation then continues into the shared run tail (synthesize -> gate ->
     terminate), so a resumed Run reaches a Verdict exactly as a fresh one does.
@@ -463,7 +488,6 @@ def resume_investigation(
             f"(terminated_reason={reconstructed.terminated_reason!r})"
         )
         raise GateError(msg)
-    plan = InvestigationPlan(steps=[PlanStep.model_validate(s) for s in reconstructed.plan_steps])
     # Collapse the rebuilt Observations to ONE per executor Step: a transient tool
     # retry records two ``tool_result`` events (two ``StepObservation`` rows) for a
     # single Step (cf. AC2 retry visibility), and the executor keeps one Observation
@@ -472,7 +496,34 @@ def resume_investigation(
     # which a retry would inflate, silently dropping a remaining Plan Step.
     by_step = {obs.step: obs for obs in reconstructed.observations}
     pre_observations = [_rebuild_observation(by_step[step]) for step in sorted(by_step)]
-    next_step_index = max(by_step, default=0)
+    # Resume-after-revision: when the executor revised the plan mid-run, the last
+    # recorded ``plan_revised`` steps replace the original plan for the remaining
+    # work.  The executor's ``revise_plan`` dispatch replaces pending with exactly
+    # one step, so each revision record in ``plan_revisions`` carries a one-element
+    # list (the single next_step).  To find which of the last revision's steps have
+    # already executed, we look at ``reconstructed.steps_after_last_revision`` — the
+    # count of tool_result events recorded *strictly after* the last ``plan_revised``
+    # event (computed by the journal rebuild from event ordering, not arithmetic).
+    # This is correct regardless of when in the run the revision fired: revision at
+    # step 1 or step 5 both yield the right 0-or-1 index into the (1-element)
+    # revised step list.
+    # If no revisions were recorded, fall back to the original plan (linear case).
+    if reconstructed.plan_revisions:
+        last_revision_steps = reconstructed.plan_revisions[-1]
+        plan = InvestigationPlan(steps=[PlanStep.model_validate(s) for s in last_revision_steps])
+        # Clamp next_step_index to the length of the revision's step list for
+        # forward-compatibility: today every revision records exactly one step
+        # (the 1-step invariant; see executor._dispatch), so
+        # ``steps_after_last_revision`` is 0 or 1 and the index is always valid.
+        # If a future revision ever records multiple steps, the count is still a
+        # step-count, not a position guarantee, and clamping prevents an
+        # out-of-bounds index from crashing a resume.
+        next_step_index = min(reconstructed.steps_after_last_revision, len(last_revision_steps))
+    else:
+        plan = InvestigationPlan(
+            steps=[PlanStep.model_validate(s) for s in reconstructed.plan_steps]
+        )
+        next_step_index = len(by_step)
     executor = Executor(
         llm=deps.llm,
         journal=deps.journal,
@@ -486,8 +537,9 @@ def resume_investigation(
         pre_observations=pre_observations,
         next_step_index=next_step_index,
     )
-    observations = [entry.result for entry in execution.observations]
-    return _conclude_run(alert, deps, observations, execution.terminated_reason, run_id=run_id)
+    return _conclude_run(
+        alert, deps, execution.observations, execution.terminated_reason, run_id=run_id
+    )
 
 
 def resume_approve(
@@ -574,20 +626,11 @@ def _pending_batch(reconstructed: ReconstructedRun, run_id: str) -> list[Action]
 def _execute_one(action: Action, deps: TriageDeps) -> list[Action]:
     """Execute one approved Action (or record ``action_skipped`` when unexecutable).
 
-    Mirrors ``_resolve_gate``'s post-gate dispatch for a single Action: an action
-    with a registered executor runs and records ``action_executed``; one without is
-    recorded ``action_skipped`` (a capability gap, never a crash) and not returned.
+    Delegates to ``_dispatch_action`` — the shared post-gate dispatch helper — so
+    the emit ordering and event shapes are byte-identical to ``_resolve_gate``.
     """
-    executor = _ACTION_EXECUTORS.get(action.name)
-    if executor is None:
-        deps.journal.emit(
-            "action_skipped",
-            {"action": action.model_dump(), "reason": "no executor for action"},
-        )
-        return []
-    result = executor(action)
-    deps.journal.emit("action_executed", {"action": action.model_dump(), "result": result})
-    return [action]
+    dispatched = _dispatch_action(action, deps)
+    return [dispatched] if dispatched is not None else []
 
 
 def _executed_targets(reconstructed: ReconstructedRun) -> set[str]:

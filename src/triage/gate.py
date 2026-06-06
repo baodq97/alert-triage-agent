@@ -234,10 +234,14 @@ class CLIGate(_BaseGate):
     _APPROVALS: frozenset[str] = frozenset({"y", "yes"})
 
     def _decide(self, batch: Sequence[Action]) -> Literal["approved", "denied"]:
-        """Prompt once; an explicit yes approves, anything else denies (safe)."""
+        """Prompt once; an explicit yes approves, anything else (or EOF) denies (safe)."""
         names = ", ".join(action.name for action in batch)
         prompt = f"Approve {len(batch)} high-risk action(s) [{names}]? [y/N]: "
-        reply = input(prompt).strip().lower()
+        try:
+            reply = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            # No terminal / piped stdin / Ctrl-C: treat as a non-approval (safe default).
+            return "denied"
         return "approved" if reply in self._APPROVALS else "denied"
 
 

@@ -1,0 +1,23 @@
+# Guards: login from a new VPN exit node still within the corporate network with MFA
+# must conclude low — new VPN node is an infrastructure change, not a compromise signal.
+name: benign-vpn-change
+alert: src/triage/evals/cases/alerts/benign-vpn-change.json
+expect:
+  trajectory:
+    must_call_tools: [lookup_user]                   # the named user is the minimum lead
+    gate_before_high_risk: true
+    no_action_without_gate: true
+    max_steps_respected: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed]
+  verdict:
+    severity_in: [low]                               # corporate-range IP + mfa = benign
+    confidence_min: 0.3
+    verdict_has_findings_with_citations: true
+reference:
+  expected_tools:
+    - name: lookup_user
+  expected_severity: low
+  expected_actions: []
+  ordered: false
+  exact: false

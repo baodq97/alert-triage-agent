@@ -40,6 +40,12 @@ ignore = [
     "PLR2004", # magic values are expected in test assertions
     "D",       # docstrings on every test add noise, test names carry intent
     "INP001",  # tests/ is intentionally not a package (pytest rootdir discovery)
+    "ANN401",  # test doubles use Any for generic payload/args parameters
+    "ARG002",  # test doubles implement Protocol signatures with unused params
+    "FBT003",  # test calls may pass boolean literals to prove both paths
+]
+"src/triage/rendering.py" = [
+    "FBT001",  # observation_tag: ok is a domain boolean, not a flag — positional is intentional
 ]
 
 [tool.ruff.lint.pydocstyle]

@@ -1,0 +1,18 @@
+{
+  "alert_id": "ALT-EVAL-RECALLELEV-0001",
+  "timestamp": "2026-06-04T09:20:00Z",
+  "source": "siem",
+  "severity_hint": "medium",
+  "event_type": "unusual_access_pattern",
+  "description": "User account 'user-finops-charlie' accessed 38 financial reports outside their normal working hours (02:15 local time). The volume is higher than the 30-day baseline (median: 3 reports/session) but within the technical access permissions for this role. No data transfer detected at this time. Prior context from memory may be relevant.",
+  "entities": {
+    "user": "user-finops-charlie"
+  },
+  "context": {
+    "reports_accessed": 38,
+    "access_time": "02:15",
+    "baseline_median": 3,
+    "data_transfer_detected": false,
+    "note": "prior HIGH-confidence malicious finding for user-finops-charlie should elevate this ambiguous alert to at least medium severity"
+  }
+}

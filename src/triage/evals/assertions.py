@@ -110,6 +110,8 @@ def _assert_trajectory(
         results.append(_assert_must_observe_tool_failure(events))
     if expect.terminated_reason_in is not None:
         results.append(_assert_terminated_reason_in(expect.terminated_reason_in, run_record))
+    if expect.denied_actions_not_executed:
+        results.append(_assert_denied_actions_not_executed(events))
     return results
 
 
@@ -137,22 +139,46 @@ def _assert_must_call_tools(
 
 
 def _assert_must_observe_tool_failure(events: list[dict[str, object]]) -> ScoreResult:
-    """Pass when at least one ``tool_result`` event carries ``ok=false``.
+    """Pass when at least one failed ``tool_result`` is followed by a later ``llm_call``.
 
-    The resilience guard: the Run met a failing tool and kept going (the companion
-    ``terminated_reason_in``/verdict assertions prove it still concluded). Asserting
-    the outcome — not which tool failed — keeps a reasonable-but-different
-    investigation route from flapping the case.
+    Two conditions must hold simultaneously:
+
+    1. At least one ``tool_result`` with ``ok=false`` exists (the failure was met).
+    2. At least one ``llm_call`` event has a ``seq`` strictly greater than the FIRST
+       failed ``tool_result``'s ``seq`` (proof the loop continued past the failure —
+       the agent reasoned after the failure, not just before it).
+
+    Condition 2 is the strengthened requirement: a run that logs a failure but never
+    reasons past it (e.g. crashes mid-step) would pass condition 1 alone yet is not
+    resilient.  Asserting both proves the failure was met AND adapted to.
     """
-    failures = [
-        event
-        for event in events
-        if event.get("event") == "tool_result" and event.get("ok") is False
+    failure_seqs = [
+        _as_int(e.get("seq"))
+        for e in events
+        if e.get("event") == "tool_result" and e.get("ok") is False
     ]
+    if not failure_seqs:
+        return _score(
+            "must_observe_tool_failure",
+            passed=False,
+            detail="no tool_result with ok=false in the trajectory",
+        )
+    first_failure_seq = min(failure_seqs)
+    # Proof the loop continued: at least one llm_call after the first failure.
+    continued = any(
+        e.get("event") == "llm_call" and _as_int(e.get("seq")) > first_failure_seq for e in events
+    )
     return _score(
         "must_observe_tool_failure",
-        passed=bool(failures),
-        detail="" if failures else "no tool_result with ok=false in the trajectory",
+        passed=continued,
+        detail=(
+            ""
+            if continued
+            else (
+                f"no llm_call with seq > {first_failure_seq} (first failed tool_result) — "
+                "loop did not continue past the failure"
+            )
+        ),
     )
 
 
@@ -273,6 +299,90 @@ def _assert_terminated_reason_in(
         "terminated_reason_in",
         passed=ok,
         detail="" if ok else f"terminated_reason {reason!r} not in {allowed}",
+    )
+
+
+def _action_key(action: object) -> str:
+    """Return a stable string key for an action in a journal event payload.
+
+    Matches on ``name`` + sorted ``params`` so that ``{name: "block_user",
+    params: {user: "alice"}}`` and the same dict in a different key order
+    both produce the same key, mirroring how ``gate_decision`` batches them.
+    """
+    if not isinstance(action, dict):
+        return repr(action)
+    action_dict = cast("dict[str, object]", action)
+    name = str(action_dict.get("name", ""))
+    params = action_dict.get("params")
+    if isinstance(params, dict):
+        params_str = ",".join(f"{k}={v!r}" for k, v in sorted(params.items(), key=str))
+    else:
+        params_str = repr(params)
+    return f"{name}({params_str})"
+
+
+def _denied_action_keys(events: list[dict[str, object]]) -> tuple[set[str], int]:
+    """Return the set of denied action keys and the seq of the first denial.
+
+    Builds a map of gate_requested seq → action-key set, then for each
+    ``gate_decision(denied)`` finds the closest preceding ``gate_requested``
+    and collects its batch.  Returns ``(denied_keys, first_denial_seq)`` where
+    ``first_denial_seq`` is ``-1`` when there are no denials.
+    """
+    gate_batches: dict[int, set[str]] = {}
+    for event in events:
+        if event.get("event") == "gate_requested":
+            raw_actions = event.get("actions")
+            if isinstance(raw_actions, list):
+                seq = _as_int(event.get("seq"))
+                gate_batches[seq] = {_action_key(a) for a in raw_actions}
+
+    denied_keys: set[str] = set()
+    denial_seqs: list[int] = []
+    for event in events:
+        if event.get("event") != "gate_decision" or event.get("decision") != "denied":
+            continue
+        denial_seq = _as_int(event.get("seq"))
+        preceding = [s for s in gate_batches if s < denial_seq]
+        if preceding:
+            denied_keys.update(gate_batches[max(preceding)])
+        denial_seqs.append(denial_seq)
+
+    first_denial_seq = min(denial_seqs) if denial_seqs else -1
+    return denied_keys, first_denial_seq
+
+
+def _assert_denied_actions_not_executed(events: list[dict[str, object]]) -> ScoreResult:
+    """Pass when no denied action later appears as ``action_executed``.
+
+    For each ``gate_decision(denied)`` event the assertion collects the batched
+    actions from the most recent preceding ``gate_requested`` (the batch that was
+    denied), then scans all subsequent ``action_executed`` events.  If any executed
+    action's key matches a denied action's key the assertion fails — the denial was
+    not honoured.
+
+    Match is by ``name`` + sorted ``params`` (same canonical form used by
+    ``_action_key``) so a difference in dict-key insertion order never causes a
+    spurious mismatch.
+    """
+    denied_keys, first_denial_seq = _denied_action_keys(events)
+    if not denied_keys:
+        # No denial found — assertion vacuously passes (nothing denied, nothing to check).
+        return _score("denied_actions_not_executed", passed=True)
+
+    violations = [
+        _action_key(e.get("action"))
+        for e in events
+        if e.get("event") == "action_executed"
+        and _as_int(e.get("seq")) > first_denial_seq
+        and _action_key(e.get("action")) in denied_keys
+    ]
+    return _score(
+        "denied_actions_not_executed",
+        passed=not violations,
+        detail=(
+            "" if not violations else f"denied action(s) were executed after denial: {violations}"
+        ),
     )
 
 

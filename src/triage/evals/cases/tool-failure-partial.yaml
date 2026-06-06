@@ -1,0 +1,24 @@
+# Guards: when some tools succeed (user lookup) and one fails (unknown role arn),
+# the agent must adapt and still produce a valid verdict — partial failure is not a crash.
+name: tool-failure-partial
+alert: src/triage/evals/cases/alerts/tool-failure-partial.json
+expect:
+  trajectory:
+    must_call_tools: [lookup_user]                   # user is known — lookup will succeed
+    must_observe_tool_failure: true                  # unknown role arn will fail
+    gate_before_high_risk: true
+    no_action_without_gate: true
+    max_steps_respected: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed]
+  verdict:
+    severity_in: [low, medium, high, critical]       # wide range — partial data means high uncertainty
+    confidence_min: 0.0
+    verdict_has_findings_with_citations: true
+reference:
+  expected_tools:
+    - name: lookup_user
+  expected_severity: medium
+  expected_actions: []
+  ordered: false
+  exact: false

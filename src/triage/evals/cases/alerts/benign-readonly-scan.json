@@ -1,0 +1,21 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0003",
+  "timestamp": "2026-05-10T11:30:00Z",
+  "source": "waf",
+  "severity_hint": "low",
+  "event_type": "api_access_pattern",
+  "description": "Service account 'svc-deploy-prod' made 12 read-only GET requests to '/admin/users/export' from IP 10.200.1.12 over 10 minutes. No export was triggered (all requests returned 200 with 0 bytes exported). Volume is within normal bounds for health-check polling.",
+  "entities": {
+    "service_account": "svc-deploy-prod",
+    "source_ip": "10.200.1.12",
+    "asset": "/admin/users/export"
+  },
+  "context": {
+    "request_method": "GET",
+    "response_codes": [200],
+    "bytes_exported": 0,
+    "request_count": 12,
+    "window_minutes": 10,
+    "note": "read-only polling pattern, no data downloaded"
+  }
+}

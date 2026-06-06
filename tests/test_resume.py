@@ -87,11 +87,15 @@ def _continue() -> str:
     return json.dumps({"decision": "continue", "rationale": "keep going"})
 
 
-def _verdict(*, actions: list[dict[str, Any]] | None = None) -> str:
+def _verdict(
+    *, actions: list[dict[str, Any]] | None = None, finding_entity: str | None = None
+) -> str:
+    statement = f"anomaly detected for user {finding_entity}" if finding_entity else "anomaly"
+    evidence = f"lookup_user confirmed {finding_entity}" if finding_entity else "lookup_user"
     return json.dumps(
         {
             "severity": "high",
-            "findings": [{"statement": "anomaly", "evidence": "lookup_user"}],
+            "findings": [{"statement": statement, "evidence": evidence}],
             "recommended_actions": actions or [],
             "confidence": 0.8,
         },
@@ -307,7 +311,13 @@ def _park_a_run(run_dir: Path) -> None:
     journal = JsonlJournal(run_dir)
     deps = _deps(
         journal,
-        FakeLLM([_plan("lookup_user"), _conclude(), _verdict(actions=[_block_alice()])]),
+        FakeLLM(
+            [
+                _plan("lookup_user"),
+                _conclude(),
+                _verdict(actions=[_block_alice()], finding_entity="alice"),
+            ]
+        ),
     )
     result = triage(_alert(), deps, run_id=run_dir.name)
     journal.close()
@@ -435,7 +445,13 @@ def test_resume_approve_on_a_completed_run_raises_and_mutates_nothing(tmp_path: 
     journal = JsonlJournal(run_dir)
     deps = _deps(
         journal,
-        FakeLLM([_plan("lookup_user"), _conclude(), _verdict(actions=[_block_alice()])]),
+        FakeLLM(
+            [
+                _plan("lookup_user"),
+                _conclude(),
+                _verdict(actions=[_block_alice()], finding_entity="alice"),
+            ]
+        ),
         gate_approve=True,
     )
     triage(_alert(), deps, run_id="run-done")
@@ -472,3 +488,242 @@ def test_resume_investigation_on_a_terminated_run_raises(tmp_path: Path) -> None
     with pytest.raises(GateError):
         resume_investigation(_alert(), resume_deps, terminated, run_id="run-term")
     journal2.close()
+
+
+# --------------------------------------------------------------------------- #
+# B2 (M2) — resume-after-revision picks the revised step, not original plan   #
+# --------------------------------------------------------------------------- #
+
+
+def _revise(next_tool: str, next_entity: str = "alice") -> str:
+    step = {"tool": next_tool, "args": {"entity": next_entity}, "rationale": "revised"}
+    return json.dumps({"decision": "revise_plan", "rationale": "revising", "next_step": step})
+
+
+def test_resume_after_revision_runs_revised_step_not_original_next(tmp_path: Path) -> None:
+    """Kill-after-revision -> resume must execute the REVISED step, not the original plan's next.
+
+    Setup: two-step original plan (lookup_user, query_logs).
+    - Step 1 runs (lookup_user); the reasoner revises to check_reputation.
+    - The journal records plan_revised with [check_reputation] and then is killed
+      before step 2 (the revised check_reputation) executes.
+    - Resume must continue from check_reputation (the last revision), NOT from
+      query_logs (the original plan's second step).
+    """
+    run_dir = tmp_path / "run-revision"
+    journal0 = JsonlJournal(run_dir)
+    journal0.emit("run_started", {"alert_id": "ALT-RESUME-1", "config": {}, "schema_version": 1})
+    journal0.emit(
+        "plan_created",
+        {
+            "steps": [
+                {"tool": "lookup_user", "args": {"entity": "alice"}, "rationale": "original 1"},
+                {"tool": "query_logs", "args": {"entity": "alice"}, "rationale": "original 2"},
+            ]
+        },
+    )
+    # Step 1: lookup_user ran and was observed.
+    journal0.emit(
+        "tool_called",
+        {"step": 1, "tool": "lookup_user", "args": {"entity": "alice"}, "attempt": 1},
+    )
+    journal0.emit("tool_result", {"step": 1, "attempt": 1, "ok": True, "data": {"status": "ok"}})
+    # The reasoner decided to revise: check_reputation replaces query_logs.
+    journal0.emit(
+        "plan_revised",
+        {"steps": [{"tool": "check_reputation", "args": {"entity": "alice"}, "rationale": "rev"}]},
+    )
+    # Killed here — check_reputation has NOT been executed yet.
+    journal0.close()
+
+    reconstructed = rebuild(run_dir / "journal.jsonl")
+    assert reconstructed.is_interrupted() is True
+    assert len(reconstructed.plan_revisions) == 1
+    assert reconstructed.plan_revisions[0][0]["tool"] == "check_reputation"
+
+    # Resume: the first reason call should continue (the revised step still pending),
+    # then check_reputation executes, then conclude, then verdict.
+    journal = JsonlJournal(run_dir)
+    deps = _deps(journal, FakeLLM([_continue(), _conclude(), _verdict()]), gate_approve=False)
+    result = resume_investigation(_alert(), deps, reconstructed, run_id="run-revision")
+    journal.close()
+
+    assert result.terminated_reason == "completed"
+    events = _read_events(run_dir)
+    new_tool_calls = [e for e in events if e["event"] == "tool_called" and e.get("step", 0) >= 2]
+    # check_reputation ran as the next step (not query_logs).
+    assert any(e["tool"] == "check_reputation" for e in new_tool_calls), (
+        f"expected check_reputation in new tool calls, got: {new_tool_calls}"
+    )
+    assert not any(e["tool"] == "query_logs" for e in new_tool_calls), (
+        f"query_logs (original plan step 2) must NOT run on resume; got: {new_tool_calls}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# B3 — revision at step ≥2: resume must execute the revised step, not drop it #
+# --------------------------------------------------------------------------- #
+
+
+def test_resume_revision_at_step_2_executes_revised_step_not_original(tmp_path: Path) -> None:
+    """Revision fires at step 2 (after two tool calls), killed before revised step runs.
+
+    The original plan is (lookup_user, query_logs, check_reputation).  Two steps run
+    (lookup_user at step 1, query_logs at step 2), then the reasoner revises to
+    get_asset_info at step 3.  The kill happens before get_asset_info executes.
+
+    With the old arithmetic: steps_executed=2, n_revisions=1 -> next_step_index=1 ->
+    pending = [get_asset_info][1:] = [] -> revised step silently dropped.
+
+    After the fix: steps_after_last_revision=0 -> next_step_index=0 -> pending =
+    [get_asset_info] -> get_asset_info runs; check_reputation (original step 3) does
+    not.
+    """
+    run_dir = tmp_path / "run-late-revision"
+    journal0 = JsonlJournal(run_dir)
+    journal0.emit("run_started", {"alert_id": "ALT-RESUME-1", "config": {}, "schema_version": 1})
+    journal0.emit(
+        "plan_created",
+        {
+            "steps": [
+                {"tool": "lookup_user", "args": {"entity": "alice"}, "rationale": "step-1"},
+                {"tool": "query_logs", "args": {"entity": "alice"}, "rationale": "step-2"},
+                {"tool": "check_reputation", "args": {"entity": "alice"}, "rationale": "step-3"},
+            ]
+        },
+    )
+    # Step 1: lookup_user executed.
+    journal0.emit(
+        "tool_called",
+        {"step": 1, "tool": "lookup_user", "args": {"entity": "alice"}, "attempt": 1},
+    )
+    journal0.emit("tool_result", {"step": 1, "attempt": 1, "ok": True, "data": {"s": "ok"}})
+    # Step 2: query_logs executed; the reasoner then revises to get_asset_info.
+    journal0.emit(
+        "tool_called",
+        {"step": 2, "tool": "query_logs", "args": {"entity": "alice"}, "attempt": 1},
+    )
+    journal0.emit("tool_result", {"step": 2, "attempt": 1, "ok": True, "data": {"s": "ok"}})
+    journal0.emit(
+        "plan_revised",
+        {"steps": [{"tool": "get_asset_info", "args": {"entity": "alice"}, "rationale": "rev"}]},
+    )
+    # Killed here — get_asset_info has NOT executed yet.
+    journal0.close()
+
+    reconstructed = rebuild(run_dir / "journal.jsonl")
+    assert reconstructed.is_interrupted() is True
+    assert len(reconstructed.plan_revisions) == 1
+    assert reconstructed.plan_revisions[0][0]["tool"] == "get_asset_info"
+    # steps_after_last_revision must be 0: no tool_result followed the revision.
+    assert reconstructed.steps_after_last_revision == 0
+
+    # Resume: reasoner continues (revised step still pending), get_asset_info runs,
+    # then conclude, then verdict.
+    journal = JsonlJournal(run_dir)
+    deps = _deps(journal, FakeLLM([_continue(), _conclude(), _verdict()]), gate_approve=False)
+    result = resume_investigation(_alert(), deps, reconstructed, run_id="run-late-revision")
+    journal.close()
+
+    assert result.terminated_reason == "completed"
+    all_events = _read_events(run_dir)
+    new_tool_calls = [
+        e for e in all_events if e["event"] == "tool_called" and e.get("step", 0) >= 3
+    ]
+    # get_asset_info (the revised step) must have run.
+    assert any(e["tool"] == "get_asset_info" for e in new_tool_calls), (
+        f"expected get_asset_info in new tool calls, got: {new_tool_calls}"
+    )
+    # check_reputation (the original plan's step 3) must NOT run.
+    assert not any(e["tool"] == "check_reputation" for e in new_tool_calls), (
+        f"check_reputation (original plan step 3) must NOT run on resume; got: {new_tool_calls}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# B4 — two plan_revised events: resume continues from the LAST revision       #
+# --------------------------------------------------------------------------- #
+
+
+def test_resume_multi_revision_continues_from_last_revision(tmp_path: Path) -> None:
+    """Two revisions; killed after the first revised step ran but before the second.
+
+    Original plan: (lookup_user, query_logs).
+    - Step 1: lookup_user runs; reasoner revises to check_reputation.
+    - Step 2: check_reputation runs (the first revised step); reasoner revises again
+      to get_asset_info.
+    - Killed before get_asset_info executes.
+
+    steps_after_last_revision must be 0 (no tool_result after the second plan_revised).
+    Resume must continue from get_asset_info only — check_reputation and query_logs
+    must not re-run.
+    """
+    run_dir = tmp_path / "run-multi-revision"
+    journal0 = JsonlJournal(run_dir)
+    journal0.emit("run_started", {"alert_id": "ALT-RESUME-1", "config": {}, "schema_version": 1})
+    journal0.emit(
+        "plan_created",
+        {
+            "steps": [
+                {"tool": "lookup_user", "args": {"entity": "alice"}, "rationale": "step-1"},
+                {"tool": "query_logs", "args": {"entity": "alice"}, "rationale": "step-2"},
+            ]
+        },
+    )
+    # Step 1: lookup_user runs; first revision fires.
+    journal0.emit(
+        "tool_called",
+        {"step": 1, "tool": "lookup_user", "args": {"entity": "alice"}, "attempt": 1},
+    )
+    journal0.emit("tool_result", {"step": 1, "attempt": 1, "ok": True, "data": {"s": "ok"}})
+    journal0.emit(
+        "plan_revised",
+        {
+            "steps": [
+                {"tool": "check_reputation", "args": {"entity": "alice"}, "rationale": "rev-1"}
+            ]
+        },
+    )
+    # Step 2: check_reputation (the first revised step) runs; second revision fires.
+    journal0.emit(
+        "tool_called",
+        {"step": 2, "tool": "check_reputation", "args": {"entity": "alice"}, "attempt": 1},
+    )
+    journal0.emit("tool_result", {"step": 2, "attempt": 1, "ok": True, "data": {"s": "ok"}})
+    journal0.emit(
+        "plan_revised",
+        {"steps": [{"tool": "get_asset_info", "args": {"entity": "alice"}, "rationale": "rev-2"}]},
+    )
+    # Killed here — get_asset_info has NOT executed yet.
+    journal0.close()
+
+    reconstructed = rebuild(run_dir / "journal.jsonl")
+    assert reconstructed.is_interrupted() is True
+    assert len(reconstructed.plan_revisions) == 2
+    assert reconstructed.plan_revisions[-1][0]["tool"] == "get_asset_info"
+    # No tool_result after the second revision: steps_after_last_revision must be 0.
+    assert reconstructed.steps_after_last_revision == 0
+
+    # Resume: reasoner continues (last revised step still pending), get_asset_info
+    # runs, then conclude, then verdict.
+    journal = JsonlJournal(run_dir)
+    deps = _deps(journal, FakeLLM([_continue(), _conclude(), _verdict()]), gate_approve=False)
+    result = resume_investigation(_alert(), deps, reconstructed, run_id="run-multi-revision")
+    journal.close()
+
+    assert result.terminated_reason == "completed"
+    all_events = _read_events(run_dir)
+    new_tool_calls = [
+        e for e in all_events if e["event"] == "tool_called" and e.get("step", 0) >= 3
+    ]
+    # Only get_asset_info (the last revised step) must run.
+    assert any(e["tool"] == "get_asset_info" for e in new_tool_calls), (
+        f"expected get_asset_info in new tool calls, got: {new_tool_calls}"
+    )
+    # query_logs (original step 2) and check_reputation (first revised step) must not re-run.
+    assert not any(e["tool"] == "query_logs" for e in new_tool_calls), (
+        f"query_logs must NOT re-run on resume; got: {new_tool_calls}"
+    )
+    assert not any(e["tool"] == "check_reputation" for e in new_tool_calls), (
+        f"check_reputation must NOT re-run on resume; got: {new_tool_calls}"
+    )

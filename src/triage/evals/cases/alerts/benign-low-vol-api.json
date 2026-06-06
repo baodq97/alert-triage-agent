@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0005",
+  "timestamp": "2026-05-10T15:00:00Z",
+  "source": "siem",
+  "severity_hint": "low",
+  "event_type": "api_calls_detected",
+  "description": "IAM user 'dev-intern-jpark' made 3 API calls in 30 minutes — well below the alert threshold of 100 calls. Calls were all to read-only list operations. No errors, no sensitive endpoints, no anomalous timing.",
+  "entities": {
+    "iam_user": "dev-intern-jpark"
+  },
+  "context": {
+    "call_count": 3,
+    "window_minutes": 30,
+    "alert_threshold": 100,
+    "operations": ["iam:ListRoles", "iam:ListPolicies", "s3:ListBuckets"],
+    "error_count": 0,
+    "note": "low-volume read-only activity, no anomaly pattern"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0023",
+  "timestamp": "2026-05-10T18:00:00Z",
+  "source": "siem",
+  "severity_hint": "critical",
+  "event_type": "advanced_persistent_threat_indicators",
+  "description": "Multi-stage APT indicator alert: (1) IAM user 'dev-intern-jpark' logged in from foreign IP 91.108.4.22, (2) the user's role 'arn:aws:iam::123456789012:role/dev-intern-jpark-role' was modified to trust an external account, (3) service account 'svc-deploy-prod' accessed 'user-management-api' from expected IP 10.200.1.1, (4) '/admin/users/export' received 850 requests in 5 minutes, (5) a new credential was created for 'svc-deploy-prod', (6) the new credential was used from an external IP to access AWS Secrets Manager. This is a complex multi-stage incident designed to exhaust investigation steps.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "service_account": "svc-deploy-prod",
+    "source_ip": "91.108.4.22",
+    "role_arn": "arn:aws:iam::123456789012:role/dev-intern-jpark-role",
+    "asset": "/admin/users/export"
+  },
+  "context": {
+    "stages": 6,
+    "indicators_count": 14,
+    "note": "deliberately complex multi-stage alert to stress the max_steps guard"
+  }
+}

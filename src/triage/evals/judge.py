@@ -20,6 +20,7 @@ journal footprint (ADR-0001: the journal is the only instrumentation).
 from __future__ import annotations
 
 import json
+import statistics
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -65,10 +66,17 @@ class JudgeResult(BaseModel):
 class Judge:
     """Advisory Tier-2 reviewer — scores reasoning from a Run's Trajectory."""
 
-    def __init__(self, *, llm: LLM, journal: Journal) -> None:
-        """Bind the LLM port and the journal; the rubric loads once."""
+    def __init__(self, *, llm: LLM, journal: Journal, samples: int = 1) -> None:
+        """Bind the LLM port and the journal; the rubric loads once.
+
+        ``samples`` controls how many independent scoring LLM calls are made.
+        When ``samples > 1`` the median score is returned (tie → lower index
+        sample's rationale) and each call is journaled as ``purpose="judge"``.
+        Default is ``1`` so existing callers are byte-identical.
+        """
         self._llm = llm
         self._journal = journal
+        self._samples = samples
         self._template = _PROMPT_PATH.read_text(encoding="utf-8")
 
     def score(self, run_record: RunRecord) -> JudgeResult:
@@ -76,9 +84,20 @@ class Judge:
 
         Any failure (LLM error, malformed score) degrades to ``scored=False`` so a
         judge problem can never block a run or fail an eval. On success it emits
-        the single ``llm_call`` (``purpose="judge"``) the Tier-2 lane records.
+        one ``llm_call`` (``purpose="judge"``) per successful sample.
+
+        When ``samples > 1`` the median score is returned and the rationale comes
+        from the median-scoring sample (tie → lower-index sample). If ALL samples
+        fail the result is ``scored=False``; if only some fail the median of the
+        successes is used.
         """
         messages = self._render(run_record)
+        if self._samples <= 1:
+            return self._score_single(messages)
+        return self._score_multi(messages)
+
+    def _score_single(self, messages: list[Message]) -> JudgeResult:
+        """Run exactly one LLM call and return its result."""
         try:
             completion = self._llm.complete(messages, JudgeScore)
         except TriageError:
@@ -99,6 +118,39 @@ class Judge:
             scored=True,
             score=completion.value.score,
             rationale=completion.value.rationale,
+        )
+
+    def _score_multi(self, messages: list[Message]) -> JudgeResult:
+        """Run ``self._samples`` independent calls and return the median result."""
+        successes: list[tuple[int, str, object]] = []  # (score, rationale, completion)
+        for _ in range(self._samples):
+            try:
+                completion = self._llm.complete(messages, JudgeScore)
+            except TriageError:
+                continue  # partial failure — skip this sample
+            self._journal.emit(
+                "llm_call",
+                {
+                    "purpose": "judge",
+                    "model": completion.model,
+                    "prompt_hash": completion.prompt_hash,
+                    "tokens": completion.tokens,
+                    "latency_ms": completion.latency_ms,
+                },
+            )
+            successes.append((completion.value.score, completion.value.rationale, completion))
+        if not successes:
+            return JudgeResult(scored=False, rationale="judge unavailable")
+        # Compute median of scores; for a tie, lower index wins (stable sort).
+        scores = [s[0] for s in successes]
+        median_score = int(statistics.median(scores))
+        # Find the sample whose score is closest to (and not above) the median score.
+        # On exact tie between two samples the lower-index one wins (list order preserved).
+        best_idx = min(range(len(successes)), key=lambda i: abs(successes[i][0] - median_score))
+        return JudgeResult(
+            scored=True,
+            score=median_score,
+            rationale=successes[best_idx][1],
         )
 
     def _render(self, run_record: RunRecord) -> list[Message]:
