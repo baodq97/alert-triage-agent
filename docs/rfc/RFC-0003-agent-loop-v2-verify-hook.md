@@ -1,8 +1,8 @@
 ---
 id: RFC-0003
 title: Agent loop v2 — explicit decision tree, verdict verify hook, structured termination
-status: draft
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-06
 ---
 

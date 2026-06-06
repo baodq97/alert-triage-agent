@@ -2,7 +2,7 @@
 id: US-0007
 title: "Eval hardening: judge soft-gate, flake hardening, suite hygiene"
 status: open
-owner: TBD
+owner: baodq97
 date: 2026-06-06
 priority: P2
 ---

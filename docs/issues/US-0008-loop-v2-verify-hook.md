@@ -1,8 +1,8 @@
 ---
 id: US-0008
 title: "Agent loop v2: verify hook, no-progress backstop, structured termination"
-status: open
-owner: TBD
+status: in-progress
+owner: baodq97
 date: 2026-06-06
 priority: P1
 ---

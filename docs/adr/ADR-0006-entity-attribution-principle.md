@@ -1,8 +1,8 @@
 ---
 id: ADR-0006
 title: Entity-attribution principle — every persisted claim names its entity
-status: proposed
-owner: TBD
+status: accepted
+owner: baodq97
 date: 2026-06-06
 ---
 

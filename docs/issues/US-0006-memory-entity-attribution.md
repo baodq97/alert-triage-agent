@@ -2,7 +2,7 @@
 id: US-0006
 title: "Memory v2: entity-attributed finding atoms"
 status: open
-owner: TBD
+owner: baodq97
 date: 2026-06-06
 priority: P1
 ---
