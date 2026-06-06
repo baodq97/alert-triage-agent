@@ -54,11 +54,19 @@ Think step by step before writing the verdict:
 <thinking>
 1. For each `ok: true` observation: what specific data did it return?
    Quote key values (usernames, IPs, timestamps, log entries).
-2. Does this data confirm, contradict, or say nothing about the alert's threat?
+2. Does this data confirm, contradict, or say nothing about the alert's
+   specific claim? An observation that returns normally but does NOT show the
+   activity the alert describes is non-corroboration — say so explicitly in a
+   finding ("query_logs returned X's recent activity; the N events the alert
+   describes do not appear in it"); never absorb it into a general benign or
+   threat narrative.
 3. For each `ok: false` observation: which aspect remains unverified?
-4. What pattern emerges across all observations?
+4. Coverage ledger: list each entity in the alert payload and classify it —
+   VERIFIED (an `ok: true` observation covers it), ATTEMPTED (only failed
+   observations target it), or NOT INVESTIGATED (no observation targets it).
+5. What pattern emerges across all observations?
    (consistent benign / consistent threat / mixed / fully unresolved)
-5. What severity and confidence does this pattern support?
+6. What severity and confidence does this pattern support, given the ledger?
 </thinking>
 
 Produce a Verdict:
@@ -87,7 +95,18 @@ Produce a Verdict:
   whether the observation confirms, contradicts, or cannot resolve the threat.
   NEVER assert findings the observations do not support. NEVER infer events
   tools did not observe. If all tools failed: name each entity that could not
-  be verified and state what this means for the risk assessment. Each finding
+  be verified and state what this means for the risk assessment.
+  State findings precisely — never describe a subset of observations as if it
+  were the whole run ("all observations failed" when only some did).
+  **Limitations are findings too**: when the coverage ledger has ATTEMPTED or
+  NOT INVESTIGATED entities, add one finding that names each of them
+  explicitly (exact values) and states that the verdict does not account for
+  them — an unacknowledged gap reads as an oversight; an acknowledged one is
+  calibrated honesty. A limitation finding declares `related_entities: []` —
+  "not investigated" is a fact about this run, not about the entity, and must
+  not enter the entity's memory. When a finding's evidence rests on the alert payload
+  itself (the zero-evidence correlation case), quote the exact alert field
+  values it relies on. Each finding
   must also declare `related_entities`: a list of the entity values from the
   alert payload (user names, IPs, account IDs, hostnames, etc.) that this
   specific finding is directly about. Use exact values from the alert — do not
@@ -101,6 +120,10 @@ Produce a Verdict:
   support one, including the alert-correlation evidence you do have) or drop
   the action. Leave empty when evidence is insufficient.
 - `confidence`: a number 0–1 reflecting how strongly the gathered evidence
-  supports your conclusion.
+  supports your conclusion. When the coverage ledger has a NOT INVESTIGATED
+  or ATTEMPTED entity that is material to the alert's core question (e.g. the
+  source IP of a network-anomaly alert), keep confidence at or below 0.75 —
+  high confidence is earned by verifying the entities the threat hinges on,
+  not by the absence of contradiction.
 
 Base every part of the Verdict on the evidence in the blocks above.

@@ -202,6 +202,16 @@ verdicts (hook action `pass` on every case); 10 cases carry advisory coverage-ga
 telemetry.** The Phase-1 "0 false-flag" gate for enabling Phase-2 re-entry is met on the
 recorded suite; the live ≤10% bound remains to be observed in live runs.
 
+Re-measured after the 2026-06-06 reasoning-quality wave (5 live improvement rounds —
+coverage gate, limitation ledger, pivot playbook, aspect completeness, judge anchors;
+judge mean 73.8 → 84.1): the new trajectories surfaced one further citation-validity
+delta — limitation/summary findings cite the failure trajectory in natural phrasings
+("no successful tool results", "could not be verified") and may reference alert
+variable-field KEYS, not just values. Branch (d) now recognizes an explicit
+negative-evidence phrase set and branch (c) includes entities/context keys ≥6 chars.
+**Result: 0 false flags; coverage-gap telemetry dropped from 10 to 3 cases** (the loop
+genuinely closed most coverage gaps rather than suppressing the signal).
+
 ## Alternatives considered
 
 - **The original six-check set** — rejected by calibration: two checks are not

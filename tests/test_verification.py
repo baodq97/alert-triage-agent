@@ -200,6 +200,46 @@ class TestCheckCitationValidity:
         passed, _failed = check_citation_validity(verdict, obs, _alert(entities={}))
         assert passed
 
+    def test_negative_evidence_phrasing_passes_with_failed_observations(self) -> None:
+        """Check (d): natural negative-evidence phrasings pass when failures happened.
+
+        Live verdicts cite the failure trajectory as "no successful tool
+        results" / "could not be verified", not the literal journal rendering
+        ``ok:false`` — calibrated against the 2026-06-06 round-5 re-record.
+        """
+        obs = [_fail_obs("nonmatching_tool_name")]
+        for phrase in (
+            "Across 5 observations there were 0 successful tool results.",
+            "The investigation produced no successful tool results at all.",
+            "The admin-account scenario could not be verified.",
+            "The destination host remains unverified; treat with caution.",
+        ):
+            verdict = _verdict(findings=[_finding(evidence=phrase)], confidence=0.35)
+            passed, _failed = check_citation_validity(verdict, obs, _alert(entities={}))
+            assert passed, f"expected pass for {phrase!r}"
+
+    def test_alert_context_key_counts_as_correlation(self) -> None:
+        """Check (c): citing an alert variable-field KEY (≥6 chars) is grounded."""
+        alert = _alert(entities={}, context={"deploy_ticket_match": False})
+        verdict = _verdict(
+            findings=[_finding(evidence="Only the alert states deploy_ticket_match is false.")],
+            confidence=0.35,
+        )
+        passed, _failed = check_citation_validity(verdict, [_fail_obs()], alert)
+        assert passed
+
+    def test_short_alert_keys_do_not_whitelist_evidence(self) -> None:
+        """Short variable-field keys ("user") never enter the correlation corpus."""
+        alert = _alert(entities={}, context={"user": "zz-no-match-zz"})
+        verdict = _verdict(
+            findings=[_finding(evidence="the user did something entirely uncited.")],
+            confidence=0.35,
+        )
+        # No failures in the run → (d) unavailable; "user" key must not rescue it.
+        passed, failed = check_citation_validity(verdict, [], alert)
+        assert not passed
+        assert failed == [0]
+
     def test_failure_citation_fails_without_failed_observations(self) -> None:
         """Check (d) does NOT apply when every observation succeeded — citing
         ``ok:false`` against an all-ok trajectory is ungrounded."""

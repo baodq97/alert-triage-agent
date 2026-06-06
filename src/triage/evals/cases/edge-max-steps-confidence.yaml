@@ -8,7 +8,7 @@
 # hitting mostly not-found tool results is epistemically unsound. This assertion
 # fails a plausibly-broken agent that parrots "high confidence" despite thin evidence.
 #
-# terminated_reason_in: [completed, max_steps] — either is valid; the guard is the
+# terminated_reason_in: [completed, max_steps, no_progress] — any is valid; the guard is the
 # confidence ceiling, not whether steps ran out.
 #
 # Step-exhausted/thin-evidence verdicts MUST stay uncertain (confidence ≤ 0.6).
@@ -19,7 +19,7 @@ expect:
     gate_before_high_risk: true
     no_action_without_gate: true
     no_repeated_identical_calls: true
-    terminated_reason_in: [completed, max_steps]       # either is valid — the point is the confidence ceiling
+    terminated_reason_in: [completed, max_steps, no_progress]  # any graceful exhaustion — the point is the confidence ceiling
   verdict:
     severity_in: [low, medium, high, critical]         # WIDE range — the conclusion itself may vary
     confidence_max: 0.6                                # thin evidence must not produce high confidence
