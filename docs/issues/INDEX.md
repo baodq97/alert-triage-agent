@@ -6,4 +6,4 @@
 | [US-0002](./US-0002-run-journal-resume.md) | Wave 2: run journal — audit trail, retry visibility, resume | open | baodq97 | 2026-06-05 |
 | [US-0003](./US-0003-eval-harness-memory.md) | Wave 3: eval harness (mandatory) + memory L1-L2 recall | open | baodq97 | 2026-06-05 |
 | [US-0004](./US-0004-autonomy-posture-readme.md) | Wave 4: watch mode, L3 threat posture, README | done | baodq97 | 2026-06-05 |
-| [US-0005](./US-0005-threat-intel-agent.md) | Stretch: Threat Intel Agent — delegated IOC enrichment | in-progress | baodq97 | 2026-06-05 |
+| [US-0005](./US-0005-threat-intel-agent.md) | Stretch: Threat Intel Agent — delegated IOC enrichment | done | baodq97 | 2026-06-05 |
