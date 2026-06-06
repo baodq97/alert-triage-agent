@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -95,6 +96,7 @@ from triage.models import (
     Verdict,
 )
 from triage.planner import Planner
+from triage.threat_intel import TIToolRegistry, classify_ioc, enrich
 from triage.tools.actions import block_user, block_user_target, is_targeted
 from triage.verdict import DEGRADED_CONFIDENCE, DEGRADED_SEVERITY, VerdictSynthesizer
 
@@ -123,6 +125,23 @@ _ACTION_EXECUTORS: dict[str, Callable[[Action], dict[str, object]]] = {
     "block_user": block_user,
 }
 
+# Maximum number of TI enrichments per run — bounds the mini-loop token cost
+# (RFC-0002 §Open questions: "fixed small step cap").  Two covers the common
+# case of one public IP + one domain in an alert without runaway cost.
+_TI_MAX_ENRICHMENTS = 2
+
+
+def _ti_enabled_from_env() -> bool:
+    """Read ``TI_ENABLED`` from the env; default is ``False`` (absent-by-default).
+
+    Truthy values: ``"1"``, ``"true"``, ``"yes"`` (case-insensitive).  Any other
+    non-empty string or an absent var is treated as disabled — matching the
+    ``MAX_STEPS`` / ``MEMORY_SYNTHESIZE_EVERY_N_RUNS`` parse pattern of falling
+    back rather than crashing the run at construction time.
+    """
+    raw = os.environ.get("TI_ENABLED", "").strip().lower()
+    return raw in {"1", "true", "yes"}
+
 
 @dataclass(frozen=True)
 class TriageDeps:
@@ -141,6 +160,13 @@ class TriageDeps:
     block, no store writes — behavior identical to before the seam was wired. A
     memory failure never crashes a Run (the store swallows its own IO faults), so no
     new ``try/except`` is needed at this boundary.
+
+    ``ti_enabled`` is an explicit per-deps override for the TI enrichment flag
+    (RFC-0002 §per-case TI wiring).  ``None`` (the default) falls back to the
+    ``TI_ENABLED`` env var (current behavior; default off).  ``True`` or ``False``
+    overrides the env var for that Run — the seam that eval cases use so parallel
+    replay runs do not race on a process-global env mutation.  All existing callers
+    that pass no ``ti_enabled`` are byte-identical: ``None`` → env read → same path.
     """
 
     llm: LLM
@@ -151,6 +177,7 @@ class TriageDeps:
     policy: RiskPolicy
     max_steps: int | None = field(default=None)
     memory: MemoryStore | None = field(default=None)
+    ti_enabled: bool | None = field(default=None)
 
 
 def triage(alert: Alert, deps: TriageDeps, *, run_id: str | None = None) -> RunResult:
@@ -296,6 +323,86 @@ def _conclude_run(
     )
 
 
+def _enrich_iocs(alert: Alert, deps: TriageDeps) -> list[ObservationEntry]:
+    """Run TI enrichment for external IOCs in the alert entities (RFC-0002).
+
+    Iterates ``alert.entities``, classifies each value with the deterministic
+    ``classify_ioc`` function, and calls ``enrich()`` for up to
+    ``_TI_MAX_ENRICHMENTS`` external IOCs (deduped by value).  Each enrichment
+    result is wrapped as one ``ObservationEntry`` with ``tool="threat_intel.enrich"``,
+    ``args={"ioc": value, "type": ioc_type}``, and a ``ToolResult`` whose ``data``
+    is the serialised ``TIReport`` (or ``ok=False`` when ``enrich`` returns ``None``).
+
+    Journal discipline (RFC-0002 §Journal):
+    * The TI mini-loop's own events (``tool_called`` / ``tool_result`` /
+      ``llm_call`` for TI tools) carry ``agent="threat-intel"`` — emitted inside
+      ``enrich()``.
+    * The wrapping ``tool_called`` / ``tool_result`` pair that records each
+      enrichment as an executor Observation carries ``agent="triage"`` — the
+      primary loop consumed the result.  This is what gives the "hierarchical
+      trace in one stream" property (US-0005 AC3).
+
+    Step numbers start at 1 and are assigned in enrichment order.  The executor
+    is later started with ``initial_step=len(result)`` so its steps begin past
+    the TI range and never collide.
+
+    TI enrichment is best-effort: ``enrich()`` never propagates an exception
+    (it swallows ``LLMError`` internally); a fixture miss degrades to an
+    ``ok=False`` observation.  A TI fault never crashes the primary Run.
+    """
+    registry = TIToolRegistry()
+    seen: set[str] = set()
+    entries: list[ObservationEntry] = []
+
+    for _entity_type, entity_value in alert.entities.items():
+        if not isinstance(entity_value, str):
+            continue
+        if entity_value in seen:
+            continue
+        ioc_type = classify_ioc(_entity_type, entity_value)
+        if ioc_type is None:
+            continue
+        seen.add(entity_value)
+        step = len(entries) + 1
+        args: dict[str, object] = {"ioc": entity_value, "type": ioc_type}
+
+        # Emit the primary-loop wrapper pair (agent="triage") before delegation.
+        deps.journal.emit(
+            "tool_called",
+            {"step": step, "tool": "threat_intel.enrich", "args": args, "attempt": 1},
+        )
+        report = enrich(
+            ioc_type, entity_value, llm=deps.llm, journal=deps.journal, registry=registry
+        )
+        if report is not None:
+            result = ToolResult(
+                tool="threat_intel.enrich",
+                ok=True,
+                data=report.model_dump(),
+            )
+            deps.journal.emit(
+                "tool_result",
+                {"step": step, "attempt": 1, "ok": True, "data": result.data},
+            )
+        else:
+            result = ToolResult(
+                tool="threat_intel.enrich",
+                ok=False,
+                error="TI enrichment failed",
+            )
+            deps.journal.emit(
+                "tool_result",
+                {"step": step, "attempt": 1, "ok": False, "error": result.error},
+            )
+        entries.append(
+            ObservationEntry(step=step, tool="threat_intel.enrich", args=dict(args), result=result)
+        )
+        if len(entries) >= _TI_MAX_ENRICHMENTS:
+            break
+
+    return entries
+
+
 def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ObservationEntry], TerminatedReason]:
     """Plan and execute, returning the ObservationEntry list and the terminated reason.
 
@@ -304,7 +411,23 @@ def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ObservationEntry]
     ``ObservationEntry`` trajectory carries through — including each entry's real
     ``step`` number — so the verdict renderer can use the journal-faithful step
     attributes rather than re-deriving them from position.
+
+    When ``TI_ENABLED`` is truthy (env) OR ``deps.ti_enabled`` is ``True``,
+    external IOCs in the alert entities are enriched **before** the plan loop runs
+    (RFC-0002 §pre-step-0).  ``deps.ti_enabled`` takes precedence over the env var
+    so parallel eval threads can set per-Run TI posture without racing on a
+    process-global env mutation.  The TI observations use steps 1..K; the executor
+    loop starts at step K+1 via ``initial_step``.  TI enrichment does NOT consume
+    the ``MAX_STEPS`` budget.
     """
+    # TI enrichment — pre-step-0, before planning and outside the MAX_STEPS budget
+    # (RFC-0002 §pre-step-0).  Runs first so the planner can see TI observations in
+    # the FakeLLM script order and so the executor pre-seeds its trajectory.
+    # ``deps.ti_enabled`` is the explicit override (not None → use it directly);
+    # None → fall back to the env var (byte-identical for all existing callers).
+    ti_on = deps.ti_enabled if deps.ti_enabled is not None else _ti_enabled_from_env()
+    ti_observations: list[ObservationEntry] = _enrich_iocs(alert, deps) if ti_on else []
+
     planner = Planner(llm=deps.llm, journal=deps.journal, tool_specs=deps.registry.specs())
     # Recall is entity-scoped and best-effort (the store never raises); ``None`` when
     # no Memory Store is wired keeps the planner prompt memory-free. Recall feeds the
@@ -314,7 +437,8 @@ def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ObservationEntry]
     try:
         plan = planner.plan(alert, recall=recall)
     except LLMError:
-        return [], "error"
+        return ti_observations, "error"
+
     executor = Executor(
         llm=deps.llm,
         journal=deps.journal,
@@ -322,7 +446,12 @@ def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ObservationEntry]
         source=deps.source,
         max_steps=deps.max_steps,
     )
-    execution = executor.run(alert, plan)
+    execution = executor.run(
+        alert,
+        plan,
+        initial_step=len(ti_observations),
+        pre_observations=ti_observations,
+    )
     return execution.observations, execution.terminated_reason
 
 
@@ -494,8 +623,19 @@ def resume_investigation(
     # per Step. Last attempt wins (the recovered result, never the failed attempt),
     # and ``next_step_index`` is the count of *Steps* consumed — never the row count,
     # which a retry would inflate, silently dropping a remaining Plan Step.
+    #
+    # F1/F2 fix (US-0005 QA): the journal rebuild now filters by agent="triage", so
+    # ``reconstructed.observations`` contains both TI wrapper observations
+    # (tool="threat_intel.enrich", agent="triage") and executor step observations.
+    # We must separate them so (a) ``next_step_index`` counts only executor steps
+    # (not TI wrappers) and (b) ``budget_used`` in the executor mirrors the fresh-run
+    # contract where TI observations are budget-free (RFC-0002 §pre-step-0).
     by_step = {obs.step: obs for obs in reconstructed.observations}
     pre_observations = [_rebuild_observation(by_step[step]) for step in sorted(by_step)]
+    # Count observations that are TI wrapper entries vs executor-issued steps.
+    # TI wrappers are identified by tool name ("threat_intel.enrich") — the only
+    # tool the primary loop emits before the executor runs (pre-step-0 contract).
+    executor_pre_count = sum(1 for obs in pre_observations if obs.tool != "threat_intel.enrich")
     # Resume-after-revision: when the executor revised the plan mid-run, the last
     # recorded ``plan_revised`` steps replace the original plan for the remaining
     # work.  The executor's ``revise_plan`` dispatch replaces pending with exactly
@@ -523,7 +663,8 @@ def resume_investigation(
         plan = InvestigationPlan(
             steps=[PlanStep.model_validate(s) for s in reconstructed.plan_steps]
         )
-        next_step_index = len(by_step)
+        # Linear case: next step is the count of completed executor steps (not TI).
+        next_step_index = executor_pre_count
     executor = Executor(
         llm=deps.llm,
         journal=deps.journal,
@@ -536,6 +677,7 @@ def resume_investigation(
         plan,
         pre_observations=pre_observations,
         next_step_index=next_step_index,
+        executor_pre_count=executor_pre_count,
     )
     return _conclude_run(
         alert, deps, execution.observations, execution.terminated_reason, run_id=run_id

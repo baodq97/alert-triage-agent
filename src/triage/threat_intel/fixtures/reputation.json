@@ -1,0 +1,42 @@
+{
+  "185.220.101.5": {
+    "ioc": "185.220.101.5",
+    "ioc_type": "public_ip",
+    "score": 95,
+    "known_bad": true,
+    "classification": "malicious",
+    "tags": ["tor-exit-node", "data-exfil-destination", "threat-actor-infrastructure"],
+    "sources_checked": ["virustotal-mock", "abuseipdb-mock", "tor-exit-list"],
+    "citation": "fixture:reputation/185.220.101.5"
+  },
+  "8.8.8.8": {
+    "ioc": "8.8.8.8",
+    "ioc_type": "public_ip",
+    "score": 0,
+    "known_bad": false,
+    "classification": "benign",
+    "tags": [],
+    "sources_checked": ["virustotal-mock", "abuseipdb-mock"],
+    "citation": "fixture:reputation/8.8.8.8"
+  },
+  "evil.example.com": {
+    "ioc": "evil.example.com",
+    "ioc_type": "domain",
+    "score": 88,
+    "known_bad": true,
+    "classification": "malicious",
+    "tags": ["phishing", "c2-infrastructure"],
+    "sources_checked": ["virustotal-mock", "urlhaus-mock"],
+    "citation": "fixture:reputation/evil.example.com"
+  },
+  "google.com": {
+    "ioc": "google.com",
+    "ioc_type": "domain",
+    "score": 0,
+    "known_bad": false,
+    "classification": "benign",
+    "tags": [],
+    "sources_checked": ["virustotal-mock", "urlhaus-mock"],
+    "citation": "fixture:reputation/google.com"
+  }
+}

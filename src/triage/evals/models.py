@@ -163,6 +163,15 @@ class GoldenCase(_CaseModel):
     existing case.  Set to ``"deny"`` for cases that assert denial semantics
     (e.g. ``high-gate-denied`` verifies that a denied batch is never executed).
     """
+    ti_enabled: bool = False
+    """Whether the TI enrichment mini-loop is enabled for this case (RFC-0002).
+
+    Mirrors the ``TI_ENABLED`` env var but per-case and race-free: the runner
+    sets ``TriageDeps.ti_enabled`` from this field rather than mutating the
+    process-global env, so parallel replay threads do not interfere with each
+    other.  The default ``False`` keeps every existing case byte-identical —
+    TI code paths are off unless a case explicitly sets ``ti_enabled: true``.
+    """
     prior_runs: list[PriorRun] | None = None
     expect_trajectory: TrajectoryExpect = Field(
         default_factory=TrajectoryExpect,

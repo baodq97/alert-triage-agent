@@ -32,10 +32,10 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from triage.core import SCHEMA_VERSION, TriageDeps, summarize, triage
+from triage.core import SCHEMA_VERSION, TriageDeps, resume_investigation, summarize, triage
 from triage.errors import JournalError, ToolError
 from triage.gate import AutoGate, DeferredGate, RiskPolicy
-from triage.journal import NoopJournal
+from triage.journal import JsonlJournal, NoopJournal, rebuild
 from triage.llm import Completion, FakeLLM, OpenAICompatibleLLM
 from triage.memory import MemoryStore
 from triage.models import Alert
@@ -605,6 +605,370 @@ def test_memory_none_no_recall_block_and_no_writes(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
+# --- TI integration (RFC-0002 / US-0005 group B) --------------------------------
+
+
+def _ti_report_json(
+    ioc_type: str = "public_ip",
+    ioc_value: str = "185.220.101.5",
+    confidence: float = 0.95,
+) -> str:
+    return json.dumps(
+        {
+            "ioc_type": ioc_type,
+            "ioc_value": ioc_value,
+            "source_findings": [
+                {
+                    "source": "multi_source_reputation",
+                    "summary": "Known Tor exit node.",
+                    "citation": f"fixture:reputation/{ioc_value}",
+                }
+            ],
+            "overall_assessment": "Confirmed malicious Tor exit node.",
+            "confidence": confidence,
+        }
+    )
+
+
+def _alert_with_public_ip(**overrides: object) -> Alert:
+    """An alert that has one public IP entity — triggers TI enrichment when enabled."""
+    base: dict[str, object] = {
+        "alert_id": "ALT-TI-1",
+        "timestamp": "2026-06-06T00:00:00Z",
+        "source": "edr",
+        "severity_hint": "high",
+        "event_type": "network_connection",
+        "description": "Outbound connection to known Tor exit node.",
+        "entities": {"ip": "185.220.101.5", "user": "alice"},
+        "context": {"port": 443},
+    }
+    return Alert.model_validate({**base, **overrides})
+
+
+def test_ti_disabled_by_default_no_ti_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TI_ENABLED unset (default off): zero TI code paths, byte-identical behavior."""
+    monkeypatch.delenv("TI_ENABLED", raising=False)
+    deps, rec = _deps([_plan("lookup_user"), _conclude(), _verdict()])
+
+    result = triage(_alert_with_public_ip(), deps)
+
+    assert result.terminated_reason == "completed"
+    # No threat_intel.enrich tool_called events in the journal.
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert ti_calls == []
+
+
+def test_ti_enabled_false_string_no_ti_events(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TI_ENABLED=false explicitly → disabled."""
+    monkeypatch.setenv("TI_ENABLED", "false")
+    deps, rec = _deps([_plan("lookup_user"), _conclude(), _verdict()])
+
+    triage(_alert_with_public_ip(), deps)
+
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert ti_calls == []
+
+
+def test_ti_enabled_fires_only_for_external_ioc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With TI enabled, only public IP/domain/hash entities trigger enrichment.
+
+    The default _alert() has entities user=alice (username → None) and
+    ip=10.0.0.9 (private → None): zero TI enrichments fire.
+    """
+    monkeypatch.setenv("TI_ENABLED", "true")
+    # No TI synthesis script entry because no external IOC in the default _alert().
+    deps, rec = _deps([_plan("lookup_user"), _conclude(), _verdict()])
+
+    result = triage(_alert(), deps)
+
+    assert result.terminated_reason == "completed"
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert ti_calls == []
+
+
+def test_ti_enabled_true_enriches_external_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TI_ENABLED=true: one public IP → one TI enrichment observation pre-plan-loop."""
+    monkeypatch.setenv("TI_ENABLED", "true")
+    # Script order: TI synthesis, plan, reason(conclude), verdict.
+    deps, rec = _deps([_ti_report_json(), _plan("lookup_user"), _conclude(), _verdict()])
+
+    result = triage(_alert_with_public_ip(), deps)
+
+    assert result.terminated_reason == "completed"
+    # One threat_intel.enrich tool_called event (agent="triage", primary loop wrapper).
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert len(ti_calls) == 1
+    assert ti_calls[0]["step"] == 1
+    assert ti_calls[0]["args"]["ioc"] == "185.220.101.5"
+    assert ti_calls[0]["args"]["type"] == "public_ip"
+    # The wrapper tool_result for the TI observation uses agent="triage".
+    ti_results = [
+        (p, agent) for e, p, agent in rec.events if e == "tool_result" and p.get("step") == 1
+    ]
+    assert any(p["ok"] is True and agent == "triage" for p, agent in ti_results)
+
+
+def test_ti_enabled_ti_report_lands_as_observation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TI result appears in the executor observations — reasoner prompt contains it."""
+    monkeypatch.setenv("TI_ENABLED", "true")
+    # The reasoner sees TI observations in its rendered prompt (US-0005 AC4).
+    llm = FakeLLM([_ti_report_json(), _plan("lookup_user"), _conclude(), _verdict()])
+    rec = RecordingJournal()
+    deps = TriageDeps(
+        llm=llm,
+        journal=rec,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(rec),
+        policy=RiskPolicy(),
+    )
+
+    triage(_alert_with_public_ip(), deps)
+
+    # The reasoner prompt (last_messages after the reason call) must contain the TI data.
+    # FakeLLM.last_messages holds the final complete() call's messages.
+    # We need the reason call's messages. Check that TI data flows through observations
+    # by verifying the tool_result journal events show a TI observation with ok=True.
+    # Primary-loop wrapper tool_result events carry agent="triage"; TI mini-loop
+    # events carry agent="threat-intel".  Filter to the primary wrapper for the
+    # threat_intel.enrich observation which holds the TIReport data.
+    ti_tool_results = [
+        p
+        for e, p, agent in rec.events
+        if e == "tool_result" and agent == "triage" and p.get("ok") is True and p.get("step") == 1
+    ]
+    assert ti_tool_results, "TI enrichment should produce an ok=True tool_result (agent=triage)"
+    # The data field of the TI observation contains the TIReport structure.
+    assert "ioc_value" in ti_tool_results[0]["data"]
+    assert ti_tool_results[0]["data"]["ioc_value"] == "185.220.101.5"
+
+
+def test_ti_enabled_enrich_none_produces_ok_false_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When enrich() returns None (LLM failure), the primary loop records ok=False."""
+    monkeypatch.setenv("TI_ENABLED", "true")
+    # Two malformed TI replies exhaust the repair attempt -> enrich returns None.
+    # Then: plan, reason(conclude), verdict.
+    deps, rec = _deps(
+        ["bad-json{{{", "still-bad{{{", _plan("lookup_user"), _conclude(), _verdict()]
+    )
+
+    result = triage(_alert_with_public_ip(), deps)
+
+    assert result.terminated_reason == "completed"
+    # The primary-loop wrapper tool_result (agent="triage") at step=1 records the
+    # failed enrichment as ok=False.
+    ti_results = [
+        p
+        for e, p, agent in rec.events
+        if e == "tool_result" and agent == "triage" and p.get("step") == 1
+    ]
+    assert len(ti_results) == 1
+    assert ti_results[0]["ok"] is False
+    assert ti_results[0]["error"] == "TI enrichment failed"
+
+
+def test_ti_journal_hierarchical_trace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Journal shows hierarchical trace: TI mini-loop events agent='threat-intel',
+    primary-loop wrapper events agent='triage' (US-0005 AC3).
+    """
+    monkeypatch.setenv("TI_ENABLED", "true")
+    deps, rec = _deps([_ti_report_json(), _plan("lookup_user"), _conclude(), _verdict()])
+
+    triage(_alert_with_public_ip(), deps)
+
+    # Primary wrapper events (tool_called/tool_result for threat_intel.enrich) are "triage".
+    wrapper_events = [
+        (e, agent)
+        for e, p, agent in rec.events
+        if p.get("tool") == "threat_intel.enrich"
+        or (p.get("step") == 1 and e in {"tool_called", "tool_result"})
+    ]
+    # The wrapping tool_called and tool_result events carry agent="triage".
+    triage_wrappers = [(e, a) for e, a in wrapper_events if a == "triage"]
+    assert len(triage_wrappers) >= 2, "at least tool_called + tool_result at agent='triage'"
+
+    # TI mini-loop's own events (tool_called/tool_result for TI tools + llm_call synthesis)
+    # carry agent="threat-intel".
+    ti_agent_events = [e for e, _, agent in rec.events if agent == "threat-intel"]
+    assert ti_agent_events, "TI mini-loop must emit events with agent='threat-intel'"
+    # At minimum: 3 tool_called + 3 tool_result + 1 llm_call = 7 events.
+    assert len(ti_agent_events) >= 7
+
+
+def test_ti_cap_at_two_enrichments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """At most 2 TI enrichments per run regardless of how many external IOCs the alert has."""
+    monkeypatch.setenv("TI_ENABLED", "true")
+    # An alert with 3 external IOCs (1 public IP + 1 domain + 1 IP duplicate → 2 unique).
+    # ip1 + domain = 2 unique; within the cap so all fire. To test capping, use 3 unique IOCs.
+    # However, the fixture data only has specific IOC values. Use domains that the
+    # classifier classifies as external but the TI fixtures may miss (ok=False is fine).
+    # ip=185.220.101.5, domain=evil.example.com, domain2=google.com → 3 unique external.
+    # First two fire (cap=2), third is skipped.
+    alert = Alert.model_validate(
+        {
+            "alert_id": "ALT-TI-CAP",
+            "timestamp": "2026-06-06T00:00:00Z",
+            "source": "edr",
+            "severity_hint": "high",
+            "event_type": "network_connection",
+            "description": "Multi-IOC alert.",
+            "entities": {
+                "ip": "185.220.101.5",
+                "domain": "evil.example.com",
+                "domain2": "google.com",
+            },
+            "context": {},
+        }
+    )
+    # Script: TI synthesis x2 (cap=2), then plan, reason, verdict.
+    deps, rec = _deps(
+        [
+            _ti_report_json(),
+            _ti_report_json("domain", "evil.example.com"),
+            _plan("lookup_user"),
+            _conclude(),
+            _verdict(),
+        ]
+    )
+
+    result = triage(alert, deps)
+
+    assert result.terminated_reason == "completed"
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert len(ti_calls) == 2  # capped at _TI_MAX_ENRICHMENTS=2
+
+
+def test_ti_dedup_same_value_different_entity_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same IOC value appearing under two entity types is enriched only once."""
+    monkeypatch.setenv("TI_ENABLED", "true")
+    alert = Alert.model_validate(
+        {
+            "alert_id": "ALT-TI-DEDUP",
+            "timestamp": "2026-06-06T00:00:00Z",
+            "source": "edr",
+            "severity_hint": "medium",
+            "event_type": "network_connection",
+            "description": "Duplicate IP under two keys.",
+            "entities": {"ip_src": "185.220.101.5", "ip_dst": "185.220.101.5"},
+            "context": {},
+        }
+    )
+    # Only 1 TI synthesis script entry because the value deduplicates.
+    deps, rec = _deps([_ti_report_json(), _plan("lookup_user"), _conclude(), _verdict()])
+
+    triage(alert, deps)
+
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert len(ti_calls) == 1
+
+
+def test_ti_observations_do_not_consume_max_steps(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TI pre-observations do not count against MAX_STEPS (RFC-0002 §pre-step-0).
+
+    With max_steps=1 and 1 TI observation, the executor should still execute 1 plan
+    step before breaching the guard.  The TI observation's step NUMBER is 1 (for the
+    journal trace); the executor's own budget counter starts at 0 independently, so the
+    executor's step is also numbered starting at 1 past the TI offset (step=2 in the
+    observation), and its budget counter reaches 1 after that step.
+    """
+    monkeypatch.setenv("TI_ENABLED", "true")
+    # Script: TI synthesis, plan (2 steps), reason(continue after step 1), verdict.
+    # max_steps=1 — with TI offset NOT consuming budget, executor runs 1 step then
+    # the second iteration breaches the guard.
+    deps, rec = _deps(
+        [_ti_report_json(), _plan("lookup_user", "query_logs"), _continue(), _verdict()],
+        max_steps=1,
+    )
+
+    result = triage(_alert_with_public_ip(), deps)
+
+    # The TI pre-observation does not consume the MAX_STEPS budget.
+    # The executor ran its 1 allowed step (max_steps=1), then breached.
+    assert result.terminated_reason == "max_steps"
+    # The TI observation is in the trajectory (step=1, tool=threat_intel.enrich).
+    ti_obs = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert len(ti_obs) == 1
+    # The executor ran exactly 1 plan step (max_steps=1 budget respected).
+    # Filter: agent="triage" and not the TI wrapper = pure executor tool calls.
+    executor_calls = [
+        p
+        for e, p, agent in rec.events
+        if e == "tool_called" and agent == "triage" and p.get("tool") != "threat_intel.enrich"
+    ]
+    assert len(executor_calls) == 1
+
+
+def test_ti_enabled_1_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TI_ENABLED=1 is a truthy value."""
+    monkeypatch.setenv("TI_ENABLED", "1")
+    deps, rec = _deps([_ti_report_json(), _plan("lookup_user"), _conclude(), _verdict()])
+
+    result = triage(_alert_with_public_ip(), deps)
+
+    assert result.terminated_reason == "completed"
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert len(ti_calls) == 1
+
+
+def test_ti_enabled_yes_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TI_ENABLED=yes is a truthy value."""
+    monkeypatch.setenv("TI_ENABLED", "yes")
+    deps, rec = _deps([_ti_report_json(), _plan("lookup_user"), _conclude(), _verdict()])
+
+    result = triage(_alert_with_public_ip(), deps)
+
+    assert result.terminated_reason == "completed"
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert len(ti_calls) == 1
+
+
+def test_ti_non_string_entity_value_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-string entity value (e.g. int) is silently skipped by TI enrichment."""
+    monkeypatch.setenv("TI_ENABLED", "true")
+    alert = Alert.model_validate(
+        {
+            "alert_id": "ALT-TI-NONSTR",
+            "timestamp": "2026-06-06T00:00:00Z",
+            "source": "edr",
+            "severity_hint": "low",
+            "event_type": "network_connection",
+            "description": "Alert with non-string entity.",
+            "entities": {"count": 42, "user": "alice"},
+            "context": {},
+        }
+    )
+    # No TI synthesis in script — no external IOC fires.
+    deps, rec = _deps([_plan("lookup_user"), _conclude(), _verdict()])
+
+    result = triage(alert, deps)
+
+    assert result.terminated_reason == "completed"
+    ti_calls = [
+        p for e, p, _ in rec.events if e == "tool_called" and p.get("tool") == "threat_intel.enrich"
+    ]
+    assert ti_calls == []
+
+
 # --- Tier B: live smoke (real LLM; auto-skipped without a key) ----------------
 
 
@@ -790,3 +1154,422 @@ def test_best_effort_terminate_swallows_a_secondary_journal_failure() -> None:
     assert result.verdict is not None
     # Both the run_started failure AND the best-effort run_terminated were attempted.
     assert journal.names == ["run_started", "run_terminated"]
+
+
+# --- US-0005 QA F1/F2: resume over a TI-bearing journal ----------------------
+#
+# These tests prove the fresh/resumed MAX_STEPS contract is symmetric when TI
+# enrichment ran in the original (interrupted) Run (RFC-0002 §pre-step-0).
+
+
+def _alert_with_external_ip(**overrides: object) -> Alert:
+    """An alert with one public IP entity — triggers TI enrichment when enabled."""
+    base: dict[str, object] = {
+        "alert_id": "ALT-RESUME-TI",
+        "timestamp": "2026-06-06T00:00:00Z",
+        "source": "edr",
+        "severity_hint": "high",
+        "event_type": "network_connection",
+        "description": "Outbound connection to suspicious IP.",
+        "entities": {"ip": "185.220.101.5", "user": "alice"},
+        "context": {"port": 443},
+    }
+    return Alert.model_validate({**base, **overrides})
+
+
+def _ti_report_for_resume(ioc_value: str = "185.220.101.5") -> dict[str, Any]:
+    return {
+        "ioc_type": "public_ip",
+        "ioc_value": ioc_value,
+        "source_findings": [
+            {
+                "source": "reputation",
+                "summary": "Known Tor exit node.",
+                "citation": f"fixture:reputation/{ioc_value}",
+            }
+        ],
+        "overall_assessment": "Malicious.",
+        "confidence": 0.9,
+    }
+
+
+def _ti_interrupted_journal(path: Path, ti_report: dict[str, Any]) -> None:
+    """Write a TI-bearing interrupted journal (no run_terminated) to ``path``.
+
+    Includes the exact interleaved structure that caused the F1 crash before the
+    agent-aware rebuild fix: TI inner rows (agent="threat-intel") at step=1..3
+    colliding with the primary TI wrapper row (agent="triage", step=1).
+    """
+    step = {"tool": "lookup_user", "args": {"entity": "alice"}, "rationale": "check"}
+    lines: list[dict[str, Any]] = [
+        {
+            "seq": 1,
+            "event": "run_started",
+            "agent": "triage",
+            "alert_id": "ALT-RESUME-TI",
+            "config": {"max_steps": None},
+            "schema_version": 1,
+        },
+        {
+            "seq": 2,
+            "event": "plan_created",
+            "agent": "triage",
+            "steps": [step],
+        },
+        # Primary TI wrapper: agent="triage", step=1.
+        {
+            "seq": 3,
+            "event": "tool_called",
+            "agent": "triage",
+            "step": 1,
+            "attempt": 1,
+            "tool": "threat_intel.enrich",
+            "args": {"ioc": "185.220.101.5", "type": "public_ip"},
+        },
+        # TI inner rows: agent="threat-intel", steps 1..3 (step-number collision).
+        {
+            "seq": 4,
+            "event": "tool_called",
+            "agent": "threat-intel",
+            "step": 1,
+            "attempt": 1,
+            "tool": "ti_reputation",
+            "args": {"ioc": "185.220.101.5"},
+        },
+        {
+            "seq": 5,
+            "event": "tool_result",
+            "agent": "threat-intel",
+            "step": 1,
+            "attempt": 1,
+            "ok": True,
+            "data": {"score": 0.95},
+        },
+        {
+            "seq": 6,
+            "event": "tool_called",
+            "agent": "threat-intel",
+            "step": 2,
+            "attempt": 1,
+            "tool": "ti_whois",
+            "args": {"ioc": "185.220.101.5"},
+        },
+        {
+            "seq": 7,
+            "event": "tool_result",
+            "agent": "threat-intel",
+            "step": 2,
+            "attempt": 1,
+            "ok": True,
+            "data": {"registrar": "none"},
+        },
+        {
+            "seq": 8,
+            "event": "tool_called",
+            "agent": "threat-intel",
+            "step": 3,
+            "attempt": 1,
+            "tool": "ti_passive_dns",
+            "args": {"ioc": "185.220.101.5"},
+        },
+        {
+            "seq": 9,
+            "event": "tool_result",
+            "agent": "threat-intel",
+            "step": 3,
+            "attempt": 1,
+            "ok": True,
+            "data": {"records": []},
+        },
+        # Primary TI wrapper result: agent="triage", step=1 — closes the pair.
+        {
+            "seq": 10,
+            "event": "tool_result",
+            "agent": "triage",
+            "step": 1,
+            "attempt": 1,
+            "ok": True,
+            "data": ti_report,
+        },
+        # First executor step: agent="triage", step=2.
+        {
+            "seq": 11,
+            "event": "tool_called",
+            "agent": "triage",
+            "step": 2,
+            "attempt": 1,
+            "tool": "lookup_user",
+            "args": {"entity": "alice"},
+        },
+        {
+            "seq": 12,
+            "event": "tool_result",
+            "agent": "triage",
+            "step": 2,
+            "attempt": 1,
+            "ok": True,
+            "data": {"user": "alice", "status": "benign"},
+        },
+        # run_terminated intentionally OMITTED — simulates a killed process.
+    ]
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+
+
+def test_resume_over_ti_bearing_journal_no_crash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 contract: resuming an interrupted TI-bearing journal never crashes.
+
+    Scenario: original run performs TI enrichment (3 inner steps) + 1 executor
+    step, then is interrupted (no run_terminated). The step-number collision
+    between TI inner rows and the primary wrapper previously caused an uncaught
+    pydantic.ValidationError on resume. After the fix, resume completes cleanly.
+    """
+    monkeypatch.setenv("TI_ENABLED", "true")
+    run_dir = tmp_path / "run-resume-ti"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    alert = _alert_with_external_ip()
+
+    _ti_interrupted_journal(run_dir / "journal.jsonl", _ti_report_for_resume())
+
+    reconstructed = rebuild(run_dir / "journal.jsonl")
+    assert reconstructed.is_interrupted()
+
+    # Agent-aware rebuild: only 2 triage-agent observations.
+    # TI inner rows must NOT be in observations.
+    assert len(reconstructed.observations) == 2
+    obs_tools = [obs.tool for obs in reconstructed.observations]
+    assert "threat_intel.enrich" in obs_tools
+    assert "lookup_user" in obs_tools
+    assert not any(t in obs_tools for t in ["ti_reputation", "ti_whois", "ti_passive_dns"])
+
+    # Resume the interrupted run — must not raise (F1 crash fix).
+    resume_journal = JsonlJournal(run_dir)  # reopens, seq continues from 12
+    resume_deps = TriageDeps(
+        llm=FakeLLM([_conclude(), _verdict()]),
+        journal=resume_journal,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(resume_journal, approve=False),
+        policy=RiskPolicy(),
+    )
+
+    result = resume_investigation(alert, resume_deps, reconstructed, run_id="ALT-RESUME-TI")
+
+    assert result.terminated_reason == "completed"
+    assert result.verdict is not None
+    resume_journal.close()
+
+
+def test_resume_over_ti_bearing_journal_budget_symmetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F2 contract: resumed TI run gets the same executor budget as a fresh one.
+
+    The TI wrapper observation (tool="threat_intel.enrich") must NOT count
+    toward budget_used on resume — mirroring the fresh-run contract where TI
+    enrichment is budget-free (RFC-0002 §pre-step-0).
+
+    Scenario: TI + 1 executor step interrupted; resume with max_steps=2.
+    Budget remaining == max_steps - executor_steps_only == 2 - 1 == 1.
+    The resumed executor must be able to run 1 more step, not 0.
+    """
+    monkeypatch.setenv("TI_ENABLED", "true")
+    run_dir = tmp_path / "run-budget-ti"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    alert = _alert_with_external_ip()
+
+    ti_report = _ti_report_for_resume()
+    step1 = {"tool": "lookup_user", "args": {"entity": "alice"}, "rationale": "check"}
+    step2 = {"tool": "query_logs", "args": {"entity": "alice"}, "rationale": "logs"}
+    lines: list[dict[str, Any]] = [
+        {
+            "seq": 1,
+            "event": "run_started",
+            "agent": "triage",
+            "alert_id": "ALT-RESUME-TI",
+            "config": {"max_steps": 2},
+            "schema_version": 1,
+        },
+        {"seq": 2, "event": "plan_created", "agent": "triage", "steps": [step1, step2]},
+        # TI wrapper (agent="triage") + 1 inner row (agent="threat-intel").
+        {
+            "seq": 3,
+            "event": "tool_called",
+            "agent": "triage",
+            "step": 1,
+            "attempt": 1,
+            "tool": "threat_intel.enrich",
+            "args": {"ioc": "185.220.101.5", "type": "public_ip"},
+        },
+        {
+            "seq": 4,
+            "event": "tool_called",
+            "agent": "threat-intel",
+            "step": 1,
+            "attempt": 1,
+            "tool": "ti_rep",
+            "args": {"ioc": "185.220.101.5"},
+        },
+        {
+            "seq": 5,
+            "event": "tool_result",
+            "agent": "threat-intel",
+            "step": 1,
+            "attempt": 1,
+            "ok": True,
+            "data": {},
+        },
+        {
+            "seq": 6,
+            "event": "tool_result",
+            "agent": "triage",
+            "step": 1,
+            "attempt": 1,
+            "ok": True,
+            "data": ti_report,
+        },
+        # One executor step at step=2.
+        {
+            "seq": 7,
+            "event": "tool_called",
+            "agent": "triage",
+            "step": 2,
+            "attempt": 1,
+            "tool": "lookup_user",
+            "args": {"entity": "alice"},
+        },
+        {
+            "seq": 8,
+            "event": "tool_result",
+            "agent": "triage",
+            "step": 2,
+            "attempt": 1,
+            "ok": True,
+            "data": {"user": "alice", "status": "benign"},
+        },
+        # Interrupted — no run_terminated.
+    ]
+    (run_dir / "journal.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+    )
+
+    reconstructed = rebuild(run_dir / "journal.jsonl")
+    assert reconstructed.is_interrupted()
+
+    # Resume with max_steps=2; 1 executor step already consumed, TI not counted.
+    # Budget_remaining = 1; the resumed run must execute 1 more step and complete.
+    resume_journal = JsonlJournal(run_dir)
+    resume_deps = TriageDeps(
+        llm=FakeLLM([_continue(), _conclude(), _verdict()]),
+        journal=resume_journal,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(resume_journal, approve=False),
+        policy=RiskPolicy(),
+        max_steps=2,
+    )
+
+    result = resume_investigation(alert, resume_deps, reconstructed, run_id="ALT-RESUME-TI")
+
+    # Must complete, not terminate with max_steps.  If budget were seeded at 2
+    # (counting TI), the guard would fire immediately (budget_used >= max_steps).
+    assert result.terminated_reason == "completed"
+    assert result.verdict is not None
+    resume_journal.close()
+
+
+def test_resume_ti_observation_visible_to_reasoner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F1 + AC4: TI observation rebuilt from journal is visible in the resumed reasoner.
+
+    The TI wrapper observation (threat_intel.enrich, ok=True) must be in the
+    pre_observations passed to Executor.resume so the reasoner's prompt contains
+    the TI context — not just the executor step.
+    """
+    monkeypatch.setenv("TI_ENABLED", "true")
+    run_dir = tmp_path / "run-ti-visible"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    alert = _alert_with_external_ip()
+
+    ti_report = _ti_report_for_resume()
+    plan_step = {"tool": "lookup_user", "args": {"entity": "alice"}, "rationale": "check"}
+    lines: list[dict[str, Any]] = [
+        {
+            "seq": 1,
+            "event": "run_started",
+            "agent": "triage",
+            "alert_id": "ALT-RESUME-TI",
+            "config": {"max_steps": None},
+            "schema_version": 1,
+        },
+        {"seq": 2, "event": "plan_created", "agent": "triage", "steps": [plan_step]},
+        # TI enrichment: wrapper + 1 inner row.
+        {
+            "seq": 3,
+            "event": "tool_called",
+            "agent": "triage",
+            "step": 1,
+            "attempt": 1,
+            "tool": "threat_intel.enrich",
+            "args": {"ioc": "185.220.101.5", "type": "public_ip"},
+        },
+        {
+            "seq": 4,
+            "event": "tool_called",
+            "agent": "threat-intel",
+            "step": 1,
+            "attempt": 1,
+            "tool": "ti_rep",
+            "args": {"ioc": "185.220.101.5"},
+        },
+        {
+            "seq": 5,
+            "event": "tool_result",
+            "agent": "threat-intel",
+            "step": 1,
+            "attempt": 1,
+            "ok": True,
+            "data": {"score": 0.9},
+        },
+        {
+            "seq": 6,
+            "event": "tool_result",
+            "agent": "triage",
+            "step": 1,
+            "attempt": 1,
+            "ok": True,
+            "data": ti_report,
+        },
+        # Interrupted after TI but before the first executor step.
+    ]
+    (run_dir / "journal.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+    )
+
+    reconstructed = rebuild(run_dir / "journal.jsonl")
+    assert reconstructed.is_interrupted()
+    # TI wrapper observation present in the rebuild.
+    assert len(reconstructed.observations) == 1
+    assert reconstructed.observations[0].tool == "threat_intel.enrich"
+    assert reconstructed.observations[0].ok is True
+
+    # Resume — the reasoner gets the TI observation in its pre_observations.
+    resume_journal = JsonlJournal(run_dir)
+    resume_deps = TriageDeps(
+        llm=FakeLLM([_conclude(), _verdict()]),
+        journal=resume_journal,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(resume_journal, approve=False),
+        policy=RiskPolicy(),
+    )
+
+    result = resume_investigation(alert, resume_deps, reconstructed, run_id="ALT-RESUME-TI")
+
+    assert result.terminated_reason == "completed"
+    assert result.verdict is not None
+    # Verdict has findings: the reasoner's prompt included the TI observation.
+    assert list(result.verdict.findings)
+    resume_journal.close()

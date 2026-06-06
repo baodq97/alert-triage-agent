@@ -1,0 +1,35 @@
+{
+  "evil.example.com": {
+    "ioc": "evil.example.com",
+    "ioc_type": "domain",
+    "resolutions": [
+      {"ip": "185.220.101.5", "first_seen": "2025-11-01", "last_seen": "2026-01-15"},
+      {"ip": "185.220.101.6", "first_seen": "2026-01-16", "last_seen": "2026-03-01"}
+    ],
+    "record_count": 2,
+    "citation": "fixture:passive_dns/evil.example.com"
+  },
+  "google.com": {
+    "ioc": "google.com",
+    "ioc_type": "domain",
+    "resolutions": [
+      {"ip": "142.250.80.46", "first_seen": "2020-01-01", "last_seen": "2026-06-01"}
+    ],
+    "record_count": 1,
+    "citation": "fixture:passive_dns/google.com"
+  },
+  "185.220.101.5": {
+    "ioc": "185.220.101.5",
+    "ioc_type": "public_ip",
+    "hostnames": ["tor-exit-5.example.net"],
+    "record_count": 1,
+    "citation": "fixture:passive_dns/185.220.101.5"
+  },
+  "8.8.8.8": {
+    "ioc": "8.8.8.8",
+    "ioc_type": "public_ip",
+    "hostnames": ["dns.google"],
+    "record_count": 1,
+    "citation": "fixture:passive_dns/8.8.8.8"
+  }
+}

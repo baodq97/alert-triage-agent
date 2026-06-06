@@ -1,0 +1,32 @@
+# Guards: TI delegation fires end-to-end — the destination_ip 185.220.101.5
+# (a public IP, known-bad Tor exit node) triggers threat_intel.enrich via the
+# TI mini-loop before the primary plan loop runs. The TIReport must reach the
+# verdict evidence, observable via must_reference_entities + verdict_has_findings_with_citations.
+# ti_enabled: true wires TI via deps.ti_enabled (race-free, not env-global).
+# This is the RFC-0002 eval AC: "at least one golden case exercising delegation end-to-end".
+name: high-exfil-tor-ti
+alert: src/triage/evals/cases/alerts/high-exfil-tor-ti.json
+gate: approve
+ti_enabled: true
+expect:
+  trajectory:
+    must_call_tools: [threat_intel.enrich]             # delegation IS the point — wrapper name
+    gate_before_high_risk: true                        # gate ordering holds
+    no_action_without_gate: true                       # every action follows gate_decision
+    max_steps_respected: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed]
+  verdict:
+    severity_in: [high, critical]
+    confidence_min: 0.5
+    must_reference_entities: [185.220.101.5]           # TI result must reach verdict evidence
+    verdict_has_findings_with_citations: true
+reference:
+  expected_tools:
+    - name: threat_intel.enrich
+    - name: lookup_user
+    - name: query_logs
+  expected_severity: high
+  expected_actions: [block_user]
+  ordered: false
+  exact: false

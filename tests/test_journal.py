@@ -554,3 +554,109 @@ def test_reopen_fresh_run_dir_starts_at_seq_one(tmp_path: Path) -> None:
     journal = JsonlJournal(run_dir)
     journal.emit("run_started", {"alert_id": "ALT-1"})
     assert _read_lines(run_dir)[0]["seq"] == 1
+
+
+# --- US-0005 QA F1/F2: agent-aware rebuild -----------------------------------
+
+
+def _e(seq: int, event: str, agent: str = "triage", **kw: Any) -> dict[str, Any]:
+    """Compact event dict builder for inline journal lines in tests."""
+    return {"seq": seq, "event": event, "agent": agent, **kw}
+
+
+def test_rebuild_threat_intel_inner_rows_excluded_from_observations(tmp_path: Path) -> None:
+    # F1: tool_called / tool_result events with agent="threat-intel" must NOT
+    # enter the resumable observations — they stay in the raw events audit trail.
+    # Only agent="triage" rows produce StepObservations.
+    path = tmp_path / "journal.jsonl"
+    lines = [
+        # Primary-loop TI wrapper (agent="triage") — goes into observations.
+        _e(1, "run_started", alert_id="ALT-TI"),
+        _e(2, "tool_called", step=1, attempt=1, tool="threat_intel.enrich"),
+        # TI mini-loop inner rows (agent="threat-intel") — stay in raw audit only.
+        _e(3, "tool_called", "threat-intel", step=1, attempt=1, tool="ti_reputation"),
+        _e(4, "tool_result", "threat-intel", step=1, attempt=1, ok=True, data={"s": 0.9}),
+        _e(5, "tool_called", "threat-intel", step=2, attempt=1, tool="ti_whois"),
+        _e(6, "tool_result", "threat-intel", step=2, attempt=1, ok=True, data={}),
+        # Primary-loop TI wrapper result — closes the pair, becomes an observation.
+        _e(7, "tool_result", step=1, attempt=1, ok=True, data={"ioc_type": "public_ip"}),
+        # Primary executor step (agent="triage").
+        _e(8, "tool_called", step=2, attempt=1, tool="lookup_user"),
+        _e(9, "tool_result", step=2, attempt=1, ok=True, data={}),
+    ]
+    path.write_text("".join(json.dumps(item) + "\n" for item in lines), encoding="utf-8")
+
+    run = rebuild(path)
+
+    # All 9 events in raw audit trail.
+    assert len(run.events) == 9
+    # Only 2 observations: the TI wrapper (step=1) + the executor step (step=2).
+    # The 4 threat-intel inner rows must NOT be here.
+    assert len(run.observations) == 2
+    tools = [obs.tool for obs in run.observations]
+    assert "threat_intel.enrich" in tools
+    assert "ti_reputation" not in tools
+    assert "ti_whois" not in tools
+    # step numbers match the primary-loop numbering.
+    steps = {obs.step for obs in run.observations}
+    assert steps == {1, 2}
+
+
+def test_rebuild_threat_intel_rows_do_not_pollute_pending_calls(tmp_path: Path) -> None:
+    # F1: the TI wrapper's pending_call must not be clobbered by inner TI rows
+    # sharing the same step number.  The wrapper's tool_result must pair with the
+    # wrapper's tool_called, not with an inner result.
+    path = tmp_path / "journal.jsonl"
+    lines = [
+        _e(1, "run_started", alert_id="ALT-TI"),
+        # Primary wrapper: step=1, tool=threat_intel.enrich.
+        _e(2, "tool_called", step=1, attempt=1, tool="threat_intel.enrich"),
+        # Inner TI rows also at step=1 — must be ignored by _pending_calls.
+        _e(3, "tool_called", "threat-intel", step=1, attempt=1, tool="ti_rep"),
+        _e(4, "tool_result", "threat-intel", step=1, attempt=1, ok=False, error="miss"),
+        # Primary wrapper result at step=1 — must pair with seq=2, not seq=3.
+        _e(5, "tool_result", step=1, attempt=1, ok=True, data={"ioc_type": "hash"}),
+    ]
+    path.write_text("".join(json.dumps(item) + "\n" for item in lines), encoding="utf-8")
+
+    run = rebuild(path)
+
+    assert len(run.observations) == 1
+    obs = run.observations[0]
+    # Must reconstruct from the primary wrapper pair, not the inner TI pair.
+    assert obs.tool == "threat_intel.enrich"
+    assert obs.ok is True
+    assert obs.data == {"ioc_type": "hash"}
+
+
+def test_rebuild_steps_after_last_revision_unaffected_by_ti_inner_rows(
+    tmp_path: Path,
+) -> None:
+    # F1: steps_after_last_revision must count primary-loop (agent="triage")
+    # tool_result events only; TI inner (agent="threat-intel") rows must be ignored.
+    path = tmp_path / "journal.jsonl"
+    lines = [
+        _e(1, "run_started", alert_id="ALT-TI"),
+        _e(2, "plan_created", steps=[{"tool": "lookup_user"}, {"tool": "check_reputation"}]),
+        # TI enrichment at step=1 (before plan loop).
+        _e(3, "tool_called", step=1, attempt=1, tool="threat_intel.enrich"),
+        _e(4, "tool_called", "threat-intel", step=1, attempt=1, tool="ti_rep"),
+        _e(5, "tool_result", "threat-intel", step=1, attempt=1, ok=True, data={}),
+        _e(6, "tool_result", step=1, attempt=1, ok=True, data={}),
+        # Executor step at step=2 (before revision).
+        _e(7, "tool_called", step=2, attempt=1, tool="lookup_user"),
+        _e(8, "tool_result", step=2, attempt=1, ok=True, data={}),
+        # Plan revision fires.
+        _e(9, "plan_revised", steps=[{"tool": "check_reputation"}]),
+        # Executor step after revision at step=3.
+        _e(10, "tool_called", step=3, attempt=1, tool="check_reputation"),
+        _e(11, "tool_result", step=3, attempt=1, ok=True, data={}),
+    ]
+    path.write_text("".join(json.dumps(item) + "\n" for item in lines), encoding="utf-8")
+
+    run = rebuild(path)
+
+    # Only the primary-loop executor step after the revision (step=3) counts.
+    # The TI inner rows (step=1) and the TI wrapper (step=1, before revision)
+    # must not inflate this counter.
+    assert run.steps_after_last_revision == 1
