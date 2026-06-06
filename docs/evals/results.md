@@ -22,30 +22,33 @@ Same agent, three model families, three endpoints — only `.env` changed, zero
 `src/triage` edits (ADR-0002). The judge is **pinned to gpt-5.4-mini** for all
 three so Tier-2 scores are comparable; the model under test is the *agent*.
 
+Run over the full 36-case suite via the shipped `make eval-sweep` (US-0009),
+judge pinned to gpt-5.4-mini:
+
 | Model | Endpoint | Tier-1 | Judge (pinned) | stdev | wall/case | tok/case |
 |---|---|---|---|---|---|---|
-| gpt-5.4-mini | Azure AI Foundry | **35/35** | 83.8 | 3.1 | 12.0s | 14.8k |
-| Llama-3.3-70B-Instruct | Azure AI Foundry | 31/35 | 78.6 | 5.7 | 17.3s | 11.6k |
-| deepseek-v4-flash | OpenRouter | 29/35 | 83.3 | 3.4 | 80.4s | 19.6k |
+| gpt-5.4-mini | Azure AI Foundry | **36/36** | 83.9 | 2.5 | 11.6s | 14.2k |
+| Llama-3.3-70B-Instruct | Azure AI Foundry | 33/36 | 78.7 | 6.4 | 17.1s | 12.1k |
+| deepseek-v4-flash | OpenRouter | 27/36 | 82.2 | 4.3 | 82.2s | 16.9k |
 
-(The cross-model matrix was run over the original 35 cases, before the US-0009
-memory case was added; the baseline column reproduces the gpt-5.4-mini result on
-that same 35-case set — 35/35, judge 83.8 — confirming the quality-loop gains are
-stable across independent runs.)
+(gpt-5.4-mini reproduces 36/36 with judge 83.9 — within noise of the standalone
+baseline 84.1 — confirming the quality-loop gains are stable across independent
+runs. Llama/DeepSeek Tier-1 counts move a few cases run-to-run, the expected
+variance of a stochastic model against ranges calibrated for a different model.)
 
 ### How to read this
 
 - **The swap works.** The full agent loop — plan, ReAct tool use, verdict,
   verify hook, gate, memory — runs end-to-end on all three models with no code
   change. That is the requirements-bonus claim, demonstrated.
-- **Tier-1 35/35 holds only on the calibrated model.** The golden cases' ranges
+- **Tier-1 36/36 holds only on the calibrated model.** The golden cases' ranges
   were tuned against gpt-5.4-mini; Llama and DeepSeek **degrade gracefully**
-  (31, 29) rather than crashing — the never-crash verdict, the zero-evidence
+  (33, 27) rather than crashing — the never-crash verdict, the zero-evidence
   confidence clamp, and the verify hook keep every run shipping a valid verdict.
   This is honest portability data, not a "every model is perfect" claim.
 - **Why deterministic Tier-1 gates and the judge only advises.** DeepSeek's
-  judge score (83.3) is essentially gpt's (83.8) — its *reasoning* is strong —
-  yet its Tier-1 is 29/35. The failures cluster on `confidence_min` /
+  judge score (82.2) is close to gpt's (83.9) — its *reasoning* is strong —
+  yet its Tier-1 is 27/36. The failures cluster on `confidence_min` /
   `severity_in` / `must_reference_entities`: confidence/severity band drift and
   the occasional missed entity reference. The holistic judge forgives these; the
   deterministic Tier-1 checks catch them. A stochastic judge must never be the
