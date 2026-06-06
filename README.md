@@ -31,6 +31,9 @@ response. This agent performs that loop autonomously:
 
 ## Architecture
 
+Deep dive — runtime flow, module seams, journal/resume mechanics, and the full
+no-framework rationale: **[docs/architecture.md](docs/architecture.md)**.
+
 ```mermaid
 flowchart TD
     A["alert JSON\n(run.py --alert)"] --> B["validate\n(Pydantic strict)"]
@@ -72,7 +75,7 @@ flowchart TD
 | `src/triage/rendering.py` | LLM-facing rendering primitives: truncation, compact JSON, observation tags, prompt split |
 | `src/triage/memory/` | L1 atoms, L2 dossiers, L3 posture; entity-scoped recall |
 | `src/triage/tools/` | `ToolRegistry` (4 read-only tools), `DataSource` Protocol, `FixtureDataSource`, `block_user` response action |
-| `src/triage/evals/` | Runner, 34 golden cases, assertion engine, replay mode, LLM judge |
+| `src/triage/evals/` | Runner, 35 golden cases, assertion engine, replay mode, LLM judge |
 | `prompts/*.md` | Every LLM prompt (planner, reasoner, verdict, judge, posture) |
 
 Dependency direction: `models` ← everything; `journal` / `llm` / `tools` / `gate` / `rendering`
@@ -184,7 +187,7 @@ golden case does not ship.
 ### Two tiers
 
 **Tier 1 — blocking behavioral assertions** (`make eval-replay` / `make eval`):
-Each of the 34 golden cases (`src/triage/evals/cases/*.yaml`) asserts on:
+Each of the 35 golden cases (`src/triage/evals/cases/*.yaml`) asserts on:
 - Trajectory: required tools called, gate-before-high-risk ordering, max-steps
   respected, no repeated identical calls.
 - Verdict: severity in the allowed range, entities referenced, confidence floor,
@@ -208,18 +211,19 @@ make eval
 ```
 
 Replay mode uses prompt-hash-keyed cached responses stored in `.replay.json` files
-alongside each case. When you change a prompt, the cache misses, forcing fresh LLM
-calls; then re-record with:
+alongside each case. When you change a prompt, the cache misses loudly (`ReplayMiss`);
+re-record the suite live with:
 
 ```bash
-uv run python -m triage.evals.runner --record
+uv run python _workspace/run_dataset.py --dirs src/triage/evals/cases --out _workspace/evalrunN
 ```
 
-This re-runs all cases live and writes new `.replay.json` caches.
+This re-runs all cases live, writes fresh `.replay.json` caches next to each YAML,
+and dumps per-case metrics (Tier-1 results, judge median-of-3, latency) to `--out`.
 
 ### Golden case coverage
 
-34 cases span the core behavioral envelope:
+35 cases span the core behavioral envelope:
 
 | Category | Cases |
 |---|---|
@@ -228,6 +232,56 @@ This re-runs all cases live and writes new `.replay.json` caches.
 | Unknown event type (zero code changes needed) | `unknown-event-type` |
 | Tool failure handling | `tool-failure`, `tool-failure-*` (4 variants) |
 | Edge cases | `edge-contradictory-signals`, `edge-empty-entities`, others |
+
+### Evaluation results (2026-06-06, live)
+
+Final state after the five-round reasoning-quality loop
+([full report](docs/reports/2026-06-06-quality-loop-summary.md)):
+
+| Metric | Value |
+|---|---|
+| Tier-1 behavioral assertions | **35/35 pass** (live and replay) |
+| Tier-2 judge mean | **84.1 / 100** (median-of-3; baseline 73.8) |
+| Judge spread | stdev 2.6, min 78 (baseline stdev 6.7) |
+| Verify-hook false flags | **0 / 35** recorded; 8.6% live (≤ 10% Phase-2 gate) |
+| Coverage-gap telemetry | 3/35 cases (was 10/35 before the loop) |
+| Memory atoms (entity attribution) | 277 → 108 (−61% cross-entity noise) |
+
+The judge mean moved 73.8 → 84.1 through five audited rounds: a reasoner coverage
+gate, an explicit verdict limitation ledger, a tool-family pivot playbook, an
+aspect-completeness rule, and judge scoring anchors. Rounds 1–4 changed real agent
+behavior (the verify hook's own coverage telemetry confirms it); round 5 calibrated
+the measuring instrument.
+
+### Three worked examples (from the final live run)
+
+**1. `exfil-prod` — confirmed threat path (judge 85/100).**
+*Input:* alert `data_exfiltration` — service account `svc-deploy-prod` called
+`/admin/users/export` 847 times from `10.200.3.47`, outside the expected caller
+range. *Trajectory:* `lookup_user` → `query_logs` (account) → `query_logs` (IP) —
+all ok. *Output:* severity **high**, confidence 0.78, 4 findings (each citing exact
+tool data; the fourth explicitly flags that the 847-call volume claim is only
+partially resolved), 3 recommended actions (`review_access`, …) — batched through
+the approval gate before execution. *Judge audit:* "each key claim tied to concrete
+tool output … keeps severity high while limiting confidence — correct decoupling."
+
+**2. `benign` — false-positive discipline (judge 86/100).**
+*Input:* off-hours console login by `dev-intern-jpark` from `203.0.113.22`.
+*Trajectory:* `lookup_user` → `query_logs` (user) → `get_asset_info` (fails: no
+record) → `query_logs` (IP). *Output:* severity **low**, confidence 0.78, no
+actions; two limitation findings explicitly name what could NOT be verified (device
+context, off-hours framing) with `related_entities: []` so run limitations never
+pollute entity memory. *Judge audit:* "the failed get_asset_info call was handled
+honestly rather than ignored."
+
+**3. `tool-failure-all-unknown-ip` — zero-evidence honesty (judge 85/100).**
+*Input:* port-scan alert with three source IPs; the fixture world has no record of
+any of them (by design). *Trajectory:* 4 calls across `query_logs` /
+`check_reputation`, every one fails. *Output:* severity **medium** (threat pattern
+unchanged — severity never downgraded for missing evidence), confidence **0.35**
+(zero-evidence clamp band), no actions, one finding per IP stating it remains
+unverified. *Judge audit:* "adapted appropriately … ending with an explicitly
+unverified, low-confidence verdict rather than inventing results."
 
 ---
 
@@ -322,7 +376,7 @@ a thin adapter loop, not a core change.
 | ≥3 tests (tool call / approval gate / tool error) | `tests/test_core.py`, `tests/test_executor.py`, `tests/test_verdict.py` |
 | Run journal (audit trail, resume, retry visibility) | `journal.py` + `ADR-0003`; US-0002 |
 | Memory L0→L3 (entities, dossiers, posture) | `src/triage/memory/`; US-0003, US-0004 |
-| Two-tier eval harness (blocking + advisory judge) | `src/triage/evals/`; 34 golden cases; US-0003 AC |
+| Two-tier eval harness (blocking + advisory judge) | `src/triage/evals/`; 35 golden cases; US-0003 AC |
 | README + `.env.example` + `pyproject.toml` | This file; repo root |
 | No secrets in repo | `.gitignore` covers `runs/`, `.env`, `.memory/`; `.env.example` has only placeholders |
 | Single-command run | `make run` |
