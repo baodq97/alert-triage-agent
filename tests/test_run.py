@@ -181,6 +181,14 @@ def test_verbose_journal_narration_covers_every_event_kind() -> None:
     err_result = narrate("tool_result", {"ok": False, "error": "boom"}, "triage")
     assert err_result is not None
     assert "error=boom" in err_result
+    # Tool output data is previewed inline (compact JSON)...
+    data_result = narrate("tool_result", {"ok": True, "data": {"status": "active"}}, "triage")
+    assert data_result == '         -> ok=True {"status": "active"}'
+    # ...and truncated past the preview budget.
+    long_result = narrate("tool_result", {"ok": True, "data": {"blob": "x" * 500}}, "triage")
+    assert long_result is not None
+    assert long_result.endswith("…")
+    assert len(long_result) < 300
 
     llm_line = narrate("llm_call", {"purpose": "plan", "tokens": 10, "latency_ms": 5.0}, "triage")
     assert llm_line is not None
