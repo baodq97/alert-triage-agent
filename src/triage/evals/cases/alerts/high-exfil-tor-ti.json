@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-HIGHEXFILTORTI-0001",
+  "timestamp": "2026-06-06T02:45:00Z",
+  "source": "dlp",
+  "severity_hint": "critical",
+  "event_type": "bulk_data_egress",
+  "description": "Service account 'svc-ml-pipeline' transferred 6.1 GB of labelled training data to an external IP (185.220.101.5) not present in the approved egress allowlist. Transfer rate was 8x the account baseline. Destination IP has no prior contact history in this organisation.",
+  "entities": {
+    "service_account": "svc-ml-pipeline",
+    "destination_ip": "185.220.101.5"
+  },
+  "context": {
+    "bytes_transferred": 6100000000,
+    "duration_seconds": 300,
+    "destination_country": "unknown",
+    "auth_method": "api_key",
+    "approved_egress_ips": ["10.50.0.0/16", "203.0.113.100"]
+  }
+}

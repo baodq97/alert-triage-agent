@@ -746,3 +746,81 @@ def test_resume_repeat_guard_rebuilds_attempted_from_pre_observations() -> None:
     # Guard note must be present in the second Reasoner call's prompt.
     second_rendered = "\n".join(m["content"] for m in llm.messages_by_call[1])
     assert "refused to repeat" in second_rendered
+
+
+# --------------------------------------------------------------------------- #
+# initial_step / pre_observations — TI pre-step-0 integration seam            #
+# --------------------------------------------------------------------------- #
+
+
+def test_run_with_initial_step_numbers_steps_past_offset() -> None:
+    """When initial_step=K, the first executor step is numbered K+1.
+
+    This is the seam the TI integration uses: TI observations use steps 1..K,
+    so the executor's first tool call is numbered K+1 in its ObservationEntry —
+    no collision in the journal trace.
+    """
+    journal = RecordingJournal()
+    executor = _executor(llm=FakeLLM([_decision("conclude")]), journal=journal)
+
+    result = executor.run(_alert(), _plan(_step()), initial_step=3)
+
+    assert result.terminated_reason == "completed"
+    # The one executor step is numbered 4 (3 + 1), not 1.
+    assert result.observations[-1].step == 4
+    called = next(p for e, p, _ in journal.events if e == "tool_called")
+    assert called["step"] == 4
+
+
+def test_run_with_pre_observations_seeds_attempted_guard() -> None:
+    """pre_observations are seeded into the repeat-call guard.
+
+    A tool+args already in pre_observations must be refused if the Reasoner
+    proposes it again — without executing it a second time.
+    """
+    journal = RecordingJournal()
+    dup_step = _step(entity="alice")  # lookup_user(alice)
+    pre = [
+        ObservationEntry(
+            step=1,
+            tool="lookup_user",
+            args={"entity": "alice"},
+            result=ToolResult(tool="lookup_user", ok=True, data={"status": "benign"}),
+        )
+    ]
+    # The reasoner proposes the same dup_step (already in pre); guard refuses it;
+    # then concludes.
+    llm = FakeLLM(
+        [
+            _decision("revise_plan", next_step=dup_step),
+            _decision("conclude"),
+        ]
+    )
+    executor = _executor(llm=llm, journal=journal)
+
+    result = executor.run(_alert(), _plan(dup_step), initial_step=1, pre_observations=pre)
+
+    assert result.terminated_reason == "completed"
+    # No new tool_called — the dup was refused by the guard (pre_obs already in attempted).
+    assert len([p for e, p, _ in journal.events if e == "tool_called"]) == 0
+    # pre_observations are in the trajectory.
+    assert result.observations[0].step == 1
+    assert result.observations[0].tool == "lookup_user"
+
+
+def test_run_initial_step_zero_budget_not_consumed_by_offset() -> None:
+    """initial_step offsets step NUMBERS but not the MAX_STEPS budget.
+
+    With max_steps=1 and initial_step=5, the executor still runs 1 step before
+    breaching the guard — the budget counter starts at 0 regardless of initial_step.
+    """
+    journal = RecordingJournal()
+    llm = FakeLLM([_decision("revise_plan", next_step=_step(tool="query_logs", entity="x"))])
+    executor = _executor(llm=llm, journal=journal, max_steps=1)
+
+    result = executor.run(_alert(), _plan(_step(entity="seed")), initial_step=5)
+
+    assert result.terminated_reason == "max_steps"
+    # 1 step ran (numbered 6 = 5+1).
+    assert len(result.observations) == 1
+    assert result.observations[0].step == 6

@@ -489,9 +489,23 @@ class _RunBuilder:
             self._run.llm_purposes.append(purpose)
 
     def _on_tool_called(self, event: dict[str, Any]) -> None:
+        # Only fold primary-loop (agent="triage") tool calls into the resumable
+        # trajectory.  The TI mini-loop's inner events (agent="threat-intel") share
+        # the same step numbers as the TI wrapper and would clobber _pending_calls,
+        # causing a resume crash (F1 fix — see triage-conventions §Journal).
+        # Missing agent defaults to "triage" — synthetic/older events without an
+        # explicit agent field are treated as primary-loop events.
+        if event.get("agent", "triage") != "triage":
+            return
         self._pending_calls[(event.get("step", 0), event.get("attempt", 0))] = event
 
     def _on_tool_result(self, event: dict[str, Any]) -> None:
+        # Mirror the agent filter from _on_tool_called: only agent="triage" results
+        # pair with the primary-loop's pending calls and enter the resumable
+        # observations.  TI inner results stay in the raw events audit trail only.
+        # Missing agent defaults to "triage" — same convention as _on_tool_called.
+        if event.get("agent", "triage") != "triage":
+            return
         _record_observation(self._run, event, self._pending_calls)
         if self._saw_revision:
             step = int(event.get("step", 0))

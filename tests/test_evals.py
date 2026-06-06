@@ -712,6 +712,30 @@ def _verdict_for(severity: str, *entities: str, confidence: float = 0.7) -> str:
     return json.dumps(payload)
 
 
+def _ti_report_for(ioc_value: str = "185.220.101.5") -> str:
+    """A minimal TIReport JSON suitable as a FakeLLM TI-synthesis entry.
+
+    The verdict field of every entity in the TI case must reference this IOC
+    value so ``must_reference_entities`` passes.  The format mirrors
+    ``TIReport`` (validated by the TI loop's ``llm.complete`` call).
+    """
+    return json.dumps(
+        {
+            "ioc_type": "public_ip",
+            "ioc_value": ioc_value,
+            "source_findings": [
+                {
+                    "source": "multi_source_reputation",
+                    "summary": f"{ioc_value} is a known Tor exit node.",
+                    "citation": f"fixture:reputation/{ioc_value}",
+                }
+            ],
+            "overall_assessment": f"{ioc_value}: confirmed malicious Tor exit node.",
+            "confidence": 0.95,
+        }
+    )
+
+
 # A case-appropriate script for each shipped golden case so a recorded cache makes
 # that case pass under replay. Tools cover each case's must_call_tools; the verdict
 # satisfies severity_in and must_reference_entities.
@@ -758,6 +782,12 @@ def _script_for(name: str) -> list[str]:
         "edge-max-steps-confidence": _verdict_for("medium", confidence=0.5),
         "medium-recall-elevates": _verdict_for("medium", "user-finops-charlie"),
     }
+    # TI cases require a TI synthesis entry before the plan (the TI mini-loop fires
+    # pre-step-0, so its LLM call is consumed before the plan call).  For all other
+    # cases the script is [plan, *reasons, verdict].
+    if name == "high-exfil-tor-ti":
+        ti_verdict = _verdict_for("high", "185.220.101.5", "svc-ml-pipeline")
+        return [_ti_report_for(), plan, *reasons, ti_verdict]
     return [plan, *reasons, verdicts[name]]
 
 
@@ -918,14 +948,18 @@ def test_run_suite_and_format_report() -> None:
     # entries are simply never popped).
 
     script: list[str] = []
-    for _ in range(34):
+    for _ in range(35):
+        # Oversupply TI entries so the TI-enabled cases consume them first without
+        # exhausting the script (extra entries in a FakeLLM are harmless — they are
+        # simply never popped).
+        script.append(_ti_report_for())
         script.extend([_plan("lookup_user", "query_logs", "check_reputation", "get_asset_info")])
         script.extend([_cont(), _cont(), _cont(), _conclude()])
         script.append(_verdict_json())
     reports = run_suite(FakeLLM(script))
     text = format_report(reports)
 
-    assert len(reports) == 34
+    assert len(reports) == 35
     assert "Eval report" in text
     assert "RESULT:" in text
 
@@ -941,7 +975,9 @@ def test_build_live_llm_needs_a_key(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_main_returns_nonzero_on_tier1_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     # Inject a FakeLLM whose verdict is 'low' everywhere → exfil-prod severity_in fails.
     script: list[str] = []
-    for _ in range(34):
+    for _ in range(35):
+        # Oversupply TI entries for the TI-enabled cases (same as test_run_suite).
+        script.append(_ti_report_for())
         script.extend([_plan("lookup_user", "query_logs", "check_reputation", "get_asset_info")])
         script.extend([_cont(), _cont(), _cont(), _conclude()])
         script.append(_verdict_json(severity="low"))
@@ -1361,10 +1397,10 @@ def test_judge_default_samples_1_is_byte_identical_to_original() -> None:
 
 
 def test_all_golden_cases_parse() -> None:
-    # All 34 shipped cases (6 original + 24 extended + 4 new round-4) must parse
-    # and declare at least one assertion each.
+    # All 35 shipped cases (6 original + 24 extended + 4 round-4 + 1 TI) must
+    # parse and declare at least one assertion each.
     cases = load_cases(_CASES_DIR)
-    assert len(cases) == 34
+    assert len(cases) == 35
     # Original core 6 must still be present.
     core_names = {
         "exfil-prod",
@@ -1504,3 +1540,180 @@ def test_deepeval_adapter_carries_input_parameters() -> None:
     assert projection.expected_tools[0]["input_parameters"] == {"entity": "x"}
     assert projection.should_consider_ordering is True
     assert projection.should_exact_match is True
+
+
+# --- ti_enabled wiring: deps override, GoldenCase threading, default-off -----
+
+
+def _is_ti_enrich_call(event: dict[str, object]) -> bool:
+    """Return True when ``event`` is a primary-loop threat_intel.enrich tool_called."""
+    return event.get("event") == "tool_called" and event.get("tool") == "threat_intel.enrich"
+
+
+def _ti_alert_json(name: str) -> str:
+    """Read the text of a TI-test alert fixture resolved from the repo root."""
+    return (
+        runner._REPO_ROOT / "src/triage/evals/cases/alerts" / name  # noqa: SLF001
+    ).read_text(encoding="utf-8")
+
+
+def test_ti_enabled_deps_override_beats_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TriageDeps.ti_enabled=False suppresses TI even when TI_ENABLED env is 'true'.
+
+    The env var is the process-global fallback; the explicit deps field overrides it.
+    This is the race-free seam for eval runner parallel threads.
+    """
+    from triage.core import TriageDeps, triage  # noqa: PLC0415 — local to this test block
+    from triage.gate import AutoGate, RiskPolicy  # noqa: PLC0415
+    from triage.tools import FixtureDataSource, ToolRegistry  # noqa: PLC0415
+
+    monkeypatch.setenv("TI_ENABLED", "true")
+    journal = runner._CapturingJournal()  # noqa: SLF001
+    # Explicit False → TI suppressed regardless of env.
+    alert_json = _ti_alert_json("benign.json")
+    deps = TriageDeps(
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict_json()]),
+        journal=journal,
+        registry=ToolRegistry(),
+        source=FixtureDataSource(),
+        gate=AutoGate(journal, approve=False),
+        policy=RiskPolicy(),
+        ti_enabled=False,
+    )
+    result = triage(Alert.model_validate_json(alert_json), deps)
+
+    assert result.terminated_reason == "completed"
+    ti_calls = [e for e in journal.events if _is_ti_enrich_call(e)]
+    assert ti_calls == [], "ti_enabled=False must suppress TI even when env is 'true'"
+
+
+def test_ti_enabled_deps_override_true_enables_ti(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TriageDeps.ti_enabled=True enables TI even when TI_ENABLED env is unset.
+
+    The explicit True in deps bypasses the env read entirely — parallel-safe.
+    """
+    from triage.core import TriageDeps, triage  # noqa: PLC0415
+    from triage.gate import AutoGate, RiskPolicy  # noqa: PLC0415
+    from triage.tools import FixtureDataSource, ToolRegistry  # noqa: PLC0415
+
+    monkeypatch.delenv("TI_ENABLED", raising=False)
+    journal = runner._CapturingJournal()  # noqa: SLF001
+    alert_json = _ti_alert_json("high-exfil-tor-ti.json")
+    # Script: TI synthesis, plan, reason(conclude), verdict.
+    deps = TriageDeps(
+        llm=FakeLLM([_ti_report_for(), _plan("lookup_user"), _conclude(), _verdict_json()]),
+        journal=journal,
+        registry=ToolRegistry(),
+        source=FixtureDataSource(),
+        gate=AutoGate(journal, approve=False),
+        policy=RiskPolicy(),
+        ti_enabled=True,
+    )
+    result = triage(Alert.model_validate_json(alert_json), deps)
+
+    assert result.terminated_reason == "completed"
+    ti_calls = [e for e in journal.events if _is_ti_enrich_call(e)]
+    assert len(ti_calls) == 1, "ti_enabled=True must enable TI even when env is unset"
+    # Verify the ioc arg via string repr to sidestep ty's dict[Unknown] inference
+    # on journal event payloads (the journal carries dict[str, object]).
+    args_repr = str(ti_calls[0].get("args"))
+    assert "185.220.101.5" in args_repr
+
+
+def test_ti_enabled_none_falls_back_to_env_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """TriageDeps.ti_enabled=None (default) falls back to env — disabled when unset."""
+    from triage.core import TriageDeps, triage  # noqa: PLC0415
+    from triage.gate import AutoGate, RiskPolicy  # noqa: PLC0415
+    from triage.tools import FixtureDataSource, ToolRegistry  # noqa: PLC0415
+
+    monkeypatch.delenv("TI_ENABLED", raising=False)
+    journal = runner._CapturingJournal()  # noqa: SLF001
+    alert_json = _ti_alert_json("high-exfil-tor-ti.json")
+    deps = TriageDeps(
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict_json()]),
+        journal=journal,
+        registry=ToolRegistry(),
+        source=FixtureDataSource(),
+        gate=AutoGate(journal, approve=False),
+        policy=RiskPolicy(),
+        ti_enabled=None,  # explicit None → env fallback
+    )
+    triage(Alert.model_validate_json(alert_json), deps)
+
+    ti_calls = [e for e in journal.events if _is_ti_enrich_call(e)]
+    assert ti_calls == [], "ti_enabled=None + no env → TI disabled (env fallback)"
+
+
+def test_golden_case_ti_enabled_default_false() -> None:
+    """GoldenCase.ti_enabled defaults to False — all existing 34 cases unaffected."""
+    case = load_case(_CASES_DIR / "exfil-prod.yaml")
+    assert case.ti_enabled is False
+
+
+def test_golden_case_ti_enabled_true_loads_correctly() -> None:
+    """The new high-exfil-tor-ti case loads with ti_enabled=True."""
+    case = load_case(_CASES_DIR / "high-exfil-tor-ti.yaml")
+    assert case.ti_enabled is True
+    assert case.name == "high-exfil-tor-ti"
+    assert case.expect_trajectory.must_call_tools == ["threat_intel.enrich"]
+
+
+def test_build_deps_threads_ti_enabled_to_deps() -> None:
+    """build_deps passes ti_enabled to TriageDeps — both True and False values."""
+    from triage.evals.runner import build_deps  # noqa: PLC0415
+
+    journal = runner._CapturingJournal()  # noqa: SLF001
+    deps_on = build_deps(FakeLLM([]), journal, ti_enabled=True)
+    deps_off = build_deps(FakeLLM([]), journal, ti_enabled=False)
+
+    assert deps_on.ti_enabled is True
+    assert deps_off.ti_enabled is False
+
+
+def test_run_case_threads_ti_enabled_from_golden_case() -> None:
+    """run_case wires case.ti_enabled into build_deps — the end-to-end seam.
+
+    A case with ti_enabled=True must produce at least one threat_intel.enrich
+    tool_called event; a case with ti_enabled=False must produce none.
+    """
+    case_on = load_case(_CASES_DIR / "high-exfil-tor-ti.yaml")
+    # Script for TI case: TI synthesis first, then plan+reason+verdict.
+    script_on = [
+        _ti_report_for(),
+        _plan("lookup_user"),
+        _conclude(),
+        _verdict_for("high", "185.220.101.5", "svc-ml-pipeline"),
+    ]
+    record_on = run_case(case_on, FakeLLM(script_on))
+    ti_calls_on = [e for e in record_on.journal if _is_ti_enrich_call(e)]
+    assert len(ti_calls_on) == 1, "ti_enabled=True case must fire threat_intel.enrich"
+
+    case_off = load_case(_CASES_DIR / "exfil-prod.yaml")
+    script_off = [
+        _plan("lookup_user", "query_logs"),
+        _cont(),
+        _conclude(),
+        _verdict_for("high", "svc-deploy-prod", "10.200.3.47"),
+    ]
+    record_off = run_case(case_off, FakeLLM(script_off))
+    ti_calls_off = [e for e in record_off.journal if _is_ti_enrich_call(e)]
+    assert ti_calls_off == [], "ti_enabled=False case must not fire threat_intel.enrich"
+
+
+def test_default_case_byte_identical_under_new_wiring(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Existing cases (ti_enabled=False) produce no TI events under the new wiring.
+
+    The ti_enabled=False path sets TriageDeps.ti_enabled=False (explicit, not None),
+    bypassing the env read. Journal must contain no threat_intel.enrich tool_called.
+    """
+    monkeypatch.delenv("TI_ENABLED", raising=False)
+    case = load_case(_CASES_DIR / "benign.yaml")
+
+    record = run_case(case, FakeLLM(list(_script_for("benign"))))
+    event_names = [e.get("event") for e in record.journal]
+    tool_names = [e.get("tool") for e in record.journal]
+
+    # No TI events — byte-identical to pre-wiring behaviour.
+    assert "threat_intel.enrich" not in tool_names
+    assert "run_started" in event_names
+    assert "verdict" in event_names

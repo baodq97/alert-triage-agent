@@ -1,0 +1,38 @@
+{
+  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855": {
+    "ioc": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "ioc_type": "hash",
+    "hash_type": "sha256",
+    "malware_family": "dropper-gen",
+    "tags": ["trojan", "dropper", "persistence"],
+    "first_seen": "2025-08-15",
+    "last_seen": "2026-04-01",
+    "verdict": "malicious",
+    "citation": "fixture:threat_feed/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "d41d8cd98f00b204e9800998ecf8427e": {
+    "ioc": "d41d8cd98f00b204e9800998ecf8427e",
+    "ioc_type": "hash",
+    "hash_type": "md5",
+    "malware_family": null,
+    "tags": [],
+    "verdict": "benign",
+    "citation": "fixture:threat_feed/d41d8cd98f00b204e9800998ecf8427e"
+  },
+  "185.220.101.5": {
+    "ioc": "185.220.101.5",
+    "ioc_type": "public_ip",
+    "malware_family": null,
+    "tags": ["tor-exit-node", "threat-actor-infrastructure"],
+    "verdict": "malicious",
+    "citation": "fixture:threat_feed/185.220.101.5"
+  },
+  "evil.example.com": {
+    "ioc": "evil.example.com",
+    "ioc_type": "domain",
+    "malware_family": "phishing-kit",
+    "tags": ["phishing", "c2"],
+    "verdict": "malicious",
+    "citation": "fixture:threat_feed/evil.example.com"
+  }
+}

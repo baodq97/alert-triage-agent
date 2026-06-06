@@ -172,11 +172,23 @@ class _LoopState:
     """The mutable bookkeeping the ReAct walk carries across Steps.
 
     Bundled into one object so ``run`` and ``resume`` seed the shared ``_loop``
-    without a long keyword-argument list: ``pending`` is the plan still to walk,
-    ``observations`` the gathered trajectory, ``attempted`` the repeat-call-guard
-    set, ``guard_notes`` the off-trajectory nudges, ``step`` the
-    ``MAX_STEPS``-counted iteration count (seeded to the rebuilt count on resume),
-    and ``consecutive_miss_count`` the A2 fail-streak counter (reset on ok=True).
+    without a long keyword-argument list:
+
+    * ``pending`` — the plan steps still to walk.
+    * ``observations`` — the gathered trajectory (pre-observations are already here
+      on entry from ``run``).
+    * ``attempted`` — the repeat-call-guard set (pre-observation tools already in
+      here so the executor never re-executes them).
+    * ``guard_notes`` — off-trajectory Reasoner nudges (not evidence).
+    * ``step`` — the *step number* used for the next executor ``ObservationEntry``;
+      starts at ``initial_step`` (the number of pre-observations so executor steps
+      are numbered past the TI range) and increments before each tool call.  This
+      counter is for **numbering only** and does NOT govern the ``MAX_STEPS`` guard.
+    * ``budget_used`` — the executor loop's own step budget; always starts at 0 for
+      a fresh ``run`` call (TI pre-observations do not consume ``MAX_STEPS`` —
+      RFC-0002 §pre-step-0).  Seeded from ``len(pre_observations)`` on ``resume``
+      (resumed steps do consume prior budget — the standard resume semantics).
+    * ``consecutive_miss_count`` — the A2 fail-streak counter (reset on ok=True).
     """
 
     pending: list[PlanStep]
@@ -184,6 +196,7 @@ class _LoopState:
     attempted: set[tuple[str, str]]
     guard_notes: list[str]
     step: int
+    budget_used: int = 0
     consecutive_miss_count: int = 0
 
 
@@ -220,25 +233,43 @@ class Executor:
         self._max_steps = max_steps if max_steps is not None else _max_steps_from_env()
         self._template = _PROMPT_PATH.read_text(encoding="utf-8")
 
-    def run(self, alert: Alert, plan: InvestigationPlan) -> ExecutionResult:
+    def run(
+        self,
+        alert: Alert,
+        plan: InvestigationPlan,
+        *,
+        initial_step: int = 0,
+        pre_observations: list[ObservationEntry] | None = None,
+    ) -> ExecutionResult:
         """Execute ``plan`` for ``alert`` and return the gathered Observations.
 
         Args:
             alert: The validated Alert under investigation (rendered untrusted).
             plan: The ``InvestigationPlan`` whose Plan Steps seed the loop.
+            initial_step: The step counter offset when the loop starts.  Defaults
+                to 0 (the fresh-run case where the loop increments to 1 before the
+                first tool call).  The TI integration uses this to seed the counter
+                past the TI pre-observations so executor steps do not collide with
+                TI step numbers (RFC-0002 §pre-step-0 convention).
+            pre_observations: Observations gathered before the plan loop (TI
+                pre-observations).  These are prepended to the result trajectory and
+                their tools are recorded in the repeat-call guard set so the executor
+                never re-executes them.  Defaults to an empty list.
 
         Returns:
             An ``ExecutionResult`` with the Observation trajectory and the
             ``terminated_reason`` — never raising on a tool or LLM failure.
         """
+        pre = pre_observations or []
         return self._loop(
             alert,
             _LoopState(
                 pending=list(plan.steps),
-                observations=[],
-                attempted=set(),
+                observations=list(pre),
+                attempted={(o.tool, _args_key(o.args)) for o in pre},
                 guard_notes=[],
-                step=0,
+                step=initial_step,  # step NUMBER starts past the TI range
+                budget_used=0,  # TI pre-observations do not consume MAX_STEPS
             ),
         )
 
@@ -249,6 +280,7 @@ class Executor:
         *,
         pre_observations: Sequence[ObservationEntry],
         next_step_index: int,
+        executor_pre_count: int | None = None,
     ) -> ExecutionResult:
         """Continue an interrupted investigation from its rebuilt Observations.
 
@@ -275,23 +307,35 @@ class Executor:
                 **one entry per executor Step** (the caller collapses a retried
                 Step's multiple recorded results to its last attempt) — seeded as
                 already-gathered evidence (reused, not re-run). ``step`` seeds the
-                ``MAX_STEPS`` counter from this length.
+                step-numbering counter from this length.
             next_step_index: The index into ``plan.steps`` of the first *unexecuted*
                 Plan Step (the count of completed executor Steps — not recorded
                 result rows, which a retry would inflate). ``continue`` walks from
                 here; ``revise`` discards it for the new step.
+            executor_pre_count: The number of ``pre_observations`` entries that
+                consumed the ``MAX_STEPS`` budget (i.e. executor-issued steps only,
+                excluding TI pre-observations).  Defaults to ``len(pre_observations)``
+                for a pure-executor resume; callers that mix TI + executor
+                observations pass only the executor count so the resumed budget
+                matches the fresh-run contract (TI never consumes ``MAX_STEPS``,
+                RFC-0002 §pre-step-0).
 
         Returns:
             An ``ExecutionResult`` whose trajectory includes the reused Observations
             plus any new ones — never raising on a tool or LLM failure.
         """
         observations = list(pre_observations)
+        n = len(observations)
+        # Budget is executor steps only.  TI pre-observations are budget-free in
+        # fresh runs (RFC-0002 §pre-step-0); the resumed contract must be symmetric.
+        budget = executor_pre_count if executor_pre_count is not None else n
         state = _LoopState(
             pending=list(plan.steps[next_step_index:]),
             observations=observations,
             attempted={(o.tool, _args_key(o.args)) for o in observations},
             guard_notes=[],
-            step=len(observations),
+            step=n,  # step NUMBER: next executor step is n+1
+            budget_used=budget,  # resume: only executor steps consumed budget
         )
 
         # Reason first over the rebuilt Observations — the deferred decision the
@@ -320,11 +364,12 @@ class Executor:
         next Plan Step, then reasons and dispatches the decision.
         """
         while state.pending:
-            if state.step >= self._max_steps:
+            if state.budget_used >= self._max_steps:
                 return ExecutionResult(
                     observations=state.observations,
                     terminated_reason="max_steps",
                 )
+            state.budget_used += 1
             state.step += 1
             plan_step = state.pending.pop(0)
             self._execute_step(

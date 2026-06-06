@@ -109,6 +109,7 @@ cp .env.example .env
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | Provider base URL — swap for DeepSeek, Ollama, vLLM, OpenRouter, etc. |
 | `LLM_MODEL` | `gpt-4o-mini` | Model name sent to the provider |
 | `MAX_STEPS` | `15` | Maximum executor steps per run; graceful termination on breach |
+| `TI_ENABLED` | `false` | Enable Threat Intel delegated IOC enrichment (RFC-0002); accepts `true`, `1`, `yes` |
 | `MEMORY_DIR` | `.memory` | Base directory for L1/L2/L3 memory artifacts (gitignored) |
 | `MEMORY_SYNTHESIZE_EVERY_N_RUNS` | `0` | Regenerate the L3 posture brief every N runs; `0` = disabled (use `--synthesize-posture` for on-demand) |
 | `RISK_POLICY_PATH` | `config/risk_policy.yaml` | Path to the risk policy YAML that classifies actions as high/low risk |

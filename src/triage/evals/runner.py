@@ -120,6 +120,7 @@ def build_deps(
     memory: MemoryStore | None = None,
     *,
     approve: bool = False,
+    ti_enabled: bool = False,
 ) -> TriageDeps:
     """Wire the agent dependencies for an eval Run (Fixture World, configurable gate).
 
@@ -134,6 +135,14 @@ def build_deps(
     ``memory`` is the optional entity-scoped Memory Store a case seeds via its
     ``prior_runs`` declaration; ``None`` (every case without a seed) keeps the loop
     memory-free — no recall block, no store writes — identical to before the seam.
+
+    ``ti_enabled`` threads the per-case TI posture through to ``TriageDeps`` as an
+    explicit override (never ``None`` from here — the runner resolves the case's
+    declared posture before calling this).  The default ``False`` is byte-identical
+    to every existing case (the implicit env-var fallback path in ``core`` would
+    also read ``False`` in CI where ``TI_ENABLED`` is unset, but an explicit
+    ``False`` in ``TriageDeps.ti_enabled`` bypasses the env read entirely, making
+    parallel replay threads race-free regardless of the environment).
     """
     return TriageDeps(
         llm=llm,
@@ -143,6 +152,7 @@ def build_deps(
         gate=AutoGate(journal, approve=approve),
         policy=RiskPolicy(),
         memory=memory,
+        ti_enabled=ti_enabled,
     )
 
 
@@ -192,10 +202,18 @@ def run_case(case: GoldenCase, llm: LLM) -> RunRecord:
     journal = _CapturingJournal()
     approve = case.gate != "deny"
     if not case.prior_runs:
-        return _run(alert, build_deps(llm, journal, approve=approve), journal)
+        return _run(
+            alert,
+            build_deps(llm, journal, approve=approve, ti_enabled=case.ti_enabled),
+            journal,
+        )
     with tempfile.TemporaryDirectory(prefix="triage-eval-memory-") as tmp:
         memory = _seed_memory(case.prior_runs, Path(tmp))
-        return _run(alert, build_deps(llm, journal, memory, approve=approve), journal)
+        return _run(
+            alert,
+            build_deps(llm, journal, memory, approve=approve, ti_enabled=case.ti_enabled),
+            journal,
+        )
 
 
 def _run(alert: Alert, deps: TriageDeps, journal: _CapturingJournal) -> RunRecord:

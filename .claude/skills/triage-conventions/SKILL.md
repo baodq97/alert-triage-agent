@@ -141,7 +141,7 @@ All prompts live in `prompts/*.md` — never inline strings. Every template that
 
 ## Config / env vars (names are a contract — keep `.env.example`, code, Makefile, README in sync)
 
-`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `MAX_STEPS` (15), `RISK_POLICY_PATH` (default `config/risk_policy.yaml`), `MEMORY_DIR` (default `.memory/`, gitignored), `MEMORY_SYNTHESIZE_EVERY_N_RUNS` (0 = disabled).
+`LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`, `MAX_STEPS` (15), `RISK_POLICY_PATH` (default `config/risk_policy.yaml`), `TI_ENABLED` (default `false`; accepts `true`/`1`/`yes` — enable Threat Intel delegated IOC enrichment, RFC-0002), `MEMORY_DIR` (default `.memory/`, gitignored), `MEMORY_SYNTHESIZE_EVERY_N_RUNS` (0 = disabled).
 
 ## Memory
 
