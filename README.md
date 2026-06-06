@@ -313,8 +313,8 @@ instrument. Full per-round trail:
 
 **Model portability** ([results.md](docs/evals/results.md)): the same agent runs
 on `gpt-5.4-mini`, `Llama-3.3-70B`, and `deepseek-v4-flash` — three families,
-three endpoints, only `.env` changed (ADR-0002). Tier-1 35/35 holds on the
-calibrated model and degrades gracefully (31, 29) on the others, never crashing.
+three endpoints, only `.env` changed (ADR-0002). Tier-1 36/36 holds on the
+calibrated model and degrades gracefully (33, 27) on the others, never crashing.
 
 ### Three worked examples (from the final live run)
 
