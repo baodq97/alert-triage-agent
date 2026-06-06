@@ -142,10 +142,14 @@ make run ALERT=alerts/ALT-2026-04-7835-privilege-escalation.json
 
 # Any custom alert JSON
 make run ALERT=path/to/your-alert.json
+
+# Watch the agent think — narrate plan / tool calls / reasoning / verdict /
+# gate live to stderr (stdout keeps just the summary; the journal is unchanged)
+uv run python run.py --alert alerts/ALT-2026-04-7821-data-exfiltration.json --verbose
 ```
 
 This prints a human-readable verdict summary and writes the versioned run record to
-`runs/<run_id>/result.json`.
+`runs/<run_id>/result.json`. `--verbose` also works with `--resume`.
 
 ### Resume flow (asynchronous approval)
 
