@@ -78,6 +78,14 @@ flowchart TD
 Dependency direction: `models` ← everything; `journal` / `llm` / `tools` / `gate` / `rendering`
 are leaves consumed by `planner` / `executor` / `verdict`. Nothing imports `run.py`.
 
+**Verdict verify hook (RFC-0003).** Every verdict passes through four deterministic
+grounding checks (citation validity, confidence-evidence consistency, action
+traceability, entity coverage) before shipping; the outcome is journaled as
+`verdict_verification`. With `VERIFY_REENTRY=true` (Phase 2 — both calibration gates
+measured and met: 0 false flags on the recorded suite, 8.6% ≤ 10% live), a failed
+hook triggers one bounded re-plan with the verification gap note before the verdict
+is re-synthesized; without it, failures degrade-and-ship exactly as before.
+
 ---
 
 ## Setup

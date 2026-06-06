@@ -212,6 +212,15 @@ negative-evidence phrase set and branch (c) includes entities/context keys ≥6 
 **Result: 0 false flags; coverage-gap telemetry dropped from 10 to 3 cases** (the loop
 genuinely closed most coverage gaps rather than suppressing the signal).
 
+### Phase-2 live gate (2026-06-06)
+
+A dedicated live sweep (35 fresh live runs, one per golden case) measured the live
+false-flag rate at **3/35 = 8.6%** (all three: citation-validity phrasing variance on
+stochastic verdicts) — within the §Phasing bound of ≤10%. With both gates met
+(recorded 0, live ≤10%), Phase-2 re-entry is enabled by default in the documented
+configuration (`VERIFY_REENTRY=true` in `.env.example`); the flag remains the
+kill-switch.
+
 ## Alternatives considered
 
 - **The original six-check set** — rejected by calibration: two checks are not

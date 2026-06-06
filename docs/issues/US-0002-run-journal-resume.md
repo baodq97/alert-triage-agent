@@ -1,7 +1,7 @@
 ---
 id: US-0002
 title: "Wave 2: run journal — audit trail, retry visibility, resume"
-status: open
+status: done
 owner: baodq97
 date: 2026-06-05
 priority: P0

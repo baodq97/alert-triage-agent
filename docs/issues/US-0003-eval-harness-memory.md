@@ -1,7 +1,7 @@
 ---
 id: US-0003
 title: "Wave 3: eval harness (mandatory) + memory L1-L2 recall"
-status: open
+status: done
 owner: baodq97
 date: 2026-06-05
 priority: P0
