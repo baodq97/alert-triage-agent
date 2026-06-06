@@ -123,9 +123,19 @@ def _narrate_tool_called(tag: str, payload: Mapping[str, Any]) -> str:
     return f"{tag}TOOL     {payload.get('tool')}({json.dumps(payload.get('args', {}))})"
 
 
+_DATA_PREVIEW_CHARS = 200
+
+
 def _narrate_tool_result(tag: str, payload: Mapping[str, Any]) -> str:
     err = payload.get("error")
-    return f"{tag}         -> ok={payload.get('ok')}" + (f" error={err}" if err else "")
+    line = f"{tag}         -> ok={payload.get('ok')}" + (f" error={err}" if err else "")
+    data = payload.get("data")
+    if data:
+        preview = json.dumps(data)
+        if len(preview) > _DATA_PREVIEW_CHARS:
+            preview = preview[:_DATA_PREVIEW_CHARS] + "…"
+        line += f" {preview}"
+    return line
 
 
 def _narrate_llm(tag: str, payload: Mapping[str, Any]) -> str:
