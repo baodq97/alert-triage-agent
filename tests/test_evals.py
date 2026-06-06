@@ -783,6 +783,8 @@ def _script_for(name: str) -> list[str]:
         "edge-prompt-injection": _verdict_for("high"),
         "edge-max-steps-confidence": _verdict_for("medium", confidence=0.5),
         "medium-recall-elevates": _verdict_for("medium", "user-finops-charlie"),
+        # --- US-0009 memory case ---
+        "medium-shared-entity-recall": _verdict_for("medium", "user-payroll-erin"),
     }
     # TI cases require a TI synthesis entry before the plan (the TI mini-loop fires
     # pre-step-0, so its LLM call is consumed before the plan call).  For all other
@@ -961,7 +963,7 @@ def test_run_suite_and_format_report() -> None:
     reports = run_suite(FakeLLM(script))
     text = format_report(reports)
 
-    assert len(reports) == 35
+    assert len(reports) == 36
     assert "Eval report" in text
     assert "RESULT:" in text
 
@@ -1647,7 +1649,7 @@ def test_all_golden_cases_parse() -> None:
     # All 35 shipped cases (6 original + 24 extended + 4 round-4 + 1 TI) must
     # parse and declare at least one assertion each.
     cases = load_cases(_CASES_DIR)
-    assert len(cases) == 35
+    assert len(cases) == 36
     # Original core 6 must still be present.
     core_names = {
         "exfil-prod",

@@ -136,7 +136,7 @@ the stable prefix (system + alert) across the run's many reasoner calls.
   alert's entities ∪ context scalars) → deterministic text-scan fallback → if
   neither names an entity, persist nothing and journal `finding_unattributed`.
   The principle: *a persisted claim exists for an entity iff the claim names that
-  entity.* This removed the old cartesian fan-out (277 → 108 atoms, −61% noise on
+  entity.* This removed the old cartesian fan-out (354 → 114 atoms, −67.8% noise on
   the recorded suite).
 - **L2 — entity dossiers.** Deterministic group-by over atoms (confidence/recency
   ranked, capped) — no LLM.
@@ -164,14 +164,25 @@ Phase 2 (`VERIFY_REENTRY=true`, both gates met: 0 false flags recorded, 8.6% liv
 turns a failed hook into one bounded re-plan with the gap note before the verdict
 is re-synthesized. The flag is the kill-switch.
 
+**Calibration limits (stated honestly).** The checks were calibrated against the
+35 self-authored golden cases — not a real SOC alert distribution. "0 false
+flags recorded" means zero on *that* set; the 8.6% live rate is the first
+out-of-calibration evidence and the reason Phase-2 ships behind a flag. The
+standing re-calibration mechanism is the telemetry itself: every verdict emits a
+`verdict_verification` event, so a drifting distribution shows up as a rising
+flag rate before it does damage, and the band constants can be re-tuned from
+recorded data. The hook is a deterministic grounding check, not a correctness
+oracle — it cannot catch a wrong-but-grounded verdict (that is the eval suite's
+and the judge's job).
+
 ## 7. Evals: the functional acceptance gate
 
-Two tiers (US-0003/0007): Tier-1 blocking behavioral assertions over 35 golden
+Two tiers (US-0003/0007): Tier-1 blocking behavioral assertions over 36 golden
 cases (trajectory + verdict ranges), Tier-2 advisory LLM judge (median-of-3,
 anchored rubric) with per-case `judge_min` soft gates (exit 2, never blocks
 Tier-1). Replay mode serves recorded responses keyed by prompt hash — key-free,
 CI-safe, and loud on prompt drift (`ReplayMiss`). Current results live in the
-README §Evaluation results and `docs/reports/`.
+README §Evaluation results and `docs/evals/`.
 
 ## 8. Why no agent framework (ADR-0001, expanded)
 
@@ -207,6 +218,28 @@ client. The reasons, in the order they actually mattered:
 Revisit (per the ADR): durable multi-node execution, or a team standardizing on a
 framework, would reopen the decision.
 
+### The LangGraph equivalence (fluency, not avoidance)
+
+The decision was made knowing exactly what the framework would give. This design
+maps onto a LangGraph `StateGraph` mechanically:
+
+| This system | LangGraph equivalent |
+|---|---|
+| `planner` / `executor` / `reasoner` / `verdict` | graph **nodes** over a shared `State` |
+| reasoner verbs `continue` / `revise_plan` / `conclude` | **conditional edges** out of the reasoner node |
+| `MAX_STEPS` + `no_progress` / `revise_exhausted` guards | `recursion_limit` + custom guard nodes |
+| `CLIGate` / `DeferredGate` (approve / deny / hold-across-restart) | `interrupt()` + `Command(resume=...)` |
+| `journal.jsonl` (event-sourced, resumable) | `checkpointer` (e.g. `SqliteSaver`) |
+| verify hook → Phase-2 re-plan re-entry | a verify node with a conditional edge back to the planner |
+
+The mapping is one-to-one; the graph would compile. What does **not** map is the
+journal *contract*: a checkpointer restores graph state, but it is not a
+human-readable, greppable, eval-assertable audit record of *what the agent did
+and why*. In a security tool where the audit trail is a product requirement (not
+a debugging aid), the journal is the reason to hand-roll — a StateGraph would sit
+on top of a journal we would have to build anyway, so it earns its keep only once
+durable multi-node execution or team standardization is in play.
+
 ## 9. Where to look
 
 | Question | Read |
@@ -217,4 +250,4 @@ framework, would reopen the decision.
 | Loop v2, verify hook, termination | `docs/rfc/RFC-0003-*`, `docs/issues/US-0008-*` |
 | Entity attribution principle | `docs/adr/ADR-0006-*`, `docs/issues/US-0006-*` |
 | Eval contract & judge soft gate | `docs/issues/US-0003-*`, `US-0007-*` |
-| Latest measured quality | `docs/reports/2026-06-06-quality-loop-summary.md` |
+| Latest measured quality | `docs/evals/2026-06-06-quality-loop-summary.md` |

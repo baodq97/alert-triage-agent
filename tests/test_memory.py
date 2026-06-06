@@ -131,6 +131,52 @@ def test_recall_is_entity_scoped_not_whole_store(tmp_path: Path) -> None:
     assert "bob fact" not in joined
 
 
+def test_recall_shared_entity_precision_no_cross_pollution(tmp_path: Path) -> None:
+    """US-0006 success metric: two multi-entity incidents sharing exactly one entity.
+
+    Incident A is about (charlie, 10.0.0.1); incident B about (dave, 10.0.0.2).
+    A new alert names only charlie — recall must surface charlie's history and
+    NOTHING from incident B (not dave, not B's IP), even though the store holds
+    both.  Recall precision is entity-scoped, so it stays high as the store grows
+    instead of degrading into cap-N cross-entity noise (ADR-0006).
+    """
+    store = MemoryStore(base_dir=tmp_path)
+    store.persist(
+        "incident-A",
+        _alert(alert_id="A", entities={"user": "charlie", "ip": "10.0.0.1"}),
+        _verdict(
+            findings=[
+                Finding(
+                    statement="charlie exfiltrated records",
+                    evidence="query_logs flow A",
+                    related_entities=["charlie"],
+                ),
+            ],
+        ),
+    )
+    store.persist(
+        "incident-B",
+        _alert(alert_id="B", entities={"user": "dave", "ip": "10.0.0.2"}),
+        _verdict(
+            findings=[
+                Finding(
+                    statement="dave escalated privileges",
+                    evidence="query_logs flow B",
+                    related_entities=["dave"],
+                ),
+            ],
+        ),
+    )
+
+    recalled = store.recall(_alert(alert_id="NEW", entities={"user": "charlie"}))
+
+    joined = " ".join(str(item["content"]) for item in recalled)
+    assert "charlie" in joined
+    # Zero cross-entity pollution from incident B (the precision metric).
+    assert "dave" not in joined
+    assert "10.0.0.2" not in joined
+
+
 def test_recall_ordering_is_deterministic(tmp_path: Path) -> None:
     store = MemoryStore(base_dir=tmp_path)
     store.persist(

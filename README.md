@@ -5,8 +5,8 @@ produces a structured verdict, and keeps a human in the loop before any high-ris
 containment action executes.
 
 Built as a raw-Python system with an explicit Plan → ReAct + replan loop, an
-event-sourced run journal, a four-level memory hierarchy, and a two-tier eval harness
-— no agent framework.
+event-sourced run journal, an entity-attributed three-level memory hierarchy, and a
+two-tier eval harness — no agent framework.
 
 ---
 
@@ -23,9 +23,32 @@ response. This agent performs that loop autonomously:
   asynchronously (`--resume --approve|--deny`).
 - **Adapts to any alert type** — the planner reads whatever fields exist in the alert
   envelope; new event types need no code changes.
-- **Gets smarter across runs** — a four-level memory hierarchy (journal atoms →
-  entity dossiers → org-level posture) feeds prior findings back into the planner
-  context.
+- **Gets smarter across runs** — an entity-attributed memory hierarchy (see
+  [Memory](#memory)) feeds prior findings back into the planner context.
+
+---
+
+## How this was built
+
+This repository was built with an **agentic workflow** — Claude Code driving the
+implementation inside a harness I designed: govkit governance gates
+(PRD → RFC → ADR → US, enforced by `npx govkit verify`), a two-tier eval gate,
+and dedicated QA agents between waves.
+
+The split is deliberate and worth stating plainly, because for an *Agentic AI
+Engineer* role the workflow itself is part of the demonstration:
+
+- **The agents wrote** most of the code and tests, under the gates above.
+- **I own** every architecture decision (ADR-0001…0006 — raw-Python loop,
+  OpenAI-compatible boundary, event-sourced journal, quality bar, adversarial
+  posture, entity attribution), the calibration constants (the no-progress
+  backstop `K=6`, the `[0.30, 0.40]` zero-evidence confidence band, the
+  zero-covered coverage rule), the accept/reject call on every code-review and
+  assessment finding, and the eval-contract design.
+
+The governance trail (`docs/`), the eval results ([docs/evals/](docs/evals/)),
+and the per-round quality-loop measurements are the evidence that the decisions —
+not just the code — were owned.
 
 ---
 
@@ -75,7 +98,7 @@ flowchart TD
 | `src/triage/rendering.py` | LLM-facing rendering primitives: truncation, compact JSON, observation tags, prompt split |
 | `src/triage/memory/` | L1 atoms, L2 dossiers, L3 posture; entity-scoped recall |
 | `src/triage/tools/` | `ToolRegistry` (4 read-only tools), `DataSource` Protocol, `FixtureDataSource`, `block_user` response action |
-| `src/triage/evals/` | Runner, 35 golden cases, assertion engine, replay mode, LLM judge |
+| `src/triage/evals/` | Runner, 36 golden cases, assertion engine, replay mode, LLM judge |
 | `prompts/*.md` | Every LLM prompt (planner, reasoner, verdict, judge, posture) |
 
 Dependency direction: `models` ← everything; `journal` / `llm` / `tools` / `gate` / `rendering`
@@ -183,6 +206,30 @@ deterministic fallback (top-N atom aggregation) without an LLM call.
 
 ---
 
+## Memory
+
+The context layer the JD calls "awareness of past incidents." Three levels, all
+**entity-attributed** (ADR-0006) so recall precision rises with the store instead
+of degrading:
+
+- **L1 — finding atoms.** Every persisted finding is attributed to the alert
+  entities it actually names (declared `related_entities` validated against the
+  alert, then a deterministic text-scan fallback). An atom exists for an entity
+  **iff** the claim names that entity; a finding that names none persists nothing
+  and emits a `finding_unattributed` audit event — never a silent drop.
+- **L2 — entity dossiers.** Deterministic group-by over atoms (confidence/recency
+  ranked, capped). No LLM.
+- **L3 — posture brief.** LLM synthesis on a cadence, with a key-free
+  deterministic top-N fallback.
+
+**Recall is entity-scoped:** the planner sees prior findings only for the current
+alert's entities. This is what removed the old cartesian fan-out — measured
+**354 → 114 atoms (−67.8%)** on the eval suite, with zero cross-entity pollution
+pinned by a deterministic test. Full measurement and the two seeded recall cases:
+[docs/evals/memory.md](docs/evals/memory.md).
+
+---
+
 ## Evals
 
 The eval harness is the functional acceptance gate — a prompt change that breaks a
@@ -191,7 +238,7 @@ golden case does not ship.
 ### Two tiers
 
 **Tier 1 — blocking behavioral assertions** (`make eval-replay` / `make eval`):
-Each of the 35 golden cases (`src/triage/evals/cases/*.yaml`) asserts on:
+Each of the 36 golden cases (`src/triage/evals/cases/*.yaml`) asserts on:
 - Trajectory: required tools called, gate-before-high-risk ordering, max-steps
   respected, no repeated identical calls.
 - Verdict: severity in the allowed range, entities referenced, confidence floor,
@@ -227,7 +274,7 @@ and dumps per-case metrics (Tier-1 results, judge median-of-3, latency) to `--ou
 
 ### Golden case coverage
 
-35 cases span the core behavioral envelope:
+36 cases span the core behavioral envelope:
 
 | Category | Cases |
 |---|---|
@@ -239,23 +286,35 @@ and dumps per-case metrics (Tier-1 results, judge median-of-3, latency) to `--ou
 
 ### Evaluation results (2026-06-06, live)
 
-Final state after the five-round reasoning-quality loop
-([full report](docs/reports/2026-06-06-quality-loop-summary.md)):
+Full results, the three-model comparison, and reproduction commands:
+**[docs/evals/results.md](docs/evals/results.md)**. Headline state on the
+calibrated baseline model (`gpt-5.4-mini`):
 
-| Metric | Value |
-|---|---|
-| Tier-1 behavioral assertions | **35/35 pass** (live and replay) |
-| Tier-2 judge mean | **84.1 / 100** (median-of-3; baseline 73.8) |
-| Judge spread | stdev 2.6, min 78 (baseline stdev 6.7) |
-| Verify-hook false flags | **0 / 35** recorded; 8.6% live (≤ 10% Phase-2 gate) |
-| Coverage-gap telemetry | 3/35 cases (was 10/35 before the loop) |
-| Memory atoms (entity attribution) | 277 → 108 (−61% cross-entity noise) |
+| Signal | Value | Weight |
+|---|---|---|
+| **Tier-1 behavioral assertions** | **36/36 pass** (live and replay) | the acceptance gate |
+| **Verify-hook false flags** | **0/35** recorded; 8.6% live (≤ 10% Phase-2 gate) | deterministic |
+| **Coverage-gap telemetry** | 3/35 cases (was 10/35 before the loop) | judge-independent |
+| **Memory cartesian-noise reduction** | 354 → 114 atoms (−67.8%) | measured |
+| Tier-2 judge mean | 84.1 / 100 (stdev 2.6, min 78; pre-loop 73.8) | advisory |
 
-The judge mean moved 73.8 → 84.1 through five audited rounds: a reasoner coverage
-gate, an explicit verdict limitation ledger, a tool-family pivot playbook, an
-aspect-completeness rule, and judge scoring anchors. Rounds 1–4 changed real agent
-behavior (the verify hook's own coverage telemetry confirms it); round 5 calibrated
-the measuring instrument.
+The acceptance weight sits on the top four — deterministic, judge-independent
+signals. The **judge mean (84.1) is advisory and self-graded**: a median-of-3
+score against a rubric in this repo, where round 5 of the quality loop calibrated
+the *judge* itself. Read it as a trend, not an absolute — the rows above are what
+actually gate.
+
+The judge mean moved 73.8 → 84.1 through five audited rounds (coverage gate,
+limitation ledger, pivot playbook, aspect completeness, judge anchors). Rounds 1–4
+changed real agent behavior — the verify hook's own coverage telemetry (10 → 3)
+confirms it independently of the judge; round 5 calibrated the measuring
+instrument. Full per-round trail:
+[docs/evals/2026-06-06-quality-loop-summary.md](docs/evals/2026-06-06-quality-loop-summary.md).
+
+**Model portability** ([results.md](docs/evals/results.md)): the same agent runs
+on `gpt-5.4-mini`, `Llama-3.3-70B`, and `deepseek-v4-flash` — three families,
+three endpoints, only `.env` changed (ADR-0002). Tier-1 35/35 holds on the
+calibrated model and degrades gracefully (31, 29) on the others, never crashing.
 
 ### Three worked examples (from the final live run)
 
@@ -318,7 +377,23 @@ it would replace only the cheapest part of the system (the ~100-line loop) while
 hiding the architecture skill the rubric weighs at 30%. The hand-rolled loop is
 transparent: the journal, the ReAct dispatch, and the gate are all plain Python that
 a reviewer can read in one sitting. Revisit when durable multi-node execution or team
-standardization matters.
+standardization matters. The decision was made from framework fluency, not
+avoidance — [docs/architecture.md §8](docs/architecture.md#8-why-no-agent-framework-adr-0001-expanded)
+maps this design node-for-node onto a LangGraph `StateGraph` (nodes, conditional
+edges, `interrupt()` gate, checkpointer) and explains why the journal contract is
+the reason to hand-roll.
+
+### Synchronous single-process — by design, with a scale-out path
+
+The agent runs synchronously in one process. Triaging *one* alert is inherently
+sequential — each step depends on the previous observation (ReAct) — so there is no
+intra-run concurrency to exploit. Scale is *across* alerts, and the seams already
+allow it without touching the loop: `triage(alert, deps)` is a pure function over
+injected dependencies, and the journal is event-sourced per run. The production
+path is a queue with one worker per alert (the journal makes each run independently
+recoverable), `async` LLM calls as the first concurrency win, and the file-backed
+memory store swapped for a database before multi-writer access. None of that
+changes agent logic — it changes the adapter around `triage()`.
 
 ### Workflow/playbook router — deliberately excluded
 
@@ -380,7 +455,7 @@ a thin adapter loop, not a core change.
 | ≥3 tests (tool call / approval gate / tool error) | `tests/test_core.py`, `tests/test_executor.py`, `tests/test_verdict.py` |
 | Run journal (audit trail, resume, retry visibility) | `journal.py` + `ADR-0003`; US-0002 |
 | Memory L0→L3 (entities, dossiers, posture) | `src/triage/memory/`; US-0003, US-0004 |
-| Two-tier eval harness (blocking + advisory judge) | `src/triage/evals/`; 35 golden cases; US-0003 AC |
+| Two-tier eval harness (blocking + advisory judge) | `src/triage/evals/`; 36 golden cases; US-0003 AC |
 | README + `.env.example` + `pyproject.toml` | This file; repo root |
 | No secrets in repo | `.gitignore` covers `runs/`, `.env`, `.memory/`; `.env.example` has only placeholders |
 | Single-command run | `make run` |
