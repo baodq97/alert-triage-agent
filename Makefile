@@ -1,4 +1,4 @@
-.PHONY: run watch test lint typecheck check eval eval-replay
+.PHONY: run watch test lint typecheck check eval eval-replay eval-sweep
 
 ALERT ?= alerts/ALT-2026-04-7821-data-exfiltration.json
 
