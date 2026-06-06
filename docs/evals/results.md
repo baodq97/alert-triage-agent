@@ -23,7 +23,8 @@ Same agent, three model families, three endpoints — only `.env` changed, zero
 three so Tier-2 scores are comparable; the model under test is the *agent*.
 
 Run over the full 36-case suite via the shipped `make eval-sweep` (US-0009),
-judge pinned to gpt-5.4-mini:
+judge pinned to gpt-5.4-mini. Full per-case breakdown for this run:
+[2026-06-06-cross-model-run.md](./2026-06-06-cross-model-run.md).
 
 | Model | Endpoint | Tier-1 | Judge (pinned) | stdev | wall/case | tok/case |
 |---|---|---|---|---|---|---|
