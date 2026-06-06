@@ -1,0 +1,21 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0008",
+  "timestamp": "2026-05-10T04:10:00Z",
+  "source": "dlp",
+  "severity_hint": "high",
+  "event_type": "large_data_export",
+  "description": "Service account 'svc-deploy-prod' exported 3.8 GB of data from PII endpoint '/admin/users/export' to external IP 185.220.101.55 in a single session. The source IP 185.220.101.55 is outside the expected range 10.200.1.0/24. DLP classification: customer PII. No scheduled report matches this volume.",
+  "entities": {
+    "service_account": "svc-deploy-prod",
+    "source_ip": "185.220.101.55",
+    "asset": "/admin/users/export"
+  },
+  "context": {
+    "bytes_exported": 3800000000,
+    "destination_ip": "185.220.101.55",
+    "dlp_classification": "customer_pii",
+    "expected_ip_range": "10.200.1.0/24",
+    "scheduled_report_match": false,
+    "note": "large PII export from unexpected external IP by service account"
+  }
+}

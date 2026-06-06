@@ -1,0 +1,17 @@
+{
+  "alert_id": "ALT-EVAL-RECALLELEV-PRIOR-0001",
+  "timestamp": "2026-05-20T11:00:00Z",
+  "source": "edr",
+  "severity_hint": "critical",
+  "event_type": "data_exfiltration",
+  "description": "User account 'user-finops-charlie' downloaded 12 GB of financial records and transferred them to a personal cloud storage service. The account was suspended immediately. This prior run seeds the memory-recall-elevates case.",
+  "entities": {
+    "user": "user-finops-charlie",
+    "destination": "personal-cloud-storage"
+  },
+  "context": {
+    "bytes_exfiltrated": 12000000000,
+    "destination_type": "personal",
+    "note": "prior HIGH-confidence malicious run seeding the medium-recall-elevates case"
+  }
+}

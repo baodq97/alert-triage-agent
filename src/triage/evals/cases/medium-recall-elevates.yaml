@@ -1,0 +1,43 @@
+# Guards: memory-recall severity elevation — a prior HIGH-confidence malicious
+# finding for 'user-finops-charlie' (data exfiltration, seeded via prior_runs)
+# should cause an ambiguous new alert for the same entity to be rated at least
+# medium, not low. Recall informs AND CAN elevate; it must not be ignored.
+#
+# pending: this is an LLM-behavior case (the elevation depends on the model
+# weighing the recalled prior appropriately). It flaps on smaller models or when
+# the recalled context is not surfaced prominently. Mark pending until proven
+# stable across >= 3 consecutive live runs.
+#
+# Prior HIGH-confidence malicious finding for user-finops-charlie seeds memory;
+# the new ambiguous alert (unusual access pattern) must conclude at least medium
+# because of the recalled context.
+name: medium-recall-elevates
+alert: src/triage/evals/cases/alerts/medium-recall-elevates.json
+pending: "LLM-behavior case: severity elevation via memory recall; flaps on smaller models — remove pending once stable across 3+ consecutive live runs"
+prior_runs:
+  - run_id: ALT-EVAL-RECALLELEV-PRIOR-0001
+    alert: src/triage/evals/cases/alerts/medium-recall-elevates-prior.json
+    verdict:
+      severity: high
+      findings:
+        - statement: user-finops-charlie exfiltrated 12 GB of financial records to personal cloud storage
+          evidence: query_logs confirmed the transfer; check_reputation flagged the destination
+      recommended_actions: []
+      confidence: 0.9
+expect:
+  trajectory:
+    must_call_tools: [lookup_user]                     # user context is unavoidable for an unusual-access alert
+    gate_before_high_risk: true
+    no_action_without_gate: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed]
+  verdict:
+    severity_in: [medium, high]                        # prior HIGH finding should elevate above low
+    confidence_min: 0.3
+reference:
+  expected_tools:
+    - name: lookup_user
+  expected_severity: medium
+  expected_actions: []
+  ordered: false
+  exact: false

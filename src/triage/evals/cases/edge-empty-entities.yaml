@@ -1,0 +1,24 @@
+# Guards: an alert with empty entities field must not crash — the agent must handle
+# the absence of investigation targets gracefully and still produce a verdict.
+name: edge-empty-entities
+alert: src/triage/evals/cases/alerts/edge-empty-entities.json
+expect:
+  trajectory:
+    must_call_tools: []                              # nothing to look up — no tools forced
+    gate_before_high_risk: true
+    no_action_without_gate: true
+    max_steps_respected: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed]
+  verdict:
+    severity_in: [low, medium, high, critical]       # any valid verdict — graceful handling is the point
+    confidence_min: 0.0
+    # verdict_has_findings_with_citations is intentionally omitted: with entities: {},
+    # the agent may make zero tool calls and produce a verdict with no citable observations.
+    # The point of this case is graceful handling, not observation quality.
+reference:
+  expected_tools: []
+  expected_severity: low
+  expected_actions: []
+  ordered: false
+  exact: false

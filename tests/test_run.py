@@ -178,7 +178,12 @@ def _high_risk_verdict() -> str:
     return json.dumps(
         {
             "severity": "high",
-            "findings": [{"statement": "s", "evidence": "lookup_user"}],
+            "findings": [
+                {
+                    "statement": "anomaly detected for svc-deploy-prod",
+                    "evidence": "lookup_user confirmed svc-deploy-prod",
+                }
+            ],
             "recommended_actions": [_block_alice()],
             "confidence": 0.7,
         },

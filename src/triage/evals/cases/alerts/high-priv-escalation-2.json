@@ -1,0 +1,20 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0007",
+  "timestamp": "2026-05-10T03:22:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "high",
+  "event_type": "iam_policy_attached",
+  "description": "IAM user 'dev-intern-jpark' attached the AWS managed policy 'arn:aws:iam::aws:policy/AdministratorAccess' to their own role 'arn:aws:iam::123456789012:role/dev-intern-jpark-role' at 03:22 UTC. No change-management ticket found. The user's assigned role is developer-readonly and this action is out of scope.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "role_arn": "arn:aws:iam::123456789012:role/dev-intern-jpark-role",
+    "policy_arn": "arn:aws:iam::aws:policy/AdministratorAccess"
+  },
+  "context": {
+    "change_ticket": null,
+    "action_time": "03:22 UTC",
+    "user_base_role": "developer-readonly",
+    "self_escalation": true,
+    "note": "unprivileged user self-attached AdministratorAccess outside business hours, no ticket"
+  }
+}

@@ -14,5 +14,14 @@
     "score": 0,
     "known_bad": false,
     "sources_checked": ["internal-asset-db", "threat-feed-mock"]
+  },
+  "185.220.101.5": {
+    "entity": "185.220.101.5",
+    "scope": "public",
+    "classification": "malicious",
+    "score": 95,
+    "known_bad": true,
+    "tags": ["tor-exit-node", "data-exfil-destination", "threat-actor-infrastructure"],
+    "sources_checked": ["internal-asset-db", "threat-feed-mock", "tor-exit-list"]
   }
 }

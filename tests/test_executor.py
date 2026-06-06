@@ -27,7 +27,12 @@ import json
 from typing import TYPE_CHECKING, Any
 
 from triage.errors import ToolError
-from triage.executor import ExecutionResult, Executor, ObservationEntry
+from triage.executor import (
+    _OBSERVATION_DATA_MAX_CHARS,
+    ExecutionResult,
+    Executor,
+    ObservationEntry,
+)
 from triage.llm import FakeLLM
 from triage.models import Alert, InvestigationPlan, PlanStep, ToolResult
 from triage.tools import ToolRegistry
@@ -349,7 +354,8 @@ def test_llm_error_mid_loop_terminates_error_and_emits_no_llm_call() -> None:
     assert result.terminated_reason == "error"
     # The tool ran (its events emitted) but the reasoner failed: no llm_call.
     assert "llm_call" not in journal.names()
-    assert journal.names() == ["tool_called", "tool_result"]
+    # llm_repair fires when the repair is attempted (before the second failure).
+    assert journal.names() == ["tool_called", "tool_result", "llm_repair"]
     # The gathered Observation is still returned for the degraded verdict.
     assert [o.tool for o in result.observations] == ["lookup_user"]
 
@@ -366,10 +372,30 @@ def test_rendered_prompt_delimits_alert_and_observations_as_untrusted() -> None:
     assert "</alert_payload>" in rendered
     assert "<observations>" in rendered
     assert "</observations>" in rendered
+    assert "<remaining_steps>" in rendered
+    assert "</remaining_steps>" in rendered
     # The alert's injection-vector description lands inside the labeled block.
     assert "Large outbound transfer from alice's host." in rendered
     # Event-type-agnostic.
     assert "data_exfiltration" in rendered
+
+
+def test_rendered_prompt_shows_remaining_steps_then_empty_when_exhausted() -> None:
+    # Two-step plan: first reason call sees the second step pending; second call sees none.
+    llm = FakeLLM([_decision("continue"), _decision("conclude")])
+    journal = RecordingJournal()
+    executor = _executor(llm=llm, journal=journal)
+    first_step = _step(entity="alice")
+    second_step = _step(tool="query_logs", entity="alice")
+
+    executor.run(_alert(), _plan(first_step, second_step))
+
+    # First reason call: second step still pending in remaining_steps block.
+    first_rendered = "\n".join(m["content"] for m in llm.messages_by_call[0])
+    assert "query_logs" in first_rendered
+    # Second reason call: no further steps pending.
+    second_rendered = "\n".join(m["content"] for m in llm.messages_by_call[1])
+    assert "no further steps are planned" in second_rendered
 
 
 def test_rendered_prompt_presents_the_available_tools() -> None:
@@ -382,6 +408,18 @@ def test_rendered_prompt_presents_the_available_tools() -> None:
     rendered = "\n".join(m["content"] for m in llm.last_messages)
     for name in ToolRegistry().names():
         assert name in rendered
+
+
+def test_render_falls_back_to_single_message_when_sentinel_absent() -> None:
+    """If the template has no {{END_OF_STABLE}}, a single message is returned."""
+    llm = FakeLLM([_decision("conclude")])
+    executor = _executor(llm=llm, journal=RecordingJournal())
+    t = "No sentinel. {{TOOLS}} {{ALERT_PAYLOAD}} {{OBSERVATIONS}} {{REMAINING_STEPS}}"
+    executor._template = t  # noqa: SLF001
+
+    executor.run(_alert(), _plan(_step()))
+
+    assert len(llm.last_messages) == 1
 
 
 def test_max_steps_falls_back_to_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -509,3 +547,202 @@ def test_resume_llm_error_on_the_first_reason_terminates_error() -> None:
     assert result.terminated_reason == "error"
     assert [o.step for o in result.observations] == [1]
     assert journal.events == []  # no llm_call metadata on the error path
+
+
+# --------------------------------------------------------------------------- #
+# Rendering helpers: truncation, XML tag shape, compact JSON (A3/A4)          #
+# --------------------------------------------------------------------------- #
+
+
+class _BigSource(FixtureSource):
+    """A FixtureSource subclass that stuffs an oversized payload into every result."""
+
+    def fetch(self, tool: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        result = super().fetch(tool, args)
+        result["big"] = "x" * (_OBSERVATION_DATA_MAX_CHARS + 500)
+        return result
+
+
+def test_oversized_observation_data_is_truncated_in_render() -> None:
+    """An observation whose data serializes to > 4000 chars is truncated in render."""
+    journal = RecordingJournal()
+    llm = FakeLLM([_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=_BigSource())
+
+    executor.run(_alert(), _plan(_step()))
+
+    rendered = "\n".join(m["content"] for m in llm.last_messages)
+    assert "truncated" in rendered
+
+
+def test_render_observations_uses_xml_observation_tags() -> None:
+    """Each observation renders as an <observation ...>...</observation> XML tag."""
+    journal = RecordingJournal()
+    llm = FakeLLM([_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal)
+
+    executor.run(_alert(), _plan(_step()))
+
+    rendered = "\n".join(m["content"] for m in llm.last_messages)
+    assert '<observation step="1" tool="lookup_user"' in rendered
+    assert "</observation>" in rendered
+
+
+def test_render_observations_ok_false_shows_false_attribute() -> None:
+    """A failed observation renders with ok="false" in the XML tag."""
+    journal = RecordingJournal()
+    source = FixtureSource(raise_for={"ghost": ToolError("not found")})
+    llm = FakeLLM([_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=source)
+
+    executor.run(_alert(), _plan(_step(entity="ghost")))
+
+    rendered = "\n".join(m["content"] for m in llm.last_messages)
+    assert 'ok="false"' in rendered
+
+
+def test_adapt_note_appended_on_tool_miss() -> None:
+    """A failed ok=False observation appends a guard_note to the rendered prompt."""
+    journal = RecordingJournal()
+    source = FixtureSource(raise_for={"ghost": ToolError("not found")})
+    llm = FakeLLM([_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=source)
+
+    executor.run(_alert(), _plan(_step(entity="ghost")))
+
+    rendered = "\n".join(m["content"] for m in llm.last_messages)
+    assert "<guard_note>" in rendered
+    assert "Adapt:" in rendered
+
+
+def test_consecutive_miss_escalates_note_message() -> None:
+    """Two consecutive ok=False observations produce the stronger escalation note."""
+    journal = RecordingJournal()
+    source = FixtureSource(
+        raise_for={
+            "ghost1": ToolError("not found"),
+            "ghost2": ToolError("not found"),
+        }
+    )
+    # Two failing steps then conclude.
+    llm = FakeLLM([_decision("continue"), _decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=source)
+
+    executor.run(
+        _alert(),
+        _plan(_step(entity="ghost1"), _step(entity="ghost2")),
+    )
+
+    # The second reason call should carry the escalated message.
+    second_rendered = "\n".join(m["content"] for m in llm.messages_by_call[1])
+    assert "consecutive failure" in second_rendered
+    assert "Conclude only when no relevant untried tool/entity remains" in second_rendered
+
+
+def test_miss_count_resets_on_ok_true() -> None:
+    """A successful ok=True step resets the consecutive-miss counter."""
+    journal = RecordingJournal()
+    # ghost fails, alice succeeds, ghost2 fails -> only 1 consecutive miss at step 3.
+    source = FixtureSource(
+        raise_for={
+            "ghost": ToolError("not found"),
+            "ghost2": ToolError("not found"),
+        }
+    )
+    # Three-step plan: ghost (fail), alice (ok), ghost2 (fail).
+    llm = FakeLLM([_decision("continue"), _decision("continue"), _decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=source)
+
+    executor.run(
+        _alert(),
+        _plan(
+            _step(entity="ghost"),
+            _step(entity="alice"),
+            _step(entity="ghost2"),
+        ),
+    )
+
+    # After the success at step 2, consecutive_miss_count resets to 0.
+    # Step 3 is the 1st consecutive miss again (not 3rd).
+    third_rendered = "\n".join(m["content"] for m in llm.messages_by_call[2])
+    # Should contain "Adapt:" (1st miss message) not "consecutive failure" (2nd+).
+    assert "Adapt:" in third_rendered
+    assert "consecutive failure" not in third_rendered
+
+
+def test_adapt_note_not_in_observations() -> None:
+    """Adapt notes must NOT enter the observations list."""
+    journal = RecordingJournal()
+    source = FixtureSource(raise_for={"ghost": ToolError("not found")})
+    llm = FakeLLM([_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=source)
+
+    result = executor.run(_alert(), _plan(_step(entity="ghost")))
+
+    # The one observation is the tool result, not the adapt note.
+    assert len(result.observations) == 1
+    assert result.observations[0].tool == "lookup_user"
+
+
+# --------------------------------------------------------------------------- #
+# B1 (M1) — llm_repair event wired through the reasoner                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_reasoner_repair_emits_llm_repair_event_before_llm_call() -> None:
+    """When the reasoner's first reply is malformed, llm_repair fires before llm_call."""
+    journal = RecordingJournal()
+    # Two malformed then one good: first triggers repair (one more malformed), then
+    # second call uses the second entry as repair response, then the concludes.
+    llm = FakeLLM(["not json", _decision("conclude")])
+    executor = _executor(llm=llm, journal=journal)
+
+    result = executor.run(_alert(), _plan(_step()))
+
+    assert result.terminated_reason == "completed"
+    names = journal.names()
+    assert "llm_repair" in names
+    assert names.index("llm_repair") < names.index("llm_call")
+    repair_payload = next(p for e, p, _ in journal.events if e == "llm_repair")
+    assert repair_payload["purpose"] == "reason"
+    assert "error" in repair_payload
+
+
+# --------------------------------------------------------------------------- #
+# T1 (H3) — resume repeat-guard rebuilds attempted from pre-observations       #
+# --------------------------------------------------------------------------- #
+
+
+def test_resume_repeat_guard_rebuilds_attempted_from_pre_observations() -> None:
+    """On resume, the repeat-call guard is seeded from the pre-resume observations.
+
+    A tool+args pair that was already executed in the pre-resume trajectory must be
+    refused on resume if the Reasoner proposes it again — no second tool_called
+    event must appear for the duplicate, but a guard note must reach the Reasoner.
+    """
+    journal = RecordingJournal()
+    # step 1 was lookup_user(alice) — present in pre_observations.
+    # The resume Reasoner first proposes that SAME call (a duplicate); after the
+    # guard refuses it the Reasoner is told to change course and concludes.
+    dup_step = _step(entity="alice")  # identical to the pre-observation
+    llm = FakeLLM(
+        [
+            # First reason call (over rebuilt obs): revise to the duplicate step.
+            _decision("revise_plan", next_step=dup_step),
+            # Second reason call (after guard refused the dup): conclude.
+            _decision("conclude"),
+        ]
+    )
+    executor = _executor(llm=llm, journal=journal)
+    plan = _plan(_step(entity="alice"), _step(entity="bob"))
+    pre = [_obs(1, entity="alice")]
+
+    result = executor.resume(_alert(), plan, pre_observations=pre, next_step_index=1)
+
+    assert result.terminated_reason == "completed"
+    # The duplicate was refused: no second tool_called for lookup_user(alice).
+    called_events = [p for e, p, _ in journal.events if e == "tool_called"]
+    assert len(called_events) == 0  # the dup was refused; no new tool ran before conclude
+    # Guard note must be present in the second Reasoner call's prompt.
+    second_rendered = "\n".join(m["content"] for m in llm.messages_by_call[1])
+    assert "refused to repeat" in second_rendered

@@ -57,7 +57,6 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from triage.errors import LLMError
-from triage.llm import Message
 from triage.models import (
     Alert,
     InvestigationPlan,
@@ -66,12 +65,20 @@ from triage.models import (
     TerminatedReason,
     ToolResult,
 )
+from triage.rendering import (
+    dump_alert,
+    dump_compact,
+    journal_llm_callbacks,
+    observation_tag,
+    split_stable_dynamic,
+    truncate,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from triage.journal import Journal
-    from triage.llm import LLM
+    from triage.llm import LLM, Message
     from triage.tools.base import DataSource, Tool
     from triage.tools.registry import ToolRegistry
 
@@ -80,6 +87,17 @@ from triage.tools.base import execute_tool
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "reasoner.md"
 
 _DEFAULT_MAX_STEPS = 15
+_OBSERVATION_DATA_MAX_CHARS = 4000
+
+
+def _truncate_data(serialized: str) -> str:
+    """Truncate an oversized serialized observation data field for LLM rendering.
+
+    Delegates to ``rendering.truncate`` — the single implementation shared with
+    verdict.  The journal retains the full data; this helper affects only the
+    LLM-facing render.
+    """
+    return truncate(serialized, _OBSERVATION_DATA_MAX_CHARS)
 
 
 def _max_steps_from_env() -> int:
@@ -156,8 +174,9 @@ class _LoopState:
     Bundled into one object so ``run`` and ``resume`` seed the shared ``_loop``
     without a long keyword-argument list: ``pending`` is the plan still to walk,
     ``observations`` the gathered trajectory, ``attempted`` the repeat-call-guard
-    set, ``guard_notes`` the off-trajectory nudges, and ``step`` the
-    ``MAX_STEPS``-counted iteration count (seeded to the rebuilt count on resume).
+    set, ``guard_notes`` the off-trajectory nudges, ``step`` the
+    ``MAX_STEPS``-counted iteration count (seeded to the rebuilt count on resume),
+    and ``consecutive_miss_count`` the A2 fail-streak counter (reset on ok=True).
     """
 
     pending: list[PlanStep]
@@ -165,6 +184,7 @@ class _LoopState:
     attempted: set[tuple[str, str]]
     guard_notes: list[str]
     step: int
+    consecutive_miss_count: int = 0
 
 
 class Executor:
@@ -282,6 +302,7 @@ class Executor:
                 alert=alert,
                 observations=state.observations,
                 guard_notes=state.guard_notes,
+                pending=state.pending,
             )
         except LLMError:
             return ExecutionResult(observations=state.observations, terminated_reason="error")
@@ -313,11 +334,36 @@ class Executor:
                 observations=state.observations,
                 guard_notes=state.guard_notes,
             )
+            # A2: track consecutive ok=False results and surface adapt notes.
+            if state.observations and not state.observations[-1].result.ok:
+                state.consecutive_miss_count += 1
+                obs = state.observations[-1]
+                if state.consecutive_miss_count == 1:
+                    note = (
+                        f"<guard_note>Step {state.step}: {obs.tool} failed for entity "
+                        f"'{obs.args.get('entity', '?')}' ({obs.result.error}). "
+                        "Adapt: try a different entity from the alert or a different "
+                        "tool.</guard_note>"
+                    )
+                else:
+                    note = (
+                        f"<guard_note>Step {state.step}: {obs.tool} failed for entity "
+                        f"'{obs.args.get('entity', '?')}' ({obs.result.error}). "
+                        f"This is the {state.consecutive_miss_count}th consecutive "
+                        "failure. Do not retry similar lookups — pivot to an entity or "
+                        "tool you have NOT tried yet (especially an unverified entity "
+                        "type such as user identity). Conclude only when no relevant "
+                        "untried tool/entity remains.</guard_note>"
+                    )
+                state.guard_notes.append(note)
+            else:
+                state.consecutive_miss_count = 0
             try:
                 decision = self._reason(
                     alert=alert,
                     observations=state.observations,
                     guard_notes=state.guard_notes,
+                    pending=state.pending,
                 )
             except LLMError:
                 return ExecutionResult(observations=state.observations, terminated_reason="error")
@@ -354,6 +400,14 @@ class Executor:
                 ),
             )
         if decision.decision == "revise_plan" and decision.next_step is not None:
+            # 1-STEP REVISION INVARIANT: every ``plan_revised`` event carries exactly
+            # one step (the single ``next_step`` the Reasoner proposed).  Resume
+            # depends on this: ``journal.rebuild`` counts ``tool_result`` events after
+            # the last ``plan_revised`` to compute ``steps_after_last_revision``, then
+            # ``core.resume_investigation`` indexes into the revision's step list by
+            # that count.  A multi-step revision would mean the count is no longer a
+            # valid index — do not change this without updating the rebuild and resume
+            # logic together.
             self._journal.emit("plan_revised", {"steps": [decision.next_step.model_dump()]})
             return _Dispatch(pending=[decision.next_step])
         if decision.decision == "revise_plan":
@@ -453,6 +507,7 @@ class Executor:
         alert: Alert,
         observations: list[ObservationEntry],
         guard_notes: list[str],
+        pending: list[PlanStep],
     ) -> ReasonerDecision:
         """Ask the Reasoner what to do next; emit ``llm_call`` (purpose reason).
 
@@ -461,12 +516,19 @@ class Executor:
                 propagated for ``run`` to convert to ``terminated_reason="error"``;
                 nothing is emitted on that path (no ``Completion`` to journal).
         """
-        messages = self._render(alert, observations, guard_notes)
-        completion = self._llm.complete(messages, ReasonerDecision)
+        messages = self._render(alert, observations, guard_notes, pending)
+        purpose = "reason"
+        on_transport_retry, on_repair = journal_llm_callbacks(self._journal, purpose)
+        completion = self._llm.complete(
+            messages,
+            ReasonerDecision,
+            on_transport_retry=on_transport_retry,
+            on_repair=on_repair,
+        )
         self._journal.emit(
             "llm_call",
             {
-                "purpose": "reason",
+                "purpose": purpose,
                 "model": completion.model,
                 "prompt_hash": completion.prompt_hash,
                 "tokens": completion.tokens,
@@ -480,21 +542,24 @@ class Executor:
         alert: Alert,
         observations: list[ObservationEntry],
         guard_notes: list[str],
+        pending: list[PlanStep],
     ) -> list[Message]:
-        """Render the reasoner prompt into the single user message the LLM seam consumes.
+        """Render the reasoner prompt as two messages: stable prefix + dynamic data.
 
+        The stable message (instructions + tools) is identical across all reason
+        calls within the session, allowing the API to cache it. The dynamic message
+        carries the per-call alert, observations, remaining steps, and task
+        instruction. ``{{END_OF_STABLE}}`` in the template marks the split point.
         ``str.replace`` over labeled sentinels (never ``str.format``) because the
-        alert payload and the Observations are JSON full of literal braces. Both
-        the alert payload and the Observations land inside labeled untrusted blocks
-        (ADR-0005): a tool Observation influences the next Step but is data, not an
-        instruction.
+        alert payload and the Observations are JSON full of literal braces.
         """
-        content = (
+        rendered = (
             self._template.replace("{{TOOLS}}", self._render_tools())
             .replace("{{ALERT_PAYLOAD}}", self._render_alert(alert))
             .replace("{{OBSERVATIONS}}", self._render_observations(observations, guard_notes))
+            .replace("{{REMAINING_STEPS}}", self._render_pending(pending))
         )
-        return [Message(role="user", content=content)]
+        return split_stable_dynamic(rendered)
 
     def _render_tools(self) -> str:
         """Render each tool spec as a stable, human-readable block."""
@@ -505,23 +570,43 @@ class Executor:
     @staticmethod
     def _render_alert(alert: Alert) -> str:
         """Dump the whole alert (envelope + payload) as one untrusted JSON blob."""
-        return json.dumps(alert.model_dump(), sort_keys=True, ensure_ascii=False, indent=2)
+        return dump_alert(alert)
+
+    @staticmethod
+    def _render_pending(pending: list[PlanStep]) -> str:
+        """Render the queued-but-not-yet-executed Plan Steps for the Reasoner."""
+        if not pending:
+            return "(no further steps are planned — all planned steps have been executed)"
+        return "\n\n".join(dump_compact(step.model_dump()) for step in pending)
 
     @staticmethod
     def _render_observations(
         observations: list[ObservationEntry],
         guard_notes: list[str],
     ) -> str:
-        """Render the Observation trajectory plus any guard notes for the Reasoner.
+        """Render the Observation trajectory plus any guard/adapt notes for the Reasoner.
 
-        The guard notes ride along here (so the Reasoner is forced to change course)
-        but are deliberately absent from the persisted evidence trajectory — a
-        refused duplicate is not an Observation.
+        Each observation is emitted as a single ``<observation>`` XML tag carrying
+        step, tool, and ok as attributes; the rest of the data is compact JSON
+        inside the tag body, with oversized data fields truncated at
+        ``_OBSERVATION_DATA_MAX_CHARS``. Guard and adapt notes (wrapped in
+        ``<guard_note>`` tags by the caller) ride along here but are deliberately
+        absent from the persisted evidence trajectory — a refused duplicate or a
+        tool-miss note is not an Observation.
         """
-        blocks = [
-            json.dumps(entry.model_dump(), sort_keys=True, ensure_ascii=False, indent=2)
-            for entry in observations
-        ]
+        blocks: list[str] = []
+        for entry in observations:
+            data = entry.model_dump()
+            result = data.pop("result", {})
+            ok_val = result.get("ok", False)
+            inner: dict[str, object] = {"step": entry.step, "args": entry.args}
+            if ok_val:
+                raw = dump_compact(result.get("data"))
+                inner["data"] = _truncate_data(raw)
+            else:
+                inner["error"] = result.get("error")
+            body = dump_compact(inner)
+            blocks.append(observation_tag(entry.step, entry.tool, ok_val, body))
         blocks.extend(guard_notes)
         return "\n\n".join(blocks)
 

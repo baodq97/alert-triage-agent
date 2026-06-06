@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0012",
+  "timestamp": "2026-05-10T08:05:00Z",
+  "source": "siem",
+  "severity_hint": "critical",
+  "event_type": "ci_pipeline_tampered",
+  "description": "Service account 'svc-deploy-prod' modified the production CI/CD pipeline definition outside any approved change window. A new step was appended that reads secrets from AWS Secrets Manager across all environments. Five secrets were accessed in the 10 minutes following the pipeline modification. No deployment ticket references this change.",
+  "entities": {
+    "service_account": "svc-deploy-prod"
+  },
+  "context": {
+    "pipeline_modified": "prod-deploy-pipeline",
+    "new_step_action": "secrets_manager_read_all",
+    "secrets_accessed_count": 5,
+    "change_window_match": false,
+    "deployment_ticket": null,
+    "note": "supply-chain attack pattern: pipeline modified then secrets exfiltrated"
+  }
+}

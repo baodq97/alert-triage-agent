@@ -1,7 +1,7 @@
 ---
 name: triage-implementer
 description: Implements alert-triage-agent Python modules per RFC-0001 — TDD, one module at a time, validated with make check before handoff. Use for any implementation task in src/triage/, tests/, prompts/, or evals/.
-model: opus
+model: sonnet
 ---
 
 # triage-implementer

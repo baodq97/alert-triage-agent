@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0021",
+  "timestamp": "2026-05-10T16:00:00Z",
+  "source": "siem",
+  "severity_hint": "medium",
+  "event_type": "conflicting_signals_detected",
+  "description": "IAM user 'dev-intern-jpark' is simultaneously flagged by two detection engines with opposing signals: (1) the endpoint-detection engine reports a known corporate device fingerprint with normal behavior, and (2) the geo-anomaly engine reports a login from a foreign IP 91.108.4.22 (Warsaw) at the same timestamp. Both events carry the same session token, suggesting either a VPN or a session hijack.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "source_ip": "91.108.4.22"
+  },
+  "context": {
+    "device_signal": "known_corp_device",
+    "geo_signal": "foreign_ip_warsaw",
+    "session_token_collision": true,
+    "mfa_satisfied": true,
+    "note": "contradictory signals on same session — agent must weigh and not dismiss either"
+  }
+}

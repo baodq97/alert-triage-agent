@@ -118,12 +118,18 @@ def build_deps(
     llm: LLM,
     journal: _CapturingJournal,
     memory: MemoryStore | None = None,
+    *,
+    approve: bool = False,
 ) -> TriageDeps:
-    """Wire the agent dependencies for an eval Run (Fixture World, default-deny gate).
+    """Wire the agent dependencies for an eval Run (Fixture World, configurable gate).
 
-    The gate is ``AutoGate(approve=False)`` — CI's default-deny posture; the eval
-    cases assert gate *ordering* and verdict shape, never a live human approval.
-    The DataSource is the bundled Fixture World, so both shipped alerts resolve.
+    ``approve`` controls whether ``AutoGate`` approves or denies the high-risk
+    batch.  The default ``False`` is CI's default-deny posture (unchanged for every
+    existing case).  Set ``approve=True`` for cases whose assertions require an
+    approved action (e.g. gate-ordering cases that assert ``action_executed``
+    follows ``gate_decision(approved)``).  Set ``approve=False`` (default) for
+    cases that assert denial semantics — the ``denied_actions_not_executed``
+    assertion requires ``gate_decision(denied)`` to be in the journal.
 
     ``memory`` is the optional entity-scoped Memory Store a case seeds via its
     ``prior_runs`` declaration; ``None`` (every case without a seed) keeps the loop
@@ -134,7 +140,7 @@ def build_deps(
         journal=journal,
         registry=ToolRegistry(),
         source=FixtureDataSource(),
-        gate=AutoGate(journal, approve=False),
+        gate=AutoGate(journal, approve=approve),
         policy=RiskPolicy(),
         memory=memory,
     )
@@ -177,14 +183,19 @@ def run_case(case: GoldenCase, llm: LLM) -> RunRecord:
     and the ``result.json``-shaped run record are bundled into the same ``RunRecord``
     the on-disk loader would produce — so live and replay runs score through the
     identical seam.
+
+    The per-case ``gate`` field (``"approve"`` or ``"deny"``) drives whether
+    ``AutoGate`` approves or denies the high-risk batch.  The default ``"approve"``
+    is byte-identical to all existing cases (no behaviour change).
     """
     alert = _load_alert(case.alert)
     journal = _CapturingJournal()
+    approve = case.gate != "deny"
     if not case.prior_runs:
-        return _run(alert, build_deps(llm, journal), journal)
+        return _run(alert, build_deps(llm, journal, approve=approve), journal)
     with tempfile.TemporaryDirectory(prefix="triage-eval-memory-") as tmp:
         memory = _seed_memory(case.prior_runs, Path(tmp))
-        return _run(alert, build_deps(llm, journal, memory), journal)
+        return _run(alert, build_deps(llm, journal, memory, approve=approve), journal)
 
 
 def _run(alert: Alert, deps: TriageDeps, journal: _CapturingJournal) -> RunRecord:
@@ -302,24 +313,52 @@ def main(argv: list[str] | None = None) -> int:
 
     The live client is built only on the live path (and only once for every case);
     the replay path never constructs it, so ``make eval --replay`` needs no key.
+
+    In replay mode, a case whose ``.replay.json`` does not exist yet is skipped
+    with a loud ``[NO CACHE]`` note in the report — it is never a hard failure and
+    never gates.  This allows new cases to land before their live recording runs.
     """
     args = argv if argv is not None else sys.argv[1:]
     replay = "--replay" in args
     cases = load_cases(_CASES_DIR)
     live_llm = None if replay else _build_live_llm()
-    reports = [evaluate_case(case, _llm_for_case(case, live_llm)) for case in cases]
-    sys.stdout.write(format_report(reports) + "\n")
+    reports_and_skips: list[CaseReport | str] = []
+    for case in cases:
+        llm = _llm_for_case(case, live_llm)
+        if llm is None:
+            # No cache recorded yet — skip loudly, never gate.
+            reports_and_skips.append(
+                f"[NO CACHE] {case.name} — no replay cache recorded yet; "
+                "run 'make eval' (live) to record one before replaying",
+            )
+        else:
+            reports_and_skips.append(evaluate_case(case, llm))
+    reports = [r for r in reports_and_skips if isinstance(r, CaseReport)]
+    lines = [format_report(reports)]
+    skips = [s for s in reports_and_skips if isinstance(s, str)]
+    if skips:
+        lines.insert(0, "\n".join(skips))
+    sys.stdout.write("\n".join(lines) + "\n")
     return 1 if any(report.gating_failed for report in reports) else 0
 
 
-def _llm_for_case(case: GoldenCase, live_llm: LLM | None) -> LLM:
+def _llm_for_case(case: GoldenCase, live_llm: LLM | None) -> LLM | None:
     """Pick the per-case LLM: that case's replay cache, or the shared live client.
 
     ``live_llm is None`` is the replay path — each case is served by its recorded
     cache via ``ReplayLLM``, never touching a live client.
+
+    Returns ``None`` when in replay mode and the cache file is missing (new case,
+    not yet recorded) — the caller must handle ``None`` as a loud skip, never a
+    hard failure.  A cache file that exists but is malformed still raises
+    ``ReplayCacheError`` loudly (a mis-recorded cache is different from "not yet
+    recorded").
     """
     if live_llm is None:
-        return ReplayLLM.from_path(case_replay_path(case))
+        path = case_replay_path(case)
+        if not path.exists():
+            return None
+        return ReplayLLM.from_path(path)
     return live_llm
 
 

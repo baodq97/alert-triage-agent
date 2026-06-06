@@ -40,5 +40,24 @@
     "recent": [
       {"ts": "2026-04-09T11:46:30Z", "action": "console.login", "result": "ok"}
     ]
+  },
+  "svc-ml-pipeline": {
+    "entity": "svc-ml-pipeline",
+    "window": "last_24h",
+    "total_events": 2340,
+    "recent": [
+      {"ts": "2026-06-01T03:00:11Z", "action": "storage.read", "resource": "s3://ml-training-data/labelled/", "result": "ok"},
+      {"ts": "2026-06-01T03:01:44Z", "action": "storage.read", "resource": "s3://ml-training-data/labelled/", "result": "ok"},
+      {"ts": "2026-06-01T03:02:58Z", "action": "storage.read", "resource": "s3://ml-training-data/labelled/", "result": "ok"},
+      {"ts": "2026-06-01T03:10:30Z", "action": "net.outbound_transfer", "destination": "185.220.101.5", "bytes": 8700000000, "result": "ok"}
+    ]
+  },
+  "185.220.101.5": {
+    "entity": "185.220.101.5",
+    "window": "last_24h",
+    "total_events": 1,
+    "recent": [
+      {"ts": "2026-06-01T03:10:30Z", "action": "net.inbound_receive", "source": "svc-ml-pipeline", "bytes": 8700000000, "result": "ok"}
+    ]
   }
 }

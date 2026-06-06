@@ -346,8 +346,14 @@ class ReconstructedRun:
     * ``events`` — the ordered event dicts (the raw audit trail).
     * ``alert_id`` / ``config`` / ``schema_version`` — from ``run_started``.
     * ``plan_steps`` — the initial plan's steps; ``plan_revisions`` — each
-      ``plan_revised``'s steps in order (the revision boundary is recorded but
-      Resume replays linear plans only — see core).
+      ``plan_revised``'s steps in order.  When non-empty, Resume rebuilds pending
+      from the last revision's steps indexed by the steps executed after that
+      revision (see ``core.resume_investigation``).
+    * ``steps_after_last_revision`` — the number of completed Tool Steps (i.e.
+      ``tool_result`` events) recorded *strictly after* the last ``plan_revised``
+      event.  Zero when no revision was recorded (the linear case).  Resume uses
+      this instead of the broken ``steps_executed - n_revisions`` arithmetic, which
+      fails when a single revision fires at step ≥2.
     * ``observations`` — completed Tool Steps as ``StepObservation`` (one per
       ``tool_result``), so a resumed Run reuses them instead of re-executing.
     * ``llm_purposes`` — the ``purpose`` of each ``llm_call`` in order (audit; the
@@ -366,6 +372,7 @@ class ReconstructedRun:
     schema_version: int | None = None
     plan_steps: list[dict[str, Any]] = field(default_factory=list)
     plan_revisions: list[list[dict[str, Any]]] = field(default_factory=list)
+    steps_after_last_revision: int = 0
     observations: list[StepObservation] = field(default_factory=list)
     llm_purposes: list[str] = field(default_factory=list)
     gate_requested: dict[str, Any] | None = None
@@ -421,6 +428,13 @@ class _RunBuilder:
     def __init__(self) -> None:
         self._run = ReconstructedRun()
         self._pending_calls: dict[tuple[int, int], dict[str, Any]] = {}
+        # Track whether a plan_revised has been seen, so tool_result events after
+        # the last revision can be counted for steps_after_last_revision.
+        self._saw_revision: bool = False
+        # Track which step numbers were already counted after the last revision so
+        # that a transient retry (two tool_result events sharing the same step) is
+        # counted as ONE step, matching the by_step dedup in core.resume_investigation.
+        self._counted_steps_after_revision: set[int] = set()
         self._handlers: dict[str, Any] = {
             "run_started": self._on_run_started,
             "plan_created": self._on_plan_created,
@@ -463,6 +477,11 @@ class _RunBuilder:
 
     def _on_plan_revised(self, event: dict[str, Any]) -> None:
         self._run.plan_revisions.append(list(event.get("steps", [])))
+        # Reset the counter each time a new revision fires so that
+        # steps_after_last_revision always reflects the LAST revision only.
+        self._saw_revision = True
+        self._run.steps_after_last_revision = 0
+        self._counted_steps_after_revision = set()
 
     def _on_llm_call(self, event: dict[str, Any]) -> None:
         purpose = event.get("purpose")
@@ -474,6 +493,11 @@ class _RunBuilder:
 
     def _on_tool_result(self, event: dict[str, Any]) -> None:
         _record_observation(self._run, event, self._pending_calls)
+        if self._saw_revision:
+            step = int(event.get("step", 0))
+            if step not in self._counted_steps_after_revision:
+                self._counted_steps_after_revision.add(step)
+                self._run.steps_after_last_revision += 1
 
     def _on_gate_requested(self, event: dict[str, Any]) -> None:
         self._run.gate_requested = event

@@ -1,0 +1,20 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0011",
+  "timestamp": "2026-05-10T07:15:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "critical",
+  "event_type": "unauthorized_admin_account_created",
+  "description": "An IAM user 'svc-backdoor-admin' was created outside the provisioning system (not by Okta SCIM) and immediately assigned 'arn:aws:iam::aws:policy/AdministratorAccess'. No HR ticket or change management record. The creating actor is unknown. Account was created at 07:15 UTC and has not been used yet.",
+  "entities": {
+    "iam_user": "svc-backdoor-admin",
+    "policy_arn": "arn:aws:iam::aws:policy/AdministratorAccess"
+  },
+  "context": {
+    "creating_actor": "unknown-principal",
+    "provisioning_system": "manual-console",
+    "hr_ticket": null,
+    "change_ticket": null,
+    "immediately_assigned_admin": true,
+    "note": "persistence mechanism: new admin account created outside normal provisioning"
+  }
+}

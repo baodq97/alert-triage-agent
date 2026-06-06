@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from triage.llm import FakeLLM
 from triage.models import Action, Alert, Finding, ToolResult, Verdict
 from triage.verdict import (
+    _OBSERVATION_DATA_MAX_CHARS,
     DEGRADED_CONFIDENCE,
     DEGRADED_SEVERITY,
     VerdictSynthesizer,
@@ -211,6 +212,17 @@ def test_rendered_prompt_handles_empty_observations_and_findings() -> None:
     assert "<findings>" in rendered
 
 
+def test_render_falls_back_to_single_message_when_sentinel_absent() -> None:
+    """If the template has no {{END_OF_STABLE}}, a single message is returned."""
+    llm = FakeLLM([_VERDICT_JSON])
+    synth = VerdictSynthesizer(llm=llm, journal=RecordingJournal())
+    synth._template = "No sentinel. {{ALERT_PAYLOAD}} {{OBSERVATIONS}} {{FINDINGS}}"  # noqa: SLF001
+
+    synth.synthesize(_alert())
+
+    assert len(llm.last_messages) == 1
+
+
 def test_degraded_path_builds_partial_verdict_without_crashing() -> None:
     journal = RecordingJournal()
     # A malformed reply, repeated, exhausts the one repair attempt -> LLMError.
@@ -246,10 +258,14 @@ def test_degraded_path_emits_only_the_verdict_event() -> None:
 
     verdict = synth.synthesize(_alert(), findings=_findings())
 
-    # No Completion means no llm_call metadata to journal; only ``verdict`` fires.
     names = [event for event, _, _ in journal.events]
-    assert names == ["verdict"]
-    assert journal.events[0][1]["verdict"] == verdict.model_dump()
+    # The repair fires before the second attempt; when both fail, llm_repair is
+    # emitted (the repair was attempted) but llm_call is NOT (no Completion exists).
+    # The final event is always verdict (RFC: "never exit without a verdict").
+    assert "llm_call" not in names
+    assert names[-1] == "verdict"
+    verdict_event = next(p for e, p, _ in journal.events if e == "verdict")
+    assert verdict_event["verdict"] == verdict.model_dump()
 
 
 def test_degraded_path_with_no_gathered_material_still_ships_a_verdict() -> None:
@@ -279,3 +295,406 @@ def test_degraded_verdict_findings_are_independent_of_recommended_actions() -> N
 
     assert verdict.findings == _findings()
     assert not any(isinstance(action, Action) for action in verdict.recommended_actions)
+
+
+# ---------------------------------------------------------------------------
+# _clamp_by_evidence: evidence-proportional confidence ceiling (Fix 1)
+# ---------------------------------------------------------------------------
+
+_OVERCONFIDENT_JSON = json.dumps(
+    {
+        "severity": "critical",
+        "findings": [
+            {
+                "statement": "Suspicious activity detected for user alice.",
+                "evidence": "check_reputation returned risk score 95 for alice.",
+            },
+        ],
+        "recommended_actions": [
+            {"name": "block_user", "params": {"user": "alice"}},
+        ],
+        "confidence": 0.95,
+    },
+)
+
+
+_UNDERCONFIDENT_JSON = json.dumps(
+    {
+        "severity": "low",
+        "findings": [
+            {
+                "statement": "No tool data available.",
+                "evidence": "All investigation tools returned not-found.",
+            },
+        ],
+        "recommended_actions": [],
+        "confidence": 0.25,
+    },
+)
+
+
+def test_confidence_floor_zero_ok() -> None:
+    """0 ok=true + LLM returns confidence < 0.30: floor raises it to 0.30."""
+    no_ok_observations = [
+        ToolResult(tool="lookup_user", ok=False, error="not found"),
+    ]
+    synth = VerdictSynthesizer(llm=FakeLLM([_UNDERCONFIDENT_JSON]), journal=RecordingJournal())
+
+    verdict = synth.synthesize(_alert(), observations=no_ok_observations)
+
+    assert verdict.confidence == 0.30
+
+
+def test_confidence_clamped_zero_ok() -> None:
+    """0 ok=true observations: confidence clamped to exactly 0.40 and actions stripped.
+
+    T3 (L2): the ceiling is == 0.40, not merely <= 0.40. This pins the exact
+    clamp constant so a refactor that accidentally changes it (e.g. to 0.5) is
+    caught immediately. ``_OVERCONFIDENT_JSON`` has confidence 0.95 which is above
+    the ceiling and must be clamped down to the boundary value exactly.
+    """
+    # All observations are ok=False — zero positive evidence.
+    no_ok_observations = [
+        ToolResult(tool="lookup_user", ok=False, error="timeout"),
+        ToolResult(tool="query_logs", ok=False, error="service unavailable"),
+    ]
+    synth = VerdictSynthesizer(llm=FakeLLM([_OVERCONFIDENT_JSON]), journal=RecordingJournal())
+
+    verdict = synth.synthesize(_alert(), observations=no_ok_observations)
+
+    # T3: pin the exact ceiling constant, not just an upper bound.
+    assert verdict.confidence == 0.40
+    assert verdict.recommended_actions == []
+
+
+def test_confidence_in_range_zero_ok_actions_stripped() -> None:
+    """0 ok=true, confidence already in [0.30, 0.40]: actions stripped, confidence preserved."""
+    in_range_json = json.dumps(
+        {
+            "severity": "low",
+            "findings": [{"statement": "No data.", "evidence": "No tool data."}],
+            "recommended_actions": [{"name": "block_user", "params": {"user": "alice"}}],
+            "confidence": 0.35,
+        },
+    )
+    no_ok_observations = [ToolResult(tool="lookup_user", ok=False, error="not found")]
+    synth = VerdictSynthesizer(llm=FakeLLM([in_range_json]), journal=RecordingJournal())
+
+    verdict = synth.synthesize(_alert(), observations=no_ok_observations)
+
+    assert verdict.confidence == 0.35
+    assert verdict.recommended_actions == []
+
+
+def test_confidence_unclamped_one_ok() -> None:
+    """1 ok=true observation: LLM confidence preserved — clamp only applies at ok_count == 0."""
+    one_ok_observations = [
+        ToolResult(tool="check_reputation", ok=True, data={"risk": 95}),
+        ToolResult(tool="lookup_user", ok=False, error="not found"),
+    ]
+    synth = VerdictSynthesizer(llm=FakeLLM([_OVERCONFIDENT_JSON]), journal=RecordingJournal())
+
+    verdict = synth.synthesize(_alert(), observations=one_ok_observations)
+
+    # One positive result: LLM value 0.95 must be preserved exactly.
+    assert verdict.confidence == 0.95
+    # Actions are NOT stripped when there is positive evidence.
+    assert len(verdict.recommended_actions) >= 1
+
+
+def test_oversized_observation_data_is_truncated_in_render() -> None:
+    """An observation whose data serializes to > 4000 chars is truncated in render."""
+    llm = FakeLLM([_VERDICT_JSON])
+    synth = VerdictSynthesizer(llm=llm, journal=RecordingJournal())
+    big_obs = ToolResult(
+        tool="query_logs",
+        ok=True,
+        data={"big": "x" * (_OBSERVATION_DATA_MAX_CHARS + 500)},
+    )
+
+    synth.synthesize(_alert(), observations=[big_obs])
+
+    rendered = "\n".join(m["content"] for m in llm.last_messages)
+    assert "truncated" in rendered
+
+
+def test_render_observations_uses_xml_observation_tags() -> None:
+    """Each observation renders as an <observation ...>...</observation> XML tag."""
+    llm = FakeLLM([_VERDICT_JSON])
+    synth = VerdictSynthesizer(llm=llm, journal=RecordingJournal())
+
+    synth.synthesize(_alert(), observations=_observations())
+
+    rendered = "\n".join(m["content"] for m in llm.last_messages)
+    assert '<observation step="1" tool="query_logs"' in rendered
+    assert "</observation>" in rendered
+    assert 'ok="true"' in rendered
+    assert 'ok="false"' in rendered
+
+
+def test_confidence_unclamped_three_ok() -> None:
+    """3 ok=true observations: LLM confidence preserved (no ceiling applies)."""
+    three_ok_json = json.dumps(
+        {
+            "severity": "high",
+            "findings": [
+                {
+                    "statement": "Confirmed malicious exfiltration by alice.",
+                    "evidence": "Three tools confirmed alice's activity.",
+                },
+            ],
+            "recommended_actions": [
+                {"name": "block_user", "params": {"user": "alice"}},
+            ],
+            "confidence": 0.91,
+        },
+    )
+    three_ok_observations = [
+        ToolResult(tool="query_logs", ok=True, data={"transfer": "5 MB"}),
+        ToolResult(tool="check_reputation", ok=True, data={"risk": 98}),
+        ToolResult(tool="get_asset_info", ok=True, data={"asset": "WS-ALICE"}),
+    ]
+    synth = VerdictSynthesizer(llm=FakeLLM([three_ok_json]), journal=RecordingJournal())
+
+    verdict = synth.synthesize(_alert(), observations=three_ok_observations)
+
+    # Three positive results: the LLM value 0.91 must be preserved exactly.
+    assert verdict.confidence == 0.91
+    assert verdict.recommended_actions[0].name == "block_user"
+
+
+# --------------------------------------------------------------------------- #
+# B1 (M1) — llm_repair event wired in verdict synthesizer                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_verdict_repair_emits_llm_repair_before_degraded_path() -> None:
+    """On a malformed first verdict reply, llm_repair fires before the verdict event.
+
+    The degraded path fires after the second malformed reply; on the repair path
+    (first bad, second good) llm_repair precedes llm_call and verdict.
+    """
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(
+        llm=FakeLLM(["not json", _VERDICT_JSON]),
+        journal=journal,
+    )
+
+    synth.synthesize(_alert())
+
+    names = [event for event, _, _ in journal.events]
+    assert "llm_repair" in names
+    assert names.index("llm_repair") < names.index("llm_call")
+    repair_payload = next(p for e, p, _ in journal.events if e == "llm_repair")
+    assert repair_payload["purpose"] == "verdict"
+    assert "error" in repair_payload
+
+
+def test_verdict_repair_not_emitted_on_clean_parse() -> None:
+    """No llm_repair event when the first verdict reply parses cleanly."""
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([_VERDICT_JSON]), journal=journal)
+
+    synth.synthesize(_alert())
+
+    names = [event for event, _, _ in journal.events]
+    assert "llm_repair" not in names
+
+
+# --------------------------------------------------------------------------- #
+# F5 — action traceability backstop                                            #
+# --------------------------------------------------------------------------- #
+
+
+def _one_ok_obs() -> list[ToolResult]:
+    """One ok=True observation so the traceability path is active (ok_count >= 1)."""
+    return [ToolResult(tool="query_logs", ok=True, data={"transfer": "alice to 203.0.113.7"})]
+
+
+def _traceable_verdict_json(*, extra_action: dict[str, Any] | None = None) -> str:
+    """Verdict whose action's 'user' param value 'alice' appears in the finding."""
+    actions = [{"name": "block_user", "params": {"user": "alice"}}]
+    if extra_action:
+        actions.append(extra_action)
+    return json.dumps(
+        {
+            "severity": "high",
+            "findings": [
+                {
+                    "statement": "alice exfiltrated data to 203.0.113.7.",
+                    "evidence": "query_logs shows outbound from alice.",
+                }
+            ],
+            "recommended_actions": actions,
+            "confidence": 0.85,
+        }
+    )
+
+
+def _untraceable_verdict_json() -> str:
+    """Verdict whose action param value 'mallory' does NOT appear in the finding."""
+    return json.dumps(
+        {
+            "severity": "high",
+            "findings": [
+                {
+                    "statement": "alice exfiltrated data.",
+                    "evidence": "query_logs shows alice.",
+                }
+            ],
+            "recommended_actions": [{"name": "block_user", "params": {"user": "mallory"}}],
+            "confidence": 0.85,
+        }
+    )
+
+
+def test_traceable_action_is_kept() -> None:
+    """An action whose param value appears in a finding is not dropped."""
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([_traceable_verdict_json()]), journal=journal)
+
+    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
+
+    assert len(verdict.recommended_actions) == 1
+    assert verdict.recommended_actions[0].name == "block_user"
+    # No drop event emitted.
+    names = [e for e, _, _ in journal.events]
+    assert "action_dropped_untraceable" not in names
+
+
+def test_untraceable_action_is_dropped_and_event_emitted() -> None:
+    """An action whose param value does not match any finding is dropped.
+
+    The drop must be journalled as ``action_dropped_untraceable`` with the action
+    payload and a reason string.
+    """
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([_untraceable_verdict_json()]), journal=journal)
+
+    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
+
+    assert verdict.recommended_actions == []
+    drop_events = [(e, p) for e, p, _ in journal.events if e == "action_dropped_untraceable"]
+    assert len(drop_events) == 1
+    _, payload = drop_events[0]
+    assert payload["action"]["name"] == "block_user"
+    assert "reason" in payload
+
+
+def test_traceability_case_insensitive() -> None:
+    """Matching is case-insensitive: 'Alice' in findings matches 'alice' in params."""
+    mixed_case_json = json.dumps(
+        {
+            "severity": "high",
+            "findings": [
+                {
+                    "statement": "ALICE performed suspicious actions.",
+                    "evidence": "Confirmed via logs.",
+                }
+            ],
+            "recommended_actions": [{"name": "block_user", "params": {"user": "alice"}}],
+            "confidence": 0.85,
+        }
+    )
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([mixed_case_json]), journal=journal)
+
+    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
+
+    assert len(verdict.recommended_actions) == 1
+    assert "action_dropped_untraceable" not in [e for e, _, _ in journal.events]
+
+
+def test_targeted_no_params_action_kept_when_findings_exist() -> None:
+    """A targeted action with no string params is kept when at least one finding is present.
+
+    No string params means nothing to trace; for targeted actions the conservative
+    rule is: keep when there is at least one finding (so there is some evidence in
+    context), drop when finding-free.
+    """
+    no_params_json = json.dumps(
+        {
+            "severity": "medium",
+            "findings": [{"statement": "Something happened.", "evidence": "logs."}],
+            "recommended_actions": [{"name": "block_user", "params": {}}],
+            "confidence": 0.6,
+        }
+    )
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([no_params_json]), journal=journal)
+
+    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
+
+    assert len(verdict.recommended_actions) == 1
+    assert "action_dropped_untraceable" not in [e for e, _, _ in journal.events]
+
+
+def test_targeted_no_params_action_dropped_when_no_findings() -> None:
+    """A targeted action with no string params is dropped when there are no findings.
+
+    Design choice: only targeted actions (e.g. ``block_user``) are subject to
+    traceability.  An untargeted advisory action (e.g. ``notify_soc``) always
+    passes through — a capability fact never decides whether a human sees a
+    recommendation.  A targeted action with no string params is dropped when the
+    verdict is finding-free (conservative fallback: nothing to anchor it).
+    """
+    no_params_no_findings_json = json.dumps(
+        {
+            "severity": "low",
+            "findings": [],
+            "recommended_actions": [{"name": "block_user", "params": {}}],
+            "confidence": 0.5,
+        }
+    )
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([no_params_no_findings_json]), journal=journal)
+
+    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
+
+    assert verdict.recommended_actions == []
+    drop_events = [e for e, _, _ in journal.events if e == "action_dropped_untraceable"]
+    assert len(drop_events) == 1
+
+
+def test_untargeted_action_always_passes_traceability() -> None:
+    """An untargeted advisory action is never dropped by the traceability backstop.
+
+    Untargeted actions (e.g. ``notify_soc``) have channel/notification params that
+    are not entity identifiers — they must always pass through to the gate unchanged
+    because a capability fact must never suppress a recommendation a human should see.
+    """
+    advisory_json = json.dumps(
+        {
+            "severity": "low",
+            "findings": [],
+            "recommended_actions": [{"name": "notify_soc", "params": {"channel": "#soc"}}],
+            "confidence": 0.5,
+        }
+    )
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([advisory_json]), journal=journal)
+
+    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
+
+    assert len(verdict.recommended_actions) == 1
+    assert verdict.recommended_actions[0].name == "notify_soc"
+    assert "action_dropped_untraceable" not in [e for e, _, _ in journal.events]
+
+
+def test_traceability_not_applied_on_zero_ok_path() -> None:
+    """The traceability backstop does not run on the ok_count == 0 path.
+
+    On zero-ok, ``_clamp_by_evidence`` already strips all actions.  The
+    traceability filter is only for the ok_count >= 1 path; testing both paths
+    do not double-drop is belt-and-suspenders.
+    """
+    # _OVERCONFIDENT_JSON has an action but all observations are ok=False.
+    no_ok = [ToolResult(tool="lookup_user", ok=False, error="not found")]
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([_OVERCONFIDENT_JSON]), journal=journal)
+
+    verdict = synth.synthesize(_alert(), observations=no_ok)
+
+    # Actions stripped by _clamp_by_evidence; no traceability event.
+    assert verdict.recommended_actions == []
+    assert "action_dropped_untraceable" not in [e for e, _, _ in journal.events]

@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0010",
+  "timestamp": "2026-05-10T06:30:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "high",
+  "event_type": "cross_service_access",
+  "description": "Service account 'svc-deploy-prod' accessed the 'user-management-api' admin endpoint and then attempted to assume roles in the HR and Finance AWS accounts — resources entirely outside its ci-cd-deployer scope. The account has no IAM policy granting cross-account assume-role. Three consecutive AccessDenied events followed by one successful AssumeRole.",
+  "entities": {
+    "service_account": "svc-deploy-prod",
+    "asset": "user-management-api"
+  },
+  "context": {
+    "out_of_scope_accounts": ["hr-account-prod", "finance-account-prod"],
+    "access_denied_count": 3,
+    "successful_assume_role": true,
+    "normal_scope": "ci-cd-deployer",
+    "note": "lateral movement pattern: ci-cd account trying to pivot to HR and Finance"
+  }
+}

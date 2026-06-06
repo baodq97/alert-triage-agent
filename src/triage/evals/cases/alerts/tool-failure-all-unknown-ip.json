@@ -1,0 +1,18 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0019",
+  "timestamp": "2026-05-10T14:30:00Z",
+  "source": "ids",
+  "severity_hint": "medium",
+  "event_type": "multi_source_scan",
+  "description": "Three consecutive port scans detected originating from IPs 203.0.113.101, 203.0.113.102, and 203.0.113.103. All IPs are unknown to the threat-intel fixture and reputation lookups return not-found for all three. The agent must handle multiple simultaneous tool failures and still produce a verdict.",
+  "entities": {
+    "source_ip_1": "203.0.113.101",
+    "source_ip_2": "203.0.113.102",
+    "source_ip_3": "203.0.113.103"
+  },
+  "context": {
+    "scan_type": "tcp_syn",
+    "ports_scanned": [22, 443, 8080],
+    "note": "all IPs unknown to fixtures — reputation checks will all fail"
+  }
+}

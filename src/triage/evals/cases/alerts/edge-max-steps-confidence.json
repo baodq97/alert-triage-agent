@@ -1,0 +1,23 @@
+{
+  "alert_id": "ALT-EVAL-MAXSTEPSCONF-0001",
+  "timestamp": "2026-06-03T07:45:00Z",
+  "source": "multi-sensor",
+  "severity_hint": "high",
+  "event_type": "multi_vector_anomaly",
+  "description": "Composite alert from four independent sensors: (1) lateral movement telemetry for host 'ws-phantom-091' communicating with 11 internal hosts outside its normal peer group; (2) an outbound DNS query for a domain with entropy score 0.97 from 'ws-phantom-091'; (3) a new scheduled task registered on 'ws-phantom-091' with an encoded PowerShell payload; (4) a failed login burst (47 attempts) against 'svc-legacy-auth' from 'ws-phantom-091'. Full investigation requires checking reputation, asset info, logs, and user records for at least four separate entities. The full multi-aspect picture requires exhaustive investigation across all available tool/entity combinations.",
+  "entities": {
+    "host": "ws-phantom-091",
+    "internal_peer_1": "ws-unknown-192",
+    "internal_peer_2": "ws-unknown-341",
+    "service_account": "svc-legacy-auth",
+    "dns_domain": "xn--nxasmq6b.xn--j6w193g",
+    "powershell_hash": "a3f2b9c1d4e5"
+  },
+  "context": {
+    "lateral_targets": 11,
+    "login_failures": 47,
+    "dns_entropy": 0.97,
+    "scheduled_task": true,
+    "note": "step-exhausted/thin-evidence verdicts must stay uncertain — confidence_max: 0.6 guards this"
+  }
+}

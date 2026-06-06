@@ -1,0 +1,14 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0020",
+  "timestamp": "2026-05-10T15:30:00Z",
+  "source": "siem",
+  "severity_hint": "low",
+  "event_type": "generic_anomaly_detected",
+  "description": "The SIEM fired a generic anomaly rule but the enrichment pipeline failed to attach any entity identifiers. No user, IP, host, or asset is associated with this alert.",
+  "entities": {},
+  "context": {
+    "rule_id": "SIEM-GENERIC-1042",
+    "enrichment_status": "failed",
+    "note": "empty entities field — agent must handle gracefully without crashing"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0015",
+  "timestamp": "2026-05-10T11:00:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "medium",
+  "event_type": "first_time_resource_access",
+  "description": "Service account 'svc-deploy-prod' accessed the 'user-management-api' service for the first time. Historically this account has only accessed the code-deploy and S3 services. The asset is in production and classified PII. No deploy ticket references user-management-api.",
+  "entities": {
+    "service_account": "svc-deploy-prod",
+    "asset": "user-management-api"
+  },
+  "context": {
+    "first_time_accessing": "user-management-api",
+    "normal_scope": ["code-deploy", "s3"],
+    "asset_classification": "pii",
+    "deploy_ticket_match": false,
+    "note": "first-time resource access outside normal scope, PII endpoint, no ticket"
+  }
+}

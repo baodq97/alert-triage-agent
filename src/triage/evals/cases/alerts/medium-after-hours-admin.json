@@ -1,0 +1,20 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0013",
+  "timestamp": "2026-05-10T03:05:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "medium",
+  "event_type": "admin_action_off_hours",
+  "description": "IAM user 'dev-intern-jpark' performed an IAM policy list operation at 03:05 UTC. The action itself (iam:ListAttachedRolePolicies) is read-only and legitimate, but the account typically has no after-hours activity. MFA was satisfied. No ticket references overnight work.",
+  "entities": {
+    "iam_user": "dev-intern-jpark"
+  },
+  "context": {
+    "action": "iam:ListAttachedRolePolicies",
+    "action_class": "read-only",
+    "local_time_utc": "03:05",
+    "mfa_satisfied": true,
+    "on_call_schedule": false,
+    "ticket_ref": null,
+    "note": "legitimate action but unusual timing, no ticket, not on-call"
+  }
+}

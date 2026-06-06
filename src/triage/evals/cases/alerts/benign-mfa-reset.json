@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0002",
+  "timestamp": "2026-05-10T09:00:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "low",
+  "event_type": "mfa_device_deregistered",
+  "description": "IAM user 'dev-intern-jpark' deregistered their MFA device and immediately re-enrolled a new TOTP authenticator. The user's IT ticket IT-78234 covers this action. No suspicious IPs or off-hours activity.",
+  "entities": {
+    "iam_user": "dev-intern-jpark"
+  },
+  "context": {
+    "old_device_type": "TOTP",
+    "new_device_type": "TOTP",
+    "ticket_ref": "IT-78234",
+    "help_desk_approved": true,
+    "source_ip": "10.0.2.15",
+    "note": "standard MFA re-enrollment flow, not a credential compromise"
+  }
+}

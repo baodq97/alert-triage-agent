@@ -57,7 +57,7 @@ from triage.errors import TriageError
 from triage.llm import Completion, prompt_hash
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
     from triage.llm import LLM, Message
@@ -189,9 +189,17 @@ class RecordingLLM:
         self,
         messages: Sequence[Message],
         response_model: type[T],
+        *,
+        on_transport_retry: Callable[[str, int, str], None] | None = None,
+        on_repair: Callable[[str, str], None] | None = None,
     ) -> Completion[T]:
         """Delegate to the inner LLM and record the validated response by hash."""
-        completion = self._inner.complete(messages, response_model)
+        completion = self._inner.complete(
+            messages,
+            response_model,
+            on_transport_retry=on_transport_retry,
+            on_repair=on_repair,
+        )
         self.cache.put(prompt_hash(messages), completion.value.model_dump_json())
         return completion
 
@@ -220,6 +228,9 @@ class ReplayLLM:
         self,
         messages: Sequence[Message],
         response_model: type[T],
+        *,
+        on_transport_retry: Callable[[str, int, str], None] | None = None,  # noqa: ARG002 — ReplayLLM never retries transport; callback ignored.
+        on_repair: Callable[[str, str], None] | None = None,  # noqa: ARG002 — ReplayLLM never repairs; callback ignored.
     ) -> Completion[T]:
         """Serve the recorded response for these messages, or fail loudly.
 

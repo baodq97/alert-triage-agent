@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -167,19 +168,29 @@ class MemoryStore:
 
 
 def _matchable_entities(entities: Mapping[str, Any]) -> list[tuple[str, str]]:
-    """Yield the ``(type, value)`` pairs whose value is a scalar, matchable str.
+    """Return ``(type, value)`` pairs for every matchable entity in ``entities``.
 
-    Entity values are ``Any`` and come from the untrusted, schema-free payload;
-    only a non-empty ``str`` key *and* value are keyable. Lists, dicts, ``None``,
-    other scalars, and empty strings are skipped — an empty type/value would
-    violate the atom's ``min_length=1`` and crash ``persist`` (a memory failure
-    must never crash a Run), and cannot name a single entity anyway.
+    Entity values are ``Any`` from the untrusted, schema-free payload; the rules:
+
+    * **Scalar ``str``** — matched as-is when both name and value are non-empty.
+    * **``list``** — each non-empty ``str`` item in the list yields a separate
+      ``(name, item)`` pair; non-str items (ints, dicts, ``None``, …) are skipped.
+    * **Everything else** (``dict``, ``int``, ``None``, …) — skipped entirely.
+
+    An empty type/value would violate the atom's ``min_length=1`` and crash
+    ``persist`` (a memory failure must never crash a Run), so empty strings are
+    always excluded regardless of path.
     """
-    return [
-        (name, value)
-        for name, value in entities.items()
-        if name and isinstance(value, str) and value
-    ]
+    result: list[tuple[str, str]] = []
+    for name, value in entities.items():
+        if not name:
+            continue
+        if isinstance(value, str):
+            if value:
+                result.append((name, value))
+        elif isinstance(value, list):
+            result.extend((name, item) for item in value if isinstance(item, str) and item)
+    return result
 
 
 def _atom_sort_key(atom: FindingAtom) -> tuple[str, str, str]:
@@ -187,9 +198,31 @@ def _atom_sort_key(atom: FindingAtom) -> tuple[str, str, str]:
     return (atom.ts, atom.run_id, atom.statement)
 
 
-def _recall_sort_key(atom: FindingAtom) -> tuple[float, str, str, str]:
-    """Confidence-desc, then recency/identity — deterministic recall ranking."""
-    return (-atom.confidence, atom.ts, atom.run_id, atom.statement)
+def _ts_sort_key(ts: str) -> float:
+    """Parse an ISO-8601 timestamp to a float for descending recency sort.
+
+    Negated so that newer timestamps sort *first* inside a single
+    ascending ``sorted()`` call.  Falls back to ``0.0`` (sorts last, i.e.
+    treated as oldest) if the string cannot be parsed — a best-effort
+    approach that keeps sorting total and crash-free on arbitrary strings
+    from the untrusted payload (ADR-0005).
+    """
+    try:
+        return -datetime.fromisoformat(ts).timestamp()
+    except (ValueError, OSError):
+        return 0.0
+
+
+def _recall_sort_key(atom: FindingAtom) -> tuple[float, float, str, str]:
+    """Confidence-desc, then recency-desc (newest first), then identity.
+
+    The docstring previously stated "confidence-desc, then recency" but
+    ``atom.ts`` ascending made *older* atoms win ties.  Fixed: the
+    timestamp is negated so that equal-confidence atoms are ranked newest
+    first.  ``run_id`` and ``statement`` are final tie-breakers (ascending)
+    to keep the order deterministic and total.
+    """
+    return (-atom.confidence, _ts_sort_key(atom.ts), atom.run_id, atom.statement)
 
 
 def _to_recall_item(atom: FindingAtom) -> dict[str, Any]:

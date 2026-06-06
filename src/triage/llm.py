@@ -42,9 +42,10 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from triage.errors import ConfigError, LLMError
+from triage.rendering import truncate as _rendering_truncate
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -56,13 +57,26 @@ _DEFAULT_TIMEOUT_SECONDS = 30.0
 # LLM-protocol mechanics (no domain content — deliberately not a prompts/ file).
 _JSON_INSTRUCTION = (
     "Respond with a single JSON object that conforms exactly to this JSON schema. "
-    "Output only the JSON, with no markdown fences or prose:\n{schema}"
+    "Output only the JSON, with no markdown fences or prose:\n"
+    "<output_schema>\n{schema}\n</output_schema>"
 )
 _REPAIR_NUDGE = (
     "Your previous response could not be parsed as JSON matching the required "
     "schema. Reply again with only a single valid JSON object conforming to it. "
     "Error: {error}"
 )
+_REPAIR_ERROR_MAX_CHARS = 500
+
+
+def _truncate_error(error: str) -> str:
+    """Truncate error strings in repair nudges to avoid leaking oversized payloads.
+
+    Delegates to ``rendering.truncate`` — the single implementation shared across
+    the codebase.  The ``"…"`` marker (no ``{n}`` count) is the repair-nudge
+    convention: the error is already a summary; recording how many chars were
+    dropped adds no value for the repair re-prompt.
+    """
+    return _rendering_truncate(error, _REPAIR_ERROR_MAX_CHARS, marker_template="…")
 
 
 class Message(TypedDict):
@@ -91,13 +105,30 @@ class Completion(Generic[T]):
 class LLM(Protocol):
     """The single structured-output port the whole agent talks to."""
 
-    def complete(self, messages: Sequence[Message], response_model: type[T]) -> Completion[T]:
+    def complete(
+        self,
+        messages: Sequence[Message],
+        response_model: type[T],
+        *,
+        on_transport_retry: Callable[[str, int, str], None] | None = None,
+        on_repair: Callable[[str, str], None] | None = None,
+    ) -> Completion[T]:
         """Render, call, parse, and validate — returning a wrapped instance.
 
         Args:
             messages: The already-rendered chat messages (prompts are rendered by
                 the caller; this seam adds no domain content).
             response_model: The Pydantic model the reply must validate against.
+            on_transport_retry: Optional callback invoked when a transport attempt
+                fails and will be retried.  Receives ``(purpose, attempt, error)``
+                — but because ``LLM`` is purpose-unaware, callers bind purpose in
+                their own closure and can ignore it here.  The callback signature
+                is ``(purpose: str, attempt: int, error: str) -> None``; a caller
+                that does not need all three args ignores them in its closure.
+                ``llm.py`` never emits journal events — this callback lets the
+                caller do so (mirrors ``before_attempt`` in tools/base.py).
+            on_repair: Optional callback invoked when the repair re-prompt fires.
+                Receives ``(purpose, error)`` for the same reason.
 
         Returns:
             A ``Completion`` carrying the validated instance and ``llm_call``
@@ -160,27 +191,57 @@ class _BaseLLM:
         self,
         messages: Sequence[Message],
         response_model: type[T],
+        *,
+        on_transport_retry: Callable[[str, int, str], None] | None = None,
     ) -> tuple[str | None, int, str]:
         """Make one logical wire call; return ``(content, tokens, model)``.
 
         Implementations own their own transport retries; this method represents a
         single *logical* completion, which the repair loop may invoke twice.
+        The ``on_transport_retry`` callback, if supplied, is forwarded so that the
+        real impl can fire it on each failed attempt before sleeping.
         """
         raise NotImplementedError  # pragma: no cover  # overridden by every impl.
 
-    def complete(self, messages: Sequence[Message], response_model: type[T]) -> Completion[T]:
-        """Render, call, parse, validate, and repair once on malformed output."""
+    def complete(
+        self,
+        messages: Sequence[Message],
+        response_model: type[T],
+        *,
+        on_transport_retry: Callable[[str, int, str], None] | None = None,
+        on_repair: Callable[[str, str], None] | None = None,
+    ) -> Completion[T]:
+        """Render, call, parse, validate, and repair once on malformed output.
+
+        Args:
+            messages: The already-rendered chat messages.
+            response_model: The Pydantic model the reply must validate against.
+            on_transport_retry: Optional callback fired when a transport attempt
+                fails and will be retried; receives ``(purpose, attempt, error)``.
+                ``llm.py`` is purpose-unaware — callers bind purpose in their
+                closure (mirrors ``before_attempt`` / ``after_attempt`` in
+                tools/base.py).
+            on_repair: Optional callback fired when the repair re-prompt fires;
+                receives ``(purpose, error)``.
+        """
         started = time.monotonic()
         digest = prompt_hash(messages)
-        content, tokens, model = self._raw_complete(messages, response_model)
+        content, tokens, model = self._raw_complete(
+            messages, response_model, on_transport_retry=on_transport_retry
+        )
         try:
             value = _parse_into(content, response_model)
         except LLMError as first_error:
+            truncated = _truncate_error(str(first_error))
+            if on_repair is not None:
+                on_repair("", truncated)
             repair_messages = [
                 *messages,
-                Message(role="user", content=_REPAIR_NUDGE.format(error=first_error)),
+                Message(role="user", content=_REPAIR_NUDGE.format(error=truncated)),
             ]
-            content, tokens, model = self._raw_complete(repair_messages, response_model)
+            content, tokens, model = self._raw_complete(
+                repair_messages, response_model, on_transport_retry=on_transport_retry
+            )
             value = _parse_into(content, response_model)
         latency_ms = int((time.monotonic() - started) * 1000)
         return Completion(
@@ -235,8 +296,17 @@ class OpenAICompatibleLLM(_BaseLLM):
         self,
         messages: Sequence[Message],
         response_model: type[T],
+        *,
+        on_transport_retry: Callable[[str, int, str], None] | None = None,
     ) -> tuple[str | None, int, str]:
-        """One logical completion with 3x transport retry + exponential backoff."""
+        """One logical completion with 3x transport retry + exponential backoff.
+
+        When a transport attempt fails and another will be made,
+        ``on_transport_retry("", attempt, error)`` is called before the sleep so
+        the caller can journal a ``llm_transport_retry`` event.  ``purpose`` is
+        always the empty string here because ``_raw_complete`` is purpose-unaware;
+        callers bind the real purpose string in their closure.
+        """
         schema = response_model.model_json_schema()
         # ALWAYS prompt-instruct the JSON (RFC-0001): native ``response_format`` is
         # an optimisation on top, absent on Ollama/some vLLM, and weakly honoured
@@ -261,6 +331,8 @@ class OpenAICompatibleLLM(_BaseLLM):
             except Exception as exc:  # noqa: BLE001 — every transport failure converts here.
                 last_error = exc
                 if attempt < _MAX_TRANSPORT_ATTEMPTS - 1:
+                    if on_transport_retry is not None:
+                        on_transport_retry("", attempt + 1, str(exc))
                     time.sleep(_BACKOFF_BASE_SECONDS * (2**attempt))
                 continue
             usage = getattr(response, "usage", None)
@@ -292,15 +364,19 @@ class FakeLLM(_BaseLLM):
         self._tokens = tokens
         self.calls = 0
         self.last_messages: list[Message] = []
+        self.messages_by_call: list[list[Message]] = []
 
     def _raw_complete(
         self,
         messages: Sequence[Message],
         response_model: type[T],  # noqa: ARG002 — part of the shared transport signature.
+        *,
+        on_transport_retry: Callable[[str, int, str], None] | None = None,  # noqa: ARG002 — FakeLLM never retries transport.
     ) -> tuple[str | None, int, str]:
         """Pop the next scripted reply; record the messages it was asked with."""
         self.calls += 1
         self.last_messages = list(messages)
+        self.messages_by_call.append(list(messages))
         if not self._script:
             msg = "FakeLLM script exhausted — no scripted reply for this call"
             raise LLMError(msg)

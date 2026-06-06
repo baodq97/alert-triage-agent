@@ -56,19 +56,26 @@ invariant) live in code at the core/gate level, not in this prompt.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from triage.errors import LLMError
-from triage.llm import Message
-from triage.models import Alert, Finding, ToolResult, Verdict
+from triage.models import Action, Alert, Finding, ToolResult, Verdict
+from triage.rendering import (
+    dump_alert,
+    dump_compact,
+    journal_llm_callbacks,
+    observation_tag,
+    split_stable_dynamic,
+    truncate,
+)
+from triage.tools.actions import is_targeted
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from triage.journal import Journal
-    from triage.llm import LLM
+    from triage.llm import LLM, Message
     from triage.models import TerminatedReason
 
 _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "verdict.md"
@@ -81,6 +88,52 @@ DEGRADED_CONFIDENCE = 0.0
 
 _NO_OBSERVATIONS = "(no observations were gathered)"
 _NO_FINDINGS = "(no findings were drawn during the run)"
+_OBSERVATION_DATA_MAX_CHARS = 4000
+
+
+def _truncate_data(serialized: str) -> str:
+    """Truncate an oversized serialized observation data field for LLM rendering.
+
+    Delegates to ``rendering.truncate`` — the single implementation shared with
+    executor.  The journal retains the full data; this helper affects only the
+    LLM-facing render.
+    """
+    return truncate(serialized, _OBSERVATION_DATA_MAX_CHARS)
+
+
+# Binary evidence gate: ok_count == 0 gets a hard confidence band and loses its
+# recommended actions (no positive evidence to ground a response); ok_count >= 1
+# means the LLM calibrates freely — the prompt provides prose guidance, this code
+# enforces only the zero-evidence floor.
+_ZERO_EVIDENCE_CONFIDENCE_MAX = 0.40
+"""Confidence ceiling when no tool returned ok=true — agent has no positive evidence."""
+_ZERO_EVIDENCE_CONFIDENCE_MIN = 0.30
+"""Confidence floor when no tool returned ok=true — a verdict is still a decision."""
+
+
+def _clamp_by_evidence(verdict: Verdict, observations: Sequence[ToolResult]) -> Verdict:
+    """Enforce evidence-proportional confidence and strip unsupported actions.
+
+    Only the zero-positive-evidence case receives a hard clamp — when every tool
+    returned ``ok=False`` the LLM has no positive data to ground any action or
+    high confidence. For 1+ positive results the prompt guides calibration freely.
+
+    Rules:
+    * ``ok_count >= 1``: no changes — the LLM calibrates based on the evidence.
+    * ``ok_count == 0``: confidence clamped to ``[0.30, 0.40]``; all recommended
+      actions stripped (there is no positive evidence to ground any response).
+    """
+    ok_count = sum(1 for obs in observations if obs.ok)
+    if ok_count >= 1:
+        return verdict
+    updates: dict[str, object] = {}
+    if verdict.confidence > _ZERO_EVIDENCE_CONFIDENCE_MAX:
+        updates["confidence"] = _ZERO_EVIDENCE_CONFIDENCE_MAX
+    elif verdict.confidence < _ZERO_EVIDENCE_CONFIDENCE_MIN:
+        updates["confidence"] = _ZERO_EVIDENCE_CONFIDENCE_MIN
+    if verdict.recommended_actions:
+        updates["recommended_actions"] = []
+    return verdict.model_copy(update=updates) if updates else verdict
 
 
 class VerdictSynthesizer:
@@ -102,6 +155,7 @@ class VerdictSynthesizer:
         alert: Alert,
         *,
         observations: Sequence[ToolResult] = (),
+        observation_steps: Sequence[int] | None = None,
         findings: Sequence[Finding] = (),
         terminated_reason: TerminatedReason | None = None,
     ) -> Verdict:
@@ -110,6 +164,15 @@ class VerdictSynthesizer:
         Args:
             alert: The validated alert under investigation.
             observations: The tool Observations gathered during the run.
+            observation_steps: The real executor step numbers corresponding to
+                each observation (same length as ``observations``).  When
+                provided, ``<observation step="...">`` uses these values so the
+                prompt matches the journal's ``tool_called``/``tool_result``
+                step numbers exactly — including any gaps caused by guard-refused
+                steps.  When ``None`` (the default, and for tests that build
+                ``ToolResult`` objects directly), steps are derived by
+                ``enumerate(observations, start=1)``, which is byte-identical for
+                gap-free runs.
             findings: The Findings already drawn during the run (carried through
                 verbatim on the degraded path).
             terminated_reason: Why the run ended early, if it did — carried onto
@@ -121,16 +184,23 @@ class VerdictSynthesizer:
             deterministic partial verdict if the LLM call failed. Never raises;
             a ``verdict`` event is always emitted.
         """
-        messages = self._render(alert, observations, findings)
+        messages = self._render(alert, observations, observation_steps, findings)
+        purpose = "verdict"
+        on_transport_retry, on_repair = journal_llm_callbacks(self._journal, purpose)
         try:
-            completion = self._llm.complete(messages, Verdict)
+            completion = self._llm.complete(
+                messages,
+                Verdict,
+                on_transport_retry=on_transport_retry,
+                on_repair=on_repair,
+            )
         except LLMError:
             verdict = self._degraded_verdict(findings, terminated_reason)
         else:
             self._journal.emit(
                 "llm_call",
                 {
-                    "purpose": "verdict",
+                    "purpose": purpose,
                     "model": completion.model,
                     "prompt_hash": completion.prompt_hash,
                     "tokens": completion.tokens,
@@ -140,6 +210,21 @@ class VerdictSynthesizer:
             # ``terminated_reason`` is code-owned: override any value the model
             # emitted with the upstream fact.
             verdict = completion.value.model_copy(update={"terminated_reason": terminated_reason})
+            # Enforce evidence-proportional confidence and action grounding.
+            verdict = _clamp_by_evidence(verdict, observations)
+            # Action traceability backstop (ok_count >= 1 path only): each
+            # recommended action must be traceable to a finding — at least one of
+            # its string param values must appear as a substring in some finding's
+            # statement or evidence.  Untraceable actions are dropped here and
+            # journalled as ``action_dropped_untraceable``.  The ok_count == 0
+            # path has already stripped all actions above, so this only runs when
+            # there is positive evidence (and therefore meaningful findings to
+            # trace against).  Uses the synthesized verdict's own findings (not
+            # the carried pre-existing ones) since those are what the LLM grounded
+            # its actions on.
+            ok_count = sum(1 for obs in observations if obs.ok)
+            if ok_count >= 1:
+                verdict = self._filter_traceable_actions(verdict)
         self._journal.emit("verdict", {"verdict": verdict.model_dump()})
         return verdict
 
@@ -157,41 +242,136 @@ class VerdictSynthesizer:
             terminated_reason=terminated_reason,
         )
 
+    def _filter_traceable_actions(self, verdict: Verdict) -> Verdict:
+        """Drop targeted actions whose entity param cannot be traced to a finding.
+
+        The verdict.md rule "every recommended action must be traceable to a
+        finding naming the same entity" is enforced here as a code backstop on the
+        ``ok_count >= 1`` path.  Only **targeted** actions (those in
+        ``TARGETED_ACTIONS``, e.g. ``block_user``) are subject to this check —
+        untargeted advisory actions (e.g. ``notify_soc``) are always passed through
+        unchanged because their params are channel/notification metadata, not
+        entity identifiers.
+
+        For each targeted action, at least one string param value must appear as a
+        case-insensitive substring in some finding's statement or evidence.  A
+        targeted action with no string params is kept only if the verdict has at
+        least one finding (conservative fallback).
+
+        Each dropped action emits an ``action_dropped_untraceable`` journal event
+        so the drop is never silent.
+
+        **Security note — quality heuristic, not a security boundary.**
+        Findings are LLM-authored from attacker-influenced input (ADR-0005), so
+        the substring match here is a *quality* backstop: it drops actions the
+        model failed to ground in its own findings (ungrounded hallucinations).
+        It is not an adversarial defense — a sufficiently crafted alert payload
+        could cause the LLM to produce a finding that contains the attacker's
+        desired entity string.  The actual security boundaries are:
+        (1) ``_accept_actions``'s target-entity invariant (the action target must
+        name an entity present in the original alert envelope, which is validated
+        Pydantic input, not LLM output); and (2) the high-risk gate (every
+        targeted action requires human approval before execution).
+        """
+        if not verdict.recommended_actions:
+            return verdict
+        # Build a single lowercased corpus of all finding text for fast substring
+        # search; one pass over all findings is cheaper than nested loops.
+        finding_corpus = " ".join(
+            (f.statement + " " + f.evidence).lower() for f in verdict.findings
+        )
+        kept: list[Action] = []
+        for action in verdict.recommended_actions:
+            if not is_targeted(action):
+                # Untargeted advisory actions are never subject to traceability.
+                kept.append(action)
+                continue
+            string_params = [v for v in (action.params or {}).values() if isinstance(v, str)]
+            if string_params:
+                # At least one string param value must appear in the finding corpus.
+                traceable = any(param.lower() in finding_corpus for param in string_params)
+            else:
+                # No string params — trace by presence of any finding at all.
+                traceable = bool(verdict.findings)
+            if traceable:
+                kept.append(action)
+            else:
+                self._journal.emit(
+                    "action_dropped_untraceable",
+                    {
+                        "action": action.model_dump(),
+                        "reason": "no finding names a param value of this action",
+                    },
+                )
+        if len(kept) == len(verdict.recommended_actions):
+            return verdict
+        return verdict.model_copy(update={"recommended_actions": kept})
+
     def _render(
         self,
         alert: Alert,
         observations: Sequence[ToolResult],
+        observation_steps: Sequence[int] | None,
         findings: Sequence[Finding],
     ) -> list[Message]:
-        """Render the prompt into the single user message the LLM seam consumes."""
-        content = (
+        """Render the prompt as two messages: stable prefix + dynamic data.
+
+        The stable message (instructions + calibration rules) is identical across
+        all verdict calls, enabling API-level prefix caching. The dynamic message
+        carries the per-run alert, observations, findings, and task instruction.
+        ``{{END_OF_STABLE}}`` in the template marks the split point.
+        """
+        rendered = (
             self._template.replace("{{ALERT_PAYLOAD}}", self._render_alert(alert))
-            .replace("{{OBSERVATIONS}}", self._render_observations(observations))
+            .replace("{{OBSERVATIONS}}", self._render_observations(observations, observation_steps))
             .replace("{{FINDINGS}}", self._render_findings(findings))
         )
-        return [Message(role="user", content=content)]
+        return split_stable_dynamic(rendered)
 
     @staticmethod
     def _render_alert(alert: Alert) -> str:
         """Dump the whole alert (envelope + payload) as one untrusted JSON blob."""
-        return json.dumps(alert.model_dump(), sort_keys=True, ensure_ascii=False, indent=2)
+        return dump_alert(alert)
 
     @staticmethod
-    def _render_observations(observations: Sequence[ToolResult]) -> str:
-        """Render the gathered Observations as a stable untrusted block."""
+    def _render_observations(
+        observations: Sequence[ToolResult],
+        observation_steps: Sequence[int] | None,
+    ) -> str:
+        """Render the gathered Observations as a stable untrusted block.
+
+        Each observation is emitted as a single ``<observation>`` XML tag carrying
+        step, tool, and ok as attributes; the rest of the data is compact JSON
+        inside the tag body. Oversized data fields are truncated at
+        ``_OBSERVATION_DATA_MAX_CHARS``. The journal keeps full data.
+
+        ``observation_steps`` carries the real executor step numbers so the
+        prompt's ``step="..."`` attributes match the journal's
+        ``tool_called``/``tool_result`` step exactly — including any numbering
+        gaps from guard-refused steps.  When ``None``, steps are derived from
+        position (``enumerate(..., start=1)``), which is byte-identical for
+        gap-free runs where the two methods agree.
+        """
         if not observations:
             return _NO_OBSERVATIONS
-        return "\n\n".join(
-            json.dumps(obs.model_dump(), sort_keys=True, ensure_ascii=False, indent=2)
-            for obs in observations
+        blocks: list[str] = []
+        steps = (
+            observation_steps if observation_steps is not None else range(1, len(observations) + 1)
         )
+        for step_num, obs in zip(steps, observations, strict=True):
+            inner: dict[str, object] = {}
+            if obs.ok:
+                raw = dump_compact(obs.data)
+                inner["data"] = _truncate_data(raw)
+            else:
+                inner["error"] = obs.error
+            body = dump_compact(inner)
+            blocks.append(observation_tag(step_num, obs.tool, obs.ok, body))
+        return "\n\n".join(blocks)
 
     @staticmethod
     def _render_findings(findings: Sequence[Finding]) -> str:
         """Render the carried Findings as a stable untrusted block."""
         if not findings:
             return _NO_FINDINGS
-        return "\n\n".join(
-            json.dumps(finding.model_dump(), sort_keys=True, ensure_ascii=False, indent=2)
-            for finding in findings
-        )
+        return "\n\n".join(dump_compact(finding.model_dump()) for finding in findings)

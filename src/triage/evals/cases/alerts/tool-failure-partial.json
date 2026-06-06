@@ -1,0 +1,16 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0018",
+  "timestamp": "2026-05-10T13:00:00Z",
+  "source": "cloudtrail",
+  "severity_hint": "medium",
+  "event_type": "iam_policy_attached",
+  "description": "IAM user 'dev-intern-jpark' made an IAM policy change. The user is known in the system, but the destination resource 'arn:aws:iam::999999999999:role/unknown-role' is not registered in any asset inventory. Some investigation tools will succeed while asset lookup will return not-found.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "role_arn": "arn:aws:iam::999999999999:role/unknown-role"
+  },
+  "context": {
+    "policy_attached": "arn:aws:iam::aws:policy/PowerUserAccess",
+    "note": "user is known (tool succeeds), unknown role target (tool fails) — partial failure scenario"
+  }
+}

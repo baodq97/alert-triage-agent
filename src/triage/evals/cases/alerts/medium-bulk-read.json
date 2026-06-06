@@ -1,0 +1,21 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0016",
+  "timestamp": "2026-05-10T14:00:00Z",
+  "source": "waf",
+  "severity_hint": "medium",
+  "event_type": "bulk_read_pattern",
+  "description": "Service account 'svc-deploy-prod' sent 420 GET requests to '/admin/users/export' in 15 minutes from IP 10.200.1.3. No export has been triggered yet (0 bytes downloaded) but the request volume is 35x the baseline rate. Pattern may be reconnaissance prior to extraction.",
+  "entities": {
+    "service_account": "svc-deploy-prod",
+    "source_ip": "10.200.1.3",
+    "asset": "/admin/users/export"
+  },
+  "context": {
+    "request_count": 420,
+    "window_minutes": 15,
+    "baseline_rate_per_window": 12,
+    "bytes_downloaded": 0,
+    "ip_in_expected_range": true,
+    "note": "35x baseline volume from known IP, no download yet — possible recon"
+  }
+}

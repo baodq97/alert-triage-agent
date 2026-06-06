@@ -326,3 +326,186 @@ def test_atom_round_trips_through_jsonl(tmp_path: Path) -> None:
     atom = FindingAtom.model_validate(json.loads(line))
 
     assert atom.entity_value in {"10.0.0.9", "alice"}
+
+
+# --------------------------------------------------------------------------- #
+# B5 (M-mem1) — recall recency tie-break: equal confidence -> newest first    #
+# --------------------------------------------------------------------------- #
+
+
+def test_equal_confidence_newer_atom_ranks_first(tmp_path: Path) -> None:
+    """With equal confidence, the atom with the newer ts must rank first in recall."""
+    store = MemoryStore(base_dir=tmp_path)
+    store.persist(
+        "run-older",
+        _alert(timestamp="2024-01-01T00:00:00Z"),
+        _verdict(
+            confidence=0.7,
+            findings=[Finding(statement="older fact", evidence="ev")],
+        ),
+    )
+    store.persist(
+        "run-newer",
+        _alert(timestamp="2025-06-01T00:00:00Z"),
+        _verdict(
+            confidence=0.7,
+            findings=[Finding(statement="newer fact", evidence="ev")],
+        ),
+    )
+
+    recalled = store.recall(_alert(alert_id="A2", entities={"ip": "10.0.0.9"}))
+
+    # Equal confidence: the newer atom (2025) must come first.
+    assert recalled[0]["content"].startswith("[high] newer fact")
+
+
+# T2 (L1) — explicit tie-break test: two atoms same confidence, different ts → newer first
+def test_recall_breaks_confidence_ties_by_recency(tmp_path: Path) -> None:
+    """Two atoms with IDENTICAL confidence sort newest-timestamp-first in recall.
+
+    This is a named explicit regression: if the recency tie-break were ever dropped
+    or inverted (e.g. ascending ts or missing second sort key) the newer fact would
+    rank behind the older one and this test would fail, alerting the author.
+    """
+    store = MemoryStore(base_dir=tmp_path)
+    store.persist(
+        "run-2022",
+        _alert(timestamp="2022-03-15T08:00:00Z"),
+        _verdict(
+            confidence=0.6,
+            findings=[Finding(statement="2022 finding", evidence="ev")],
+        ),
+    )
+    store.persist(
+        "run-2026",
+        _alert(timestamp="2026-01-01T00:00:00Z"),
+        _verdict(
+            confidence=0.6,
+            findings=[Finding(statement="2026 finding", evidence="ev")],
+        ),
+    )
+
+    recalled = store.recall(_alert(alert_id="A2", entities={"ip": "10.0.0.9"}))
+
+    assert len(recalled) == 2
+    # Same confidence (0.6): the 2026 atom must rank first.
+    assert "2026 finding" in recalled[0]["content"]
+    assert "2022 finding" in recalled[1]["content"]
+
+
+def test_higher_confidence_always_wins_regardless_of_recency(tmp_path: Path) -> None:
+    """Higher confidence ranks first even when the atom is older."""
+    store = MemoryStore(base_dir=tmp_path)
+    store.persist(
+        "run-old-high",
+        _alert(timestamp="2022-01-01T00:00:00Z"),
+        _verdict(
+            confidence=0.95,
+            findings=[Finding(statement="old high-conf", evidence="ev")],
+        ),
+    )
+    store.persist(
+        "run-new-low",
+        _alert(timestamp="2025-06-01T00:00:00Z"),
+        _verdict(
+            confidence=0.3,
+            findings=[Finding(statement="new low-conf", evidence="ev")],
+        ),
+    )
+
+    recalled = store.recall(_alert(alert_id="A2", entities={"ip": "10.0.0.9"}))
+
+    assert recalled[0]["content"].startswith("[high] old high-conf")
+
+
+# --------------------------------------------------------------------------- #
+# B6 (M-mem3) — list-entity matching                                           #
+# --------------------------------------------------------------------------- #
+
+
+def test_list_entity_persists_and_recalls_per_item(tmp_path: Path) -> None:
+    """A list entity value yields one atom per non-empty str item."""
+    store = MemoryStore(base_dir=tmp_path)
+    alert = _alert(entities={"source_ips": ["1.2.3.4", "5.6.7.8"]})
+    store.persist("run-list", alert, _verdict())
+
+    # Each IP in the list should produce a separate recall entry.
+    recalled_first = store.recall(_alert(alert_id="A2", entities={"source_ips": ["1.2.3.4"]}))
+    recalled_second = store.recall(_alert(alert_id="A3", entities={"source_ips": ["5.6.7.8"]}))
+
+    assert recalled_first, "1.2.3.4 should have been persisted and recalled"
+    assert recalled_second, "5.6.7.8 should have been persisted and recalled"
+    assert any("Exfiltrated" in item["content"] for item in recalled_first)
+
+
+def test_list_entity_skips_non_str_members(tmp_path: Path) -> None:
+    """Non-str items in a list (int, None, dict) are skipped silently."""
+    store = MemoryStore(base_dir=tmp_path)
+    alert = _alert(entities={"ports": [22, None, {"nested": 1}, "valid-str"]})
+    store.persist("run-mixed", alert, _verdict())
+
+    # Only the valid str item ("valid-str") should produce atoms.
+    recalled = store.recall(_alert(alert_id="A2", entities={"ports": ["valid-str"]}))
+    assert recalled, "the valid str item should have been matched"
+
+    # None/int/dict items do not produce atoms.
+    no_match = store.recall(_alert(alert_id="A3", entities={"ports": [22]}))
+    assert no_match == []
+
+
+def test_list_entity_skips_empty_strings(tmp_path: Path) -> None:
+    """Empty strings inside a list are not persisted (min_length violation guard)."""
+    store = MemoryStore(base_dir=tmp_path)
+    alert = _alert(entities={"ips": ["", "  ", "10.0.0.1"]})
+    store.persist("run-empty-list", alert, _verdict())
+
+    # Only the non-empty "10.0.0.1" should exist.
+    recalled = store.recall(_alert(alert_id="A2", entities={"ips": ["10.0.0.1"]}))
+    assert recalled
+
+    empty_recall = store.recall(_alert(alert_id="A3", entities={"ips": [""]}))
+    assert empty_recall == []
+
+
+def test_mixed_scalar_and_list_entities_both_persist(tmp_path: Path) -> None:
+    """Both scalar str and list entities in the same alert are all persisted."""
+    store = MemoryStore(base_dir=tmp_path)
+    alert = _alert(entities={"user": "alice", "source_ips": ["1.2.3.4", "5.6.7.8"]})
+    store.persist("run-combo", alert, _verdict())
+
+    # Scalar and both list items should be matchable.
+    assert store.recall(_alert(alert_id="A2", entities={"user": "alice"}))
+    assert store.recall(_alert(alert_id="A3", entities={"source_ips": ["1.2.3.4"]}))
+    assert store.recall(_alert(alert_id="A4", entities={"source_ips": ["5.6.7.8"]}))
+
+
+def test_unparseable_timestamp_falls_back_in_recall_sort(tmp_path: Path) -> None:
+    """An atom with an unparseable ``ts`` is sorted last (fallback 0.0); no crash."""
+    store = MemoryStore(base_dir=tmp_path)
+    # Normal atom with a valid timestamp.
+    store.persist(
+        "run-valid",
+        _alert(timestamp="2025-06-01T00:00:00Z"),
+        _verdict(confidence=0.5, findings=[Finding(statement="valid fact", evidence="ev")]),
+    )
+    # Inject an atom with a garbage timestamp directly into the store file.
+    path = next(iter(tmp_path.glob("*.jsonl")))
+    bad_atom = {
+        "atom_id": "bad000",
+        "entity_type": "ip",
+        "entity_value": "10.0.0.9",
+        "statement": "bad-ts fact",
+        "evidence": "ev",
+        "severity": "high",
+        "confidence": 0.5,
+        "run_id": "run-bad-ts",
+        "ts": "not-a-timestamp",
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(bad_atom) + "\n")
+
+    # Must not crash; both atoms recalled, bad-ts atom treated as oldest.
+    recalled = store.recall(_alert(alert_id="A2", entities={"ip": "10.0.0.9"}))
+    assert len(recalled) == 2
+    # The valid-ts atom (2025) sorts before the bad-ts atom (fallback oldest).
+    assert recalled[0]["content"].startswith("[high] valid fact")

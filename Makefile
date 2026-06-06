@@ -1,4 +1,4 @@
-.PHONY: run watch test lint typecheck check eval
+.PHONY: run watch test lint typecheck check eval eval-replay
 
 ALERT ?= alerts/ALT-2026-04-7821-data-exfiltration.json
 
@@ -20,4 +20,7 @@ typecheck:
 check: lint typecheck test
 
 eval:
-	uv run python -m triage.evals.runner
+	uv run --env-file .env python -m triage.evals.runner
+
+eval-replay:
+	uv run python -m triage.evals.runner --replay

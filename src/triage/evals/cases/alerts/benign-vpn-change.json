@@ -1,0 +1,19 @@
+{
+  "alert_id": "ALT-EVAL-EXT-0006",
+  "timestamp": "2026-05-10T16:20:00Z",
+  "source": "edr",
+  "severity_hint": "low",
+  "event_type": "login_from_new_ip",
+  "description": "IAM user 'dev-intern-jpark' logged in from IP 10.100.5.88, a new VPN exit node provisioned this week. The IP is still within the corporate network block 10.0.0.0/8. MFA was satisfied. The VPN team confirmed the new exit node in their change log.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "source_ip": "10.100.5.88"
+  },
+  "context": {
+    "network_block": "10.0.0.0/8",
+    "network_type": "corporate-vpn",
+    "mfa_used": true,
+    "vpn_change_log": "VPN-EXIT-NODE-2026-05-08",
+    "note": "new VPN exit node within corporate range, mfa passed"
+  }
+}
