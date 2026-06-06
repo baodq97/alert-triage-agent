@@ -1,7 +1,7 @@
 ---
 id: US-0004
 title: "Wave 4: watch mode, L3 threat posture, README"
-status: open
+status: done
 owner: baodq97
 date: 2026-06-05
 priority: P1
@@ -18,6 +18,8 @@ As a detection engineer, I want the agent to consume alerts autonomously from a 
 `run.py --watch <dir>` + `--synthesize-posture` (on-demand L3 trigger), L3 posture synthesis (config cadence `MEMORY_SYNTHESIZE_EVERY_N_RUNS`, 0 = disabled, degradable to deterministic top-N), README, final QA sweep.
 
 ## Acceptance criteria
+> **Scope note (2026-06-06, owner):** watch mode was cut per RFC-0001's sanctioned cut line ("watch-mode → README"); the README carries the design sketch. The recommend-and-hold watch AC moves with it. L3 posture, README, and the full-sweep QA shipped (PR #6).
+
 
 - [ ] Dropping an alert JSON into the watched folder triggers a full autonomous run
 - [ ] L3 posture brief regenerates per configured cadence and feeds planner recall; with no key/time, the deterministic fallback produces a usable brief
