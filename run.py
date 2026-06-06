@@ -36,10 +36,13 @@ adapter.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -53,7 +56,7 @@ from triage.core import (
 )
 from triage.errors import TriageError
 from triage.gate import CLIGate, DeferredGate, RiskPolicy
-from triage.journal import JsonlJournal, rebuild
+from triage.journal import Journal, JsonlJournal, rebuild
 from triage.llm import OpenAICompatibleLLM
 from triage.memory import MemoryStore, PostureSynthesizer
 from triage.memory.posture import synthesize_posture_if_due
@@ -62,6 +65,114 @@ from triage.tools import FixtureDataSource, ToolRegistry
 
 _RUNS_DIR = Path(__file__).resolve().parent / "runs"
 _RESUME_BY = "cli-resume"
+
+
+class _VerboseJournal:
+    """A journal decorator: forwards every event, narrates the run to stderr.
+
+    A CLI concern only — core stays silent (ADR-0003: the journal is the single
+    instrumentation; this wrapper *reads* the same event stream the journal
+    persists, it never adds events of its own).  stderr keeps stdout clean for
+    the final summary, so piping stdout still yields just the verdict.
+    """
+
+    def __init__(self, inner: JsonlJournal) -> None:
+        """Wrap ``inner``; all events are forwarded to it unchanged."""
+        self._inner = inner
+
+    def emit(
+        self,
+        event: str,
+        payload: Mapping[str, Any],
+        *,
+        agent: str = "triage",
+    ) -> None:
+        """Forward to the real journal, then narrate the interesting events."""
+        self._inner.emit(event, payload, agent=agent)
+        line = self._narrate(event, payload, agent)
+        if line is not None:
+            print(line, file=sys.stderr)  # noqa: T201 — CLI verbose narration: stderr is the point.
+
+    @staticmethod
+    def _narrate(event: str, payload: Mapping[str, Any], agent: str) -> str | None:
+        """Render one journal event as a human line, or ``None`` to stay quiet."""
+        renderer = _NARRATORS.get(event)
+        if renderer is None:
+            return None
+        tag = "" if agent == "triage" else f"[{agent}] "
+        return renderer(tag, payload)
+
+
+def _narrate_plan(tag: str, payload: Mapping[str, Any]) -> str:
+    steps = payload.get("steps") or []
+    lines = [f"{tag}PLAN     {len(steps)} step(s)"]
+    lines.extend(
+        f"{tag}         - {s.get('tool')}({json.dumps(s.get('args', {}))})"
+        for s in steps
+        if isinstance(s, Mapping)
+    )
+    return "\n".join(lines)
+
+
+def _narrate_revise(tag: str, payload: Mapping[str, Any]) -> str:
+    steps = payload.get("steps") or []
+    return f"{tag}REVISE   {len(steps)} replacement step(s): {json.dumps(steps)}"
+
+
+def _narrate_tool_called(tag: str, payload: Mapping[str, Any]) -> str:
+    return f"{tag}TOOL     {payload.get('tool')}({json.dumps(payload.get('args', {}))})"
+
+
+def _narrate_tool_result(tag: str, payload: Mapping[str, Any]) -> str:
+    err = payload.get("error")
+    return f"{tag}         -> ok={payload.get('ok')}" + (f" error={err}" if err else "")
+
+
+def _narrate_llm(tag: str, payload: Mapping[str, Any]) -> str:
+    return (
+        f"{tag}LLM      {payload.get('purpose')} "
+        f"({payload.get('tokens')} tok, {payload.get('latency_ms')} ms)"
+    )
+
+
+def _narrate_verdict(tag: str, payload: Mapping[str, Any]) -> str:
+    verdict = payload.get("verdict")
+    if isinstance(verdict, Mapping):
+        n_findings = len(verdict.get("findings") or [])
+        return (
+            f"{tag}VERDICT  severity={verdict.get('severity')} "
+            f"confidence={verdict.get('confidence')} findings={n_findings}"
+        )
+    return f"{tag}VERDICT  shipped"
+
+
+def _narrate_verification(tag: str, payload: Mapping[str, Any]) -> str:
+    line = f"{tag}VERIFY   {payload.get('action')}"
+    if payload.get("failed"):
+        line += f" failed={payload['failed']}"
+    if payload.get("uncovered_entities"):
+        line += f" uncovered={payload['uncovered_entities']}"
+    return line
+
+
+def _narrate_gate_requested(tag: str, payload: Mapping[str, Any]) -> str:
+    actions = payload.get("actions") or []
+    return f"{tag}GATE?    {len(actions)} high-risk action(s) pending approval"
+
+
+_NARRATORS: dict[str, Any] = {
+    "plan_created": _narrate_plan,
+    "plan_revised": _narrate_revise,
+    "tool_called": _narrate_tool_called,
+    "tool_result": _narrate_tool_result,
+    "llm_call": _narrate_llm,
+    "verdict": _narrate_verdict,
+    "verdict_verification": _narrate_verification,
+    "gate_requested": _narrate_gate_requested,
+    "gate_decision": lambda tag, p: f"{tag}GATE     {p.get('decision')}",
+    "action_executed": lambda tag, p: f"{tag}ACTION   {p.get('action')} executed",
+    "run_terminated": lambda tag, p: f"{tag}END      {p.get('reason')}",
+}
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -91,6 +202,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
             "Regenerate the L3 org-level threat posture brief immediately, "
             "regardless of the configured cadence (including cadence=0)."
         ),
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Narrate the run live to stderr (plan, tool calls, reasoning, verdict, gate).",
     )
     decision = parser.add_mutually_exclusive_group()
     decision.add_argument(
@@ -129,7 +246,7 @@ def _persist(result: RunResult, runs_dir: Path) -> Path:
     return record_path
 
 
-def _deps(llm: OpenAICompatibleLLM, journal: JsonlJournal, *, interactive: bool) -> TriageDeps:
+def _deps(llm: OpenAICompatibleLLM, journal: Journal, *, interactive: bool) -> TriageDeps:
     """Assemble the leaf dependency bundle from an already-built LLM + journal.
 
     The fresh ``--alert`` path uses the interactive ``CLIGate`` (the operator answers
@@ -155,7 +272,7 @@ def _deps(llm: OpenAICompatibleLLM, journal: JsonlJournal, *, interactive: bool)
     )
 
 
-def _run_fresh(alert_path: Path, runs_dir: Path) -> RunResult:
+def _run_fresh(alert_path: Path, runs_dir: Path, *, verbose: bool = False) -> RunResult:
     """Mint a Run, persist the Alert, and triage it end-to-end (the ``--alert`` path).
 
     The LLM is built FIRST: an unset ``LLM_API_KEY`` raises ``ConfigError`` here,
@@ -166,13 +283,22 @@ def _run_fresh(alert_path: Path, runs_dir: Path) -> RunResult:
     llm = OpenAICompatibleLLM()
     run_id = str(uuid.uuid4())
     run_dir = runs_dir / run_id
-    journal = JsonlJournal(run_dir)
+    journal: Journal = JsonlJournal(run_dir)
+    if verbose:
+        journal = _VerboseJournal(journal)
     _persist_alert(alert, run_dir)
     deps = _deps(llm, journal, interactive=True)
     return triage(alert, deps, run_id=run_id)
 
 
-def _run_resume(run_id: str, runs_dir: Path, *, approve: bool, deny: bool) -> RunResult:
+def _run_resume(
+    run_id: str,
+    runs_dir: Path,
+    *,
+    approve: bool,
+    deny: bool,
+    verbose: bool = False,
+) -> RunResult:
     """Reopen, rebuild, and continue a prior Run (the ``--resume`` path).
 
     Dispatches on the rebuilt journal tail: ``--approve`` / ``--deny`` complete a
@@ -184,7 +310,10 @@ def _run_resume(run_id: str, runs_dir: Path, *, approve: bool, deny: bool) -> Ru
     llm = OpenAICompatibleLLM()
     run_dir = runs_dir / run_id
     reconstructed = rebuild(run_dir / "journal.jsonl")
-    journal = JsonlJournal(run_dir)  # reopen: continues seq, truncates any torn line.
+    # Reopen: continues seq, truncates any torn line.
+    journal: Journal = JsonlJournal(run_dir)
+    if verbose:
+        journal = _VerboseJournal(journal)
     deps = _deps(llm, journal, interactive=False)
     if approve:
         return resume_approve(deps, reconstructed, run_id=run_id, by=_RESUME_BY)
@@ -270,9 +399,10 @@ def main(argv: list[str] | None = None, *, runs_dir: Path = _RUNS_DIR) -> int:
                 runs_dir,
                 approve=args.approve,
                 deny=args.deny,
+                verbose=args.verbose,
             )
         else:
-            result = _run_fresh(args.alert, runs_dir)
+            result = _run_fresh(args.alert, runs_dir, verbose=args.verbose)
     except TriageError as exc:
         print(f"error: {exc}", file=sys.stderr)  # noqa: T201 — CLI adapter: stderr is the point.
         return 1

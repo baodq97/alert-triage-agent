@@ -130,6 +130,96 @@ def test_main_runs_alert_persists_record_and_prints_summary(
     assert "Run record:" in out
 
 
+def test_main_verbose_narrates_run_to_stderr_and_keeps_stdout_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--verbose`` streams PLAN/TOOL/VERDICT/END lines to stderr; stdout and the
+    persisted journal are byte-identical in shape to a quiet run."""
+    alert_path = _write_alert(tmp_path)
+    runs_dir = tmp_path / "runs"
+    monkeypatch.setattr(run_module, "OpenAICompatibleLLM", lambda: FakeLLM(_script()))
+
+    exit_code = run_module.main(["--alert", str(alert_path), "--verbose"], runs_dir=runs_dir)
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    # Narration lands on stderr only.
+    assert "PLAN" in captured.err
+    assert "TOOL     lookup_user" in captured.err
+    assert "VERDICT  severity=high" in captured.err
+    assert "END      completed" in captured.err
+    assert "PLAN" not in captured.out
+    # The journal is still written through the wrapper, full event stream intact.
+    run_dirs = list(runs_dir.iterdir())
+    journal_events = [
+        json.loads(line)
+        for line in (run_dirs[0] / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert journal_events[0]["event"] == "run_started"
+    assert journal_events[-1]["event"] == "run_terminated"
+
+
+def test_verbose_journal_narration_covers_every_event_kind() -> None:
+    """Unit: each narrated event renders its line; unknown events stay quiet."""
+    narrate = run_module._VerboseJournal._narrate  # noqa: SLF001 — internal under test
+
+    plan = narrate(
+        "plan_created", {"steps": [{"tool": "lookup_user", "args": {"entity": "a"}}]}, "triage"
+    )
+    assert plan is not None
+    assert "PLAN     1 step(s)" in plan
+    assert "lookup_user" in plan
+
+    revise = narrate("plan_revised", {"steps": [{"tool": "query_logs", "args": {}}]}, "triage")
+    assert revise is not None
+    assert "REVISE   1 replacement step(s)" in revise
+
+    ok_result = narrate("tool_result", {"ok": True}, "triage")
+    assert ok_result == "         -> ok=True"
+    err_result = narrate("tool_result", {"ok": False, "error": "boom"}, "triage")
+    assert err_result is not None
+    assert "error=boom" in err_result
+
+    llm_line = narrate("llm_call", {"purpose": "plan", "tokens": 10, "latency_ms": 5.0}, "triage")
+    assert llm_line is not None
+    assert "LLM      plan" in llm_line
+
+    verdict_line = narrate(
+        "verdict", {"verdict": {"severity": "low", "confidence": 0.4, "findings": []}}, "triage"
+    )
+    assert verdict_line == "VERDICT  severity=low confidence=0.4 findings=0"
+    assert narrate("verdict", {"verdict": "opaque"}, "triage") == "VERDICT  shipped"
+
+    verify_clean = narrate("verdict_verification", {"action": "pass"}, "triage")
+    assert verify_clean == "VERIFY   pass"
+    verify_flagged = narrate(
+        "verdict_verification",
+        {"action": "degrade", "failed": ["coverage"], "uncovered_entities": ["1.2.3.4"]},
+        "triage",
+    )
+    assert verify_flagged is not None
+    assert "failed=['coverage']" in verify_flagged
+    assert "uncovered=['1.2.3.4']" in verify_flagged
+
+    gate_req = narrate("gate_requested", {"actions": [{}, {}]}, "triage")
+    assert gate_req == "GATE?    2 high-risk action(s) pending approval"
+    assert narrate("gate_decision", {"decision": "denied"}, "triage") == "GATE     denied"
+
+    action_line = narrate("action_executed", {"action": {"name": "block_user"}}, "triage")
+    assert action_line is not None
+    assert "ACTION" in action_line
+
+    # Delegated-agent events carry the agent tag.
+    ti_line = narrate("tool_called", {"tool": "ti.enrich", "args": {}}, "threat-intel")
+    assert ti_line is not None
+    assert ti_line.startswith("[threat-intel] ")
+
+    # Noise events (llm internals, run_started, memory) stay quiet.
+    assert narrate("run_started", {"alert_id": "x"}, "triage") is None
+
+
 def test_main_reads_argv_from_sys_when_none(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -281,6 +371,24 @@ def test_main_resume_deny_records_and_concludes(
     record = json.loads((runs_dir / run_id / "result.json").read_text(encoding="utf-8"))
     assert record["gate_decisions"][0]["decision"] == "denied"
     assert record["executed_actions"] == []
+
+
+def test_main_resume_verbose_narrates_to_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--resume --verbose`` wraps the reopened journal and narrates the gate."""
+    runs_dir = tmp_path / "runs"
+    run_id = "run-adapter-deny-verbose"
+    _park_run_via_adapter(run_id, runs_dir)
+    monkeypatch.setattr(run_module, "OpenAICompatibleLLM", lambda: FakeLLM([]))
+
+    exit_code = run_module.main(["--resume", run_id, "--deny", "--verbose"], runs_dir=runs_dir)
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "GATE     denied" in captured.err
 
 
 def test_main_resume_investigation_reads_alert_json_and_completes(
