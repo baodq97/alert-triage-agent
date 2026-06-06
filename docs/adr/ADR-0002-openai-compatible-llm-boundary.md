@@ -28,3 +28,4 @@ Use the `openai` SDK wire format as the only LLM interface. Provider, endpoint, 
 - (+) Local-model bonus collapses into configuration; reviewer runs with whatever key they have.
 - (+) One structured-output/repair code path to test.
 - (−) Anthropic models are reachable only via OpenAI-compatible gateways, and provider-specific features (caching, thinking) are unavailable — acceptable at this scope.
+- (−) **Data egress:** the full alert payload, tool observations, and recalled memory are sent to whatever endpoint `LLM_BASE_URL` points at. With the roadmap connectors (Splunk, Okta, CMDB) this content can carry real security data — operators handling sensitive alerts must point `LLM_BASE_URL` at a trusted or self-hosted endpoint. (Added 2026-06-06 from the STRIDE review; no code change — the configuration seam is the mitigation.)
