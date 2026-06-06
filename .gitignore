@@ -29,3 +29,4 @@ Thumbs.db
 # test artifacts
 .coverage
 htmlcov/
+.codegraph/

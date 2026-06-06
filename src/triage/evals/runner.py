@@ -100,6 +100,7 @@ class CaseReport:
     pending: bool
     tier1: list[ScoreResult] = field(default_factory=list)
     judge: JudgeResult | None = None
+    judge_min: float | None = None
     model: str = ""
     prompt_hashes: list[str] = field(default_factory=list)
 
@@ -112,6 +113,22 @@ class CaseReport:
     def gating_failed(self) -> bool:
         """Return whether this case fails the Tier-1 gate (pending never gates)."""
         return bool(self.tier1_failures) and not self.pending
+
+    @property
+    def judge_failed(self) -> bool:
+        """Return whether this case fails the soft Tier-2 judge gate.
+
+        Conditions: ``judge_min`` is set AND the judge scored (``scored=True``)
+        AND ``judge.score < judge_min``.  A not-scored judge (transport error,
+        no key) NEVER fails the soft gate — degradation must not block CI.
+        An absent ``judge_min`` is always False.  A pending case never triggers
+        the soft gate.
+        """
+        if self.pending or self.judge_min is None or self.judge is None:
+            return False
+        if not self.judge.scored or self.judge.score is None:
+            return False
+        return self.judge.score < self.judge_min
 
 
 def build_deps(
@@ -253,6 +270,7 @@ def evaluate_case(
         pending=case.pending is not None,
         tier1=tier1,
         judge=judge_result,
+        judge_min=case.judge_min,
         model=model,
         prompt_hashes=_prompt_hashes(run_record),
     )
@@ -309,6 +327,19 @@ def _build_live_llm() -> LLM:
     return OpenAICompatibleLLM()
 
 
+def _build_judge(llm: LLM) -> Any:  # noqa: ANN401 — duck-typed Judge; see evaluate_case.
+    """Build the live Tier-2 Judge (median-of-3, journal-free) for ``main``.
+
+    Lazy import for the same reason as ``_build_live_llm``: the replay path and
+    the deterministic suite never need the judge module's rubric load.
+    """
+    # Deliberate lazy import (rationale in the docstring above).
+    from triage.evals.judge import Judge  # noqa: PLC0415
+    from triage.journal import NoopJournal  # noqa: PLC0415
+
+    return Judge(llm=llm, journal=NoopJournal(), samples=3)
+
+
 def case_replay_path(case: GoldenCase, cases_dir: Path = _CASES_DIR) -> Path:
     """Return the replay-cache path that sits alongside ``case``'s YAML by name.
 
@@ -335,11 +366,17 @@ def main(argv: list[str] | None = None) -> int:
     In replay mode, a case whose ``.replay.json`` does not exist yet is skipped
     with a loud ``[NO CACHE]`` note in the report — it is never a hard failure and
     never gates.  This allows new cases to land before their live recording runs.
+
+    Live mode wires the Tier-2 Judge (median-of-3) for cases declaring
+    ``judge_min`` — the soft gate's only consumers (US-0007).  Judging every case
+    would triple live cost for advisory output nothing gates on; replay mode never
+    judges (the judge is an LLM, and replay is the key-free path).
     """
     args = argv if argv is not None else sys.argv[1:]
     replay = "--replay" in args
     cases = load_cases(_CASES_DIR)
     live_llm = None if replay else _build_live_llm()
+    judge = None if live_llm is None else _build_judge(live_llm)
     reports_and_skips: list[CaseReport | str] = []
     for case in cases:
         llm = _llm_for_case(case, live_llm)
@@ -350,14 +387,29 @@ def main(argv: list[str] | None = None) -> int:
                 "run 'make eval' (live) to record one before replaying",
             )
         else:
-            reports_and_skips.append(evaluate_case(case, llm))
+            case_judge = judge if case.judge_min is not None else None
+            reports_and_skips.append(evaluate_case(case, llm, judge=case_judge))
     reports = [r for r in reports_and_skips if isinstance(r, CaseReport)]
     lines = [format_report(reports)]
     skips = [s for s in reports_and_skips if isinstance(s, str)]
     if skips:
         lines.insert(0, "\n".join(skips))
+    tier1_failed = any(report.gating_failed for report in reports)
+    judge_soft_failed = any(report.judge_failed for report in reports)
+    if judge_soft_failed and not tier1_failed:
+        warn_lines = ["", "TIER-2 WARN — judge_min not met (soft gate, exit 2):"]
+        warn_lines.extend(
+            f"  {report.name}: score={report.judge.score} < judge_min={report.judge_min}"
+            for report in reports
+            if report.judge_failed and report.judge is not None
+        )
+        lines.append("\n".join(warn_lines))
     sys.stdout.write("\n".join(lines) + "\n")
-    return 1 if any(report.gating_failed for report in reports) else 0
+    if tier1_failed:
+        return 1
+    if judge_soft_failed:
+        return 2
+    return 0
 
 
 def _llm_for_case(case: GoldenCase, live_llm: LLM | None) -> LLM | None:

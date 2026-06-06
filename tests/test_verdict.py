@@ -502,7 +502,12 @@ def test_verdict_repair_not_emitted_on_clean_parse() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# F5 — action traceability backstop                                            #
+# F5 — action traceability backstop (re-homed to core._conclude_run, RFC-0003) #
+# --------------------------------------------------------------------------- #
+# The traceability filter moved from verdict.synthesize to core._conclude_run.
+# The tests below verify that synthesize() now PASSES actions through unchanged
+# (no filtering at the verdict layer), consistent with RFC-0003 §Module seams.
+# The end-to-end traceability behavior is tested in test_core.py.
 # --------------------------------------------------------------------------- #
 
 
@@ -548,8 +553,27 @@ def _untraceable_verdict_json() -> str:
     )
 
 
-def test_traceable_action_is_kept() -> None:
-    """An action whose param value appears in a finding is not dropped."""
+def test_synthesize_passes_through_actions_unfiltered() -> None:
+    """synthesize() no longer filters actions — traceability is enforced at core level.
+
+    RFC-0003 §Module seams: the verify hook (core._conclude_run) is the canonical
+    enforcement point for action traceability.  synthesize() passes through all
+    LLM-returned actions unchanged; filtering happens in the core degrade path.
+    """
+    journal = RecordingJournal()
+    synth = VerdictSynthesizer(llm=FakeLLM([_untraceable_verdict_json()]), journal=journal)
+
+    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
+
+    # Untraceable action passes through synthesize unchanged.
+    assert len(verdict.recommended_actions) == 1
+    assert verdict.recommended_actions[0].name == "block_user"
+    # No drop event emitted from synthesize.
+    assert "action_dropped_untraceable" not in [e for e, _, _ in journal.events]
+
+
+def test_synthesize_passes_through_traceable_action() -> None:
+    """A traceable action is still passed through by synthesize (no regression)."""
     journal = RecordingJournal()
     synth = VerdictSynthesizer(llm=FakeLLM([_traceable_verdict_json()]), journal=journal)
 
@@ -557,112 +581,11 @@ def test_traceable_action_is_kept() -> None:
 
     assert len(verdict.recommended_actions) == 1
     assert verdict.recommended_actions[0].name == "block_user"
-    # No drop event emitted.
-    names = [e for e, _, _ in journal.events]
-    assert "action_dropped_untraceable" not in names
-
-
-def test_untraceable_action_is_dropped_and_event_emitted() -> None:
-    """An action whose param value does not match any finding is dropped.
-
-    The drop must be journalled as ``action_dropped_untraceable`` with the action
-    payload and a reason string.
-    """
-    journal = RecordingJournal()
-    synth = VerdictSynthesizer(llm=FakeLLM([_untraceable_verdict_json()]), journal=journal)
-
-    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
-
-    assert verdict.recommended_actions == []
-    drop_events = [(e, p) for e, p, _ in journal.events if e == "action_dropped_untraceable"]
-    assert len(drop_events) == 1
-    _, payload = drop_events[0]
-    assert payload["action"]["name"] == "block_user"
-    assert "reason" in payload
-
-
-def test_traceability_case_insensitive() -> None:
-    """Matching is case-insensitive: 'Alice' in findings matches 'alice' in params."""
-    mixed_case_json = json.dumps(
-        {
-            "severity": "high",
-            "findings": [
-                {
-                    "statement": "ALICE performed suspicious actions.",
-                    "evidence": "Confirmed via logs.",
-                }
-            ],
-            "recommended_actions": [{"name": "block_user", "params": {"user": "alice"}}],
-            "confidence": 0.85,
-        }
-    )
-    journal = RecordingJournal()
-    synth = VerdictSynthesizer(llm=FakeLLM([mixed_case_json]), journal=journal)
-
-    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
-
-    assert len(verdict.recommended_actions) == 1
     assert "action_dropped_untraceable" not in [e for e, _, _ in journal.events]
 
 
-def test_targeted_no_params_action_kept_when_findings_exist() -> None:
-    """A targeted action with no string params is kept when at least one finding is present.
-
-    No string params means nothing to trace; for targeted actions the conservative
-    rule is: keep when there is at least one finding (so there is some evidence in
-    context), drop when finding-free.
-    """
-    no_params_json = json.dumps(
-        {
-            "severity": "medium",
-            "findings": [{"statement": "Something happened.", "evidence": "logs."}],
-            "recommended_actions": [{"name": "block_user", "params": {}}],
-            "confidence": 0.6,
-        }
-    )
-    journal = RecordingJournal()
-    synth = VerdictSynthesizer(llm=FakeLLM([no_params_json]), journal=journal)
-
-    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
-
-    assert len(verdict.recommended_actions) == 1
-    assert "action_dropped_untraceable" not in [e for e, _, _ in journal.events]
-
-
-def test_targeted_no_params_action_dropped_when_no_findings() -> None:
-    """A targeted action with no string params is dropped when there are no findings.
-
-    Design choice: only targeted actions (e.g. ``block_user``) are subject to
-    traceability.  An untargeted advisory action (e.g. ``notify_soc``) always
-    passes through — a capability fact never decides whether a human sees a
-    recommendation.  A targeted action with no string params is dropped when the
-    verdict is finding-free (conservative fallback: nothing to anchor it).
-    """
-    no_params_no_findings_json = json.dumps(
-        {
-            "severity": "low",
-            "findings": [],
-            "recommended_actions": [{"name": "block_user", "params": {}}],
-            "confidence": 0.5,
-        }
-    )
-    journal = RecordingJournal()
-    synth = VerdictSynthesizer(llm=FakeLLM([no_params_no_findings_json]), journal=journal)
-
-    verdict = synth.synthesize(_alert(), observations=_one_ok_obs())
-
-    assert verdict.recommended_actions == []
-    drop_events = [e for e, _, _ in journal.events if e == "action_dropped_untraceable"]
-    assert len(drop_events) == 1
-
-
-def test_untargeted_action_always_passes_traceability() -> None:
-    """An untargeted advisory action is never dropped by the traceability backstop.
-
-    Untargeted actions (e.g. ``notify_soc``) have channel/notification params that
-    are not entity identifiers — they must always pass through to the gate unchanged
-    because a capability fact must never suppress a recommendation a human should see.
-    """
+def test_synthesize_passes_through_untargeted_action() -> None:
+    """An untargeted advisory action is passed through by synthesize."""
     advisory_json = json.dumps(
         {
             "severity": "low",
@@ -681,14 +604,12 @@ def test_untargeted_action_always_passes_traceability() -> None:
     assert "action_dropped_untraceable" not in [e for e, _, _ in journal.events]
 
 
-def test_traceability_not_applied_on_zero_ok_path() -> None:
-    """The traceability backstop does not run on the ok_count == 0 path.
+def test_zero_ok_actions_stripped_by_clamp_not_traceability() -> None:
+    """On zero-ok, _clamp_by_evidence strips all actions (not traceability filter).
 
-    On zero-ok, ``_clamp_by_evidence`` already strips all actions.  The
-    traceability filter is only for the ok_count >= 1 path; testing both paths
-    do not double-drop is belt-and-suspenders.
+    synthesize() no longer has traceability filtering. _clamp_by_evidence still
+    strips actions on the ok_count == 0 path, independent of traceability.
     """
-    # _OVERCONFIDENT_JSON has an action but all observations are ok=False.
     no_ok = [ToolResult(tool="lookup_user", ok=False, error="not found")]
     journal = RecordingJournal()
     synth = VerdictSynthesizer(llm=FakeLLM([_OVERCONFIDENT_JSON]), journal=journal)

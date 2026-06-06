@@ -83,6 +83,22 @@ import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from triage.attribution import entities_in_text
+from triage.constants import (
+    AWAITING_APPROVAL,
+    COMPLETED,
+    ERROR,
+    EVT_ACTION_DROPPED_UNTRACEABLE,
+    EVT_ACTION_EXECUTED,
+    EVT_ACTION_REJECTED,
+    EVT_ACTION_SKIPPED,
+    EVT_GATE_DECISION,
+    EVT_RUN_STARTED,
+    EVT_RUN_TERMINATED,
+    EVT_TOOL_CALLED,
+    EVT_TOOL_RESULT,
+    EVT_VERDICT_VERIFICATION,
+)
 from triage.errors import GateError, JournalError, LLMError
 from triage.executor import Executor, ObservationEntry
 from triage.gate import is_hold
@@ -96,9 +112,12 @@ from triage.models import (
     Verdict,
 )
 from triage.planner import Planner
+from triage.rendering import dump_compact
 from triage.threat_intel import TIToolRegistry, classify_ioc, enrich
 from triage.tools.actions import block_user, block_user_target, is_targeted
 from triage.verdict import DEGRADED_CONFIDENCE, DEGRADED_SEVERITY, VerdictSynthesizer
+from triage.verification import VerificationResult
+from triage.verification import verify as _verify_verdict
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -141,6 +160,64 @@ def _ti_enabled_from_env() -> bool:
     """
     raw = os.environ.get("TI_ENABLED", "").strip().lower()
     return raw in {"1", "true", "yes"}
+
+
+def _verify_reentry_from_env() -> bool:
+    """Read ``VERIFY_REENTRY`` from the env; default is ``False`` (Phase 2 off).
+
+    Same parse pattern as ``TI_ENABLED``: truthy values are ``"1"``, ``"true"``,
+    ``"yes"`` (case-insensitive).  Phase 2 is gated on the Phase-1 false-flag
+    measurement (RFC-0003 §Phasing) — off by default until the calibration gate
+    is met.
+    """
+    raw = os.environ.get("VERIFY_REENTRY", "").strip().lower()
+    return raw in {"1", "true", "yes"}
+
+
+def _filter_traceable_verdict(
+    verdict: Verdict,
+    journal: Journal,
+) -> Verdict:
+    """Drop targeted actions whose entity param cannot be traced to a finding.
+
+    Re-homed from ``verdict._filter_traceable_actions`` to ``core._conclude_run``
+    (RFC-0003 §Module seams): the verify hook is the canonical enforcement point;
+    this helper runs on the Phase-1 degrade path (or when check 3 passes on the
+    normal path, it is a no-op since all actions survived).
+
+    Behaviour is byte-identical to the former ``verdict._filter_traceable_actions``
+    call — same filter logic, same ``action_dropped_untraceable`` events.
+
+    Only targeted actions are filtered.  Untargeted advisory actions always pass
+    through unchanged.
+    """
+    if not verdict.recommended_actions:
+        return verdict
+    # Caller only invokes this on the ok_count >= 1 path (positive-evidence path).
+    finding_corpus = " ".join(f.statement + " " + f.evidence for f in verdict.findings)
+    kept: list[Action] = []
+    for action in verdict.recommended_actions:
+        if not is_targeted(action):
+            kept.append(action)
+            continue
+        string_params = [v for v in (action.params or {}).values() if isinstance(v, str)]
+        if string_params:
+            traceable = bool(entities_in_text(finding_corpus, string_params))
+        else:
+            traceable = bool(verdict.findings)
+        if traceable:
+            kept.append(action)
+        else:
+            journal.emit(
+                EVT_ACTION_DROPPED_UNTRACEABLE,
+                {
+                    "action": action.model_dump(),
+                    "reason": "no finding names a param value of this action",
+                },
+            )
+    if len(kept) == len(verdict.recommended_actions):
+        return verdict
+    return verdict.model_copy(update={"recommended_actions": kept})
 
 
 @dataclass(frozen=True)
@@ -207,7 +284,7 @@ def triage(alert: Alert, deps: TriageDeps, *, run_id: str | None = None) -> RunR
         run_id = str(uuid.uuid4())
     try:
         deps.journal.emit(
-            "run_started",
+            EVT_RUN_STARTED,
             {
                 "alert_id": alert.alert_id,
                 "config": {"max_steps": deps.max_steps},
@@ -235,15 +312,15 @@ def _degraded_on_journal_error(deps: TriageDeps, run_id: str) -> RunResult:
         findings=[],
         recommended_actions=[],
         confidence=DEGRADED_CONFIDENCE,
-        terminated_reason="error",
+        terminated_reason=ERROR,
     )
-    _best_effort_terminate(deps.journal, "error")
+    _best_effort_terminate(deps.journal, ERROR)
     return RunResult(
         run_id=run_id,
         verdict=verdict,
         gate_decisions=[],
         executed_actions=[],
-        terminated_reason="error",
+        terminated_reason=ERROR,
     )
 
 
@@ -257,7 +334,7 @@ def _best_effort_terminate(journal: Journal, reason: TerminatedReason) -> None:
     # The journal is already known-broken; a secondary JournalError here has no
     # recovery left and is deliberately suppressed (the in-memory RunResult ships).
     with contextlib.suppress(JournalError):
-        journal.emit("run_terminated", {"reason": reason})
+        journal.emit(EVT_RUN_TERMINATED, {"reason": reason})
 
 
 def _conclude_run(
@@ -267,8 +344,9 @@ def _conclude_run(
     terminated_reason: TerminatedReason,
     *,
     run_id: str,
+    _reentry_used: bool = False,
 ) -> RunResult:
-    """The shared run *tail*: synthesize the Verdict, gate, and terminate.
+    """The shared run *tail*: synthesize the Verdict, verify, gate, and terminate.
 
     Reused by ``triage`` (fresh) and ``resume_investigation`` (interrupted Run) — it
     never emits ``run_started`` (the reopened journal already has it). On a ``HOLD``
@@ -281,14 +359,81 @@ def _conclude_run(
     renderer can use real executor step numbers (``entry.step``) instead of
     re-deriving them from position — preserving step fidelity when guard-refused
     steps create numbering gaps in the journal.
+
+    RFC-0003 §Verify hook (Phase 1 + Phase 2):
+
+    After synthesis, the deterministic verify hook runs over the Verdict and the
+    run's evidence trajectory.  The outcome is ALWAYS journaled as
+    ``verdict_verification``.
+
+    Phase 1 (always active): on hook failure, the verdict is degraded in-place —
+    targeted actions whose entity param cannot be traced to a finding are dropped
+    (same ``action_dropped_untraceable`` events as today; the filter logic is
+    re-homed from ``verdict._filter_traceable_actions`` to here).  The ``ok_count``
+    path logic is preserved: filtering only runs when ``ok_count >= 1`` (when
+    ``ok_count == 0``, ``_clamp_by_evidence`` already stripped all actions in
+    synthesize).
+
+    Phase 2 (``VERIFY_REENTRY=true``, default off): on hook failure with budget
+    remaining and re-entry unused, the planner is re-invoked with a gap note, the
+    resulting steps seed a fresh pending, the executor resumes, and the verdict is
+    re-synthesized once.  Re-entry is bounded to 1.  An empty re-plan degrades
+    (never loops).  The second ``verdict_verification`` event is then journaled.
+
+    ``_reentry_used`` is an internal flag that prevents a second re-entry on the
+    recursive call — it is NOT exposed to callers outside ``core.py``.
     """
+    observations = [entry.result for entry in observation_entries]
     synthesizer = VerdictSynthesizer(llm=deps.llm, journal=deps.journal)
     verdict = synthesizer.synthesize(
         alert,
-        observations=[entry.result for entry in observation_entries],
+        observations=observations,
         observation_steps=[entry.step for entry in observation_entries],
         terminated_reason=terminated_reason,
     )
+
+    # ---- RFC-0003 Verify hook ------------------------------------------------
+    # Run all four checks; ALWAYS emit verdict_verification for the first verdict.
+    verification = _verify_verdict(
+        verdict, observations, alert, call_args=[entry.args for entry in observation_entries]
+    )
+    hook_action = "pass" if verification.passed else "degrade"
+    deps.journal.emit(
+        EVT_VERDICT_VERIFICATION,
+        {
+            "checks": verification.checks,
+            "failed": verification.failed_checks,
+            "uncovered_entities": verification.uncovered_entities,
+            "failed_findings": verification.failed_findings,
+            "action": hook_action,
+        },
+    )
+
+    # Phase-2: on failure, with re-entry unused and flag on, attempt re-entry.
+    # The first verdict_verification is already journaled above; Phase-2 journals
+    # a SECOND verdict_verification for the re-synthesized verdict (RFC-0003
+    # §Phasing: "journal second verdict_verification").
+    if not verification.passed and not _reentry_used and _verify_reentry_from_env():
+        reentry_result = _attempt_reentry(
+            alert,
+            deps,
+            observation_entries,
+            run_id=run_id,
+            verification=verification,
+        )
+        if reentry_result is not None:
+            return reentry_result
+        # Empty re-plan → fall through to Phase-1 degrade.
+
+    # Phase-1 degrade: apply the action-traceability filter (re-homed from
+    # verdict.synthesize — byte-identical events and shipped verdict).
+    # Only runs when ok_count >= 1 (the ok_count == 0 path already stripped all
+    # actions via _clamp_by_evidence inside synthesize).
+    ok_count = sum(1 for obs in observations if obs.ok)
+    if ok_count >= 1:
+        verdict = _filter_traceable_verdict(verdict, deps.journal)
+    # ---- end verify hook -----------------------------------------------------
+
     # Persist L1 atoms at verdict time (RFC-0001 §Memory: "finding atoms persisted at
     # verdict time"). The guard is presence-only — any synthesized Verdict persists,
     # degraded or not: atoms are per-(entity, finding), so a degraded-but-with-findings
@@ -299,27 +444,161 @@ def _conclude_run(
     # parked Run's Verdict (persisted here before it parked) is never re-persisted. The
     # store is best-effort (swallows its own IO faults) — it cannot crash the Run.
     if deps.memory is not None:
-        deps.memory.persist(run_id, alert, verdict)
+        deps.memory.persist(run_id, alert, verdict, journal=deps.journal)
     accepted = _accept_actions(alert, verdict.recommended_actions, deps.journal)
     outcome = deps.gate.request(accepted, deps.policy)
     if is_hold(outcome):
-        deps.journal.emit("run_terminated", {"reason": "awaiting_approval"})
+        deps.journal.emit(EVT_RUN_TERMINATED, {"reason": AWAITING_APPROVAL})
         return RunResult(
             run_id=run_id,
             verdict=verdict,
             gate_decisions=[],
             executed_actions=[],
-            terminated_reason="awaiting_approval",
+            terminated_reason=AWAITING_APPROVAL,
         )
     decision = _as_decision(outcome)
     gate_decisions, executed = _resolve_gate(decision, accepted, deps)
-    deps.journal.emit("run_terminated", {"reason": terminated_reason})
+    deps.journal.emit(EVT_RUN_TERMINATED, {"reason": terminated_reason})
     return RunResult(
         run_id=run_id,
         verdict=verdict,
         gate_decisions=gate_decisions,
         executed_actions=executed,
         terminated_reason=terminated_reason,
+    )
+
+
+def _attempt_reentry(
+    alert: Alert,
+    deps: TriageDeps,
+    observation_entries: list[ObservationEntry],
+    *,
+    run_id: str,
+    verification: VerificationResult,
+) -> RunResult | None:
+    """Phase-2 verify re-entry: re-plan with the gap note, re-enter the executor.
+
+    Returns the ``RunResult`` from the re-entered run, or ``None`` if the re-plan
+    produced no steps (empty re-plan → caller degrades; never loops).
+
+    The gap note is a structured ``{kind, failed_checks, uncovered_entities}``
+    record rendered as an untrusted labeled block in the planner prompt's recall
+    channel (the existing untrusted-context path; no new injection surface).
+
+    Budget contract: the executor re-enters via its resume-style entry with
+    ``executor_pre_count = len(observation_entries)`` so the resumed budget
+    reflects all prior executor steps.  TI observations remain budget-free
+    (RFC-0002 §pre-step-0): the budget count uses ``executor_pre_count`` to
+    exclude them, matching the fresh-run contract.
+    """
+    # Build a structured gap note from the verification result.
+    gap_note_data = {
+        "kind": "verify_gap",
+        "failed_checks": verification.failed_checks,
+        "uncovered_entities": verification.uncovered_entities,
+        "failed_findings": verification.failed_findings,
+    }
+    gap_note_text = dump_compact(gap_note_data)
+    # Render as a labeled untrusted recall item (same channel as memory recall).
+    gap_recall = [
+        {
+            "run_id": run_id,
+            "confidence": 0.0,  # 0.0 = purely structural gap, not evidence quality
+            "content": (f"<verify_gap untrusted='true'>{gap_note_text}</verify_gap>"),
+        }
+    ]
+
+    # Re-plan with the gap note appended to the recall channel.
+    planner = Planner(llm=deps.llm, journal=deps.journal, tool_specs=deps.registry.specs())
+    try:
+        new_plan = planner.plan(alert, recall=gap_recall)
+    except LLMError:
+        return None  # Empty re-plan / LLM failure → degrade.
+
+    if not new_plan.steps:
+        # Empty re-plan: the planner produced nothing useful → degrade.
+        return None
+
+    # Record the re-plan as plan_created (re-entry semantics: this is a fresh
+    # plan revision for the re-investigation; the plan event was already emitted
+    # by planner.plan above, so no double-emit is needed here).
+
+    # Re-enter the executor via resume-style entry.
+    # Budget: all prior observation_entries consume budget; TI entries are
+    # budget-free so we count only non-TI entries.
+    executor_pre_count = sum(1 for e in observation_entries if e.tool != "threat_intel.enrich")
+    executor = Executor(
+        llm=deps.llm,
+        journal=deps.journal,
+        registry=deps.registry,
+        source=deps.source,
+        max_steps=deps.max_steps,
+    )
+    execution = executor.resume(
+        alert,
+        new_plan,
+        pre_observations=observation_entries,
+        next_step_index=0,  # Fresh plan: start from the first new step.
+        executor_pre_count=executor_pre_count,
+    )
+
+    # Re-synthesize the verdict with the combined trajectory.
+    new_observations = execution.observations
+    new_synthesizer = VerdictSynthesizer(llm=deps.llm, journal=deps.journal)
+    new_verdict = new_synthesizer.synthesize(
+        alert,
+        observations=[entry.result for entry in new_observations],
+        observation_steps=[entry.step for entry in new_observations],
+        terminated_reason=execution.terminated_reason,
+    )
+
+    # Re-verify the re-synthesized verdict (journals the second verdict_verification).
+    new_verification = _verify_verdict(
+        new_verdict,
+        [entry.result for entry in new_observations],
+        alert,
+        call_args=[entry.args for entry in new_observations],
+    )
+    hook_action = "pass" if new_verification.passed else "degrade"
+    deps.journal.emit(
+        EVT_VERDICT_VERIFICATION,
+        {
+            "checks": new_verification.checks,
+            "failed": new_verification.failed_checks,
+            "uncovered_entities": new_verification.uncovered_entities,
+            "failed_findings": new_verification.failed_findings,
+            "action": hook_action,
+        },
+    )
+
+    # Apply Phase-1 degrade on the re-synthesized verdict too.
+    new_ok_count = sum(1 for entry in new_observations if entry.result.ok)
+    if new_ok_count >= 1:
+        new_verdict = _filter_traceable_verdict(new_verdict, deps.journal)
+
+    # Ship: persist atoms, gate, terminate.
+    if deps.memory is not None:
+        deps.memory.persist(run_id, alert, new_verdict, journal=deps.journal)
+    accepted = _accept_actions(alert, new_verdict.recommended_actions, deps.journal)
+    outcome = deps.gate.request(accepted, deps.policy)
+    if is_hold(outcome):
+        deps.journal.emit(EVT_RUN_TERMINATED, {"reason": AWAITING_APPROVAL})
+        return RunResult(
+            run_id=run_id,
+            verdict=new_verdict,
+            gate_decisions=[],
+            executed_actions=[],
+            terminated_reason=AWAITING_APPROVAL,
+        )
+    decision = _as_decision(outcome)
+    gate_decisions, executed = _resolve_gate(decision, accepted, deps)
+    deps.journal.emit(EVT_RUN_TERMINATED, {"reason": execution.terminated_reason})
+    return RunResult(
+        run_id=run_id,
+        verdict=new_verdict,
+        gate_decisions=gate_decisions,
+        executed_actions=executed,
+        terminated_reason=execution.terminated_reason,
     )
 
 
@@ -368,7 +647,7 @@ def _enrich_iocs(alert: Alert, deps: TriageDeps) -> list[ObservationEntry]:
 
         # Emit the primary-loop wrapper pair (agent="triage") before delegation.
         deps.journal.emit(
-            "tool_called",
+            EVT_TOOL_CALLED,
             {"step": step, "tool": "threat_intel.enrich", "args": args, "attempt": 1},
         )
         report = enrich(
@@ -381,7 +660,7 @@ def _enrich_iocs(alert: Alert, deps: TriageDeps) -> list[ObservationEntry]:
                 data=report.model_dump(),
             )
             deps.journal.emit(
-                "tool_result",
+                EVT_TOOL_RESULT,
                 {"step": step, "attempt": 1, "ok": True, "data": result.data},
             )
         else:
@@ -391,7 +670,7 @@ def _enrich_iocs(alert: Alert, deps: TriageDeps) -> list[ObservationEntry]:
                 error="TI enrichment failed",
             )
             deps.journal.emit(
-                "tool_result",
+                EVT_TOOL_RESULT,
                 {"step": step, "attempt": 1, "ok": False, "error": result.error},
             )
         entries.append(
@@ -437,7 +716,7 @@ def _investigate(alert: Alert, deps: TriageDeps) -> tuple[list[ObservationEntry]
     try:
         plan = planner.plan(alert, recall=recall)
     except LLMError:
-        return ti_observations, "error"
+        return ti_observations, ERROR
 
     executor = Executor(
         llm=deps.llm,
@@ -496,7 +775,7 @@ def _accept_actions(
             accepted.append(action)
             continue
         journal.emit(
-            "action_rejected",
+            EVT_ACTION_REJECTED,
             {"action": action.model_dump(), "reason": reason},
         )
     return accepted
@@ -526,12 +805,12 @@ def _dispatch_action(action: Action, deps: TriageDeps) -> Action | None:
     executor = _ACTION_EXECUTORS.get(action.name)
     if executor is None:
         deps.journal.emit(
-            "action_skipped",
+            EVT_ACTION_SKIPPED,
             {"action": action.model_dump(), "reason": "no executor for action"},
         )
         return None
     result = executor(action)
-    deps.journal.emit("action_executed", {"action": action.model_dump(), "result": result})
+    deps.journal.emit(EVT_ACTION_EXECUTED, {"action": action.model_dump(), "result": result})
     return action
 
 
@@ -709,7 +988,7 @@ def resume_approve(
         GateError: The Run is not pending approval (no mutation occurs).
     """
     batch = _pending_batch(reconstructed, run_id)
-    deps.journal.emit("gate_decision", {"decision": "approved", "by": by})
+    deps.journal.emit(EVT_GATE_DECISION, {"decision": "approved", "by": by})
     decision = GateDecision(decision="approved", by=by)
     already = _executed_targets(reconstructed)
     executed: list[Action] = []
@@ -720,7 +999,7 @@ def resume_approve(
             executed.append(action)
             continue
         executed.extend(_execute_one(action, deps))
-    deps.journal.emit("run_terminated", {"reason": "completed"})
+    deps.journal.emit(EVT_RUN_TERMINATED, {"reason": COMPLETED})
     return _resumed_result(reconstructed, run_id, [decision], executed)
 
 
@@ -742,9 +1021,9 @@ def resume_deny(
         GateError: The Run is not pending approval (no mutation occurs).
     """
     _pending_batch(reconstructed, run_id)
-    deps.journal.emit("gate_decision", {"decision": "denied", "by": by})
+    deps.journal.emit(EVT_GATE_DECISION, {"decision": "denied", "by": by})
     decision = GateDecision(decision="denied", by=by)
-    deps.journal.emit("run_terminated", {"reason": "completed"})
+    deps.journal.emit(EVT_RUN_TERMINATED, {"reason": COMPLETED})
     return _resumed_result(reconstructed, run_id, [decision], [])
 
 
@@ -812,7 +1091,7 @@ def _resumed_result(
         verdict=verdict,
         gate_decisions=gate_decisions,
         executed_actions=executed,
-        terminated_reason="completed",
+        terminated_reason=COMPLETED,
     )
 
 

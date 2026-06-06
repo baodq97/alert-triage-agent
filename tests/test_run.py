@@ -66,7 +66,13 @@ def _script() -> list[str]:
     verdict = json.dumps(
         {
             "severity": "high",
-            "findings": [{"statement": "s", "evidence": "lookup_user"}],
+            "findings": [
+                {
+                    "statement": "svc-deploy-prod exfiltrated data.",
+                    "evidence": "lookup_user confirmed svc-deploy-prod",
+                    "related_entities": ["svc-deploy-prod"],
+                }
+            ],
             "recommended_actions": [],
             "confidence": 0.7,
         },

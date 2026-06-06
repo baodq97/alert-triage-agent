@@ -9,8 +9,9 @@ atom; recall hashes the key to locate the file.
 
 Levels (RFC-0001 §Memory):
 
-* **L1 — Finding Atoms** (``persist``): each ``(matchable entity, finding)`` pair
-  becomes one atom appended to that entity's file.
+* **L1 — Finding Atoms** (``persist``): each ``(attributed entity, finding)`` pair
+  becomes one atom appended to that entity's file.  Attribution follows ADR-0006's
+  resolution order (declared → detected → unattributed).
 * **L2 — Entity Dossier** (``dossier``): the deterministic group-by of all atoms
   for one entity, derived on read (dedupe by ``atom_id``, stably sorted). No LLM.
 * **Recall** (``recall``): the atoms for the *current alert's* entities only —
@@ -27,6 +28,28 @@ A memory failure must never crash a Run: ``persist`` and ``recall`` swallow
 filesystem and JSON-decode errors and degrade to a no-op / empty recall. No typed
 ``TriageError`` is raised from this module (none is warranted — the seam is
 best-effort), so nothing here crosses a module boundary as an exception.
+
+**ADR-0006 entity-attribution (US-0006):**
+
+``persist`` uses ``attribution.attribute_finding`` (ADR-0006's resolution order)
+rather than a cartesian fan-out.  Only the attributed entity values are keyed;
+a finding unattributed by both the declared and detection paths persists no atom
+and emits a ``finding_unattributed`` journal event — visible in the audit trail,
+never silently lost.
+
+Attribution VALIDATES against ``entities union context`` values (per ADR-0006 §1):
+a context entity value (e.g. a pipeline name) is a valid attribution target.
+However, ATOM KEYS remain envelope ``entities`` only: ``entity_type`` is looked
+up in ``alert.entities``; when a value matches only ``context`` (not in
+``entities``), it has no ``entity_type`` in the envelope, so no atom is written
+for that value — context-attributed findings go to the unattributed path.
+This preserves recall compatibility (recall scopes by alert entities, keyed on
+``entity_type``); context-only findings are surfaced via ``finding_unattributed``
+in the audit trail.
+
+**Existing stores:** no migration required.  Old cartesian atoms age out by
+confidence/recency ranking on recall; new attributed atoms simply score alongside
+them.  The append-only, idempotent atom contract makes coexistence safe.
 """
 
 from __future__ import annotations
@@ -38,13 +61,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from triage.attribution import _entity_type_for, attribute_finding
+from triage.constants import EVT_FINDING_UNATTRIBUTED
 from triage.memory.atoms import FindingAtom, atom_id_for
 from triage.memory.posture import load_posture_brief
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from triage.journal import Journal
     from triage.models import Alert, Verdict
+
+_UNATTRIBUTED_STATEMENT_MAX = 200
+"""Max chars for the statement field in ``finding_unattributed`` events."""
 
 _DEFAULT_BASE_DIR = ".memory"
 _ENV_VAR = "MEMORY_DIR"
@@ -67,19 +96,77 @@ class MemoryStore:
             base_dir = os.environ.get(_ENV_VAR, _DEFAULT_BASE_DIR)
         self.base_dir = Path(base_dir)
 
-    def persist(self, run_id: str, alert: Alert, verdict: Verdict) -> None:
-        """Persist one L1 atom per ``(matchable entity, finding)`` association.
+    def persist(
+        self,
+        run_id: str,
+        alert: Alert,
+        verdict: Verdict,
+        *,
+        journal: Journal | None = None,
+    ) -> None:
+        """Persist one L1 atom per ``(attributed entity, finding)`` association.
 
-        Findings carry no entity reference, so every finding associates with every
-        matchable alert entity (a scalar ``str`` value). Empty entities or empty
-        findings persist nothing. Writes are idempotent: an atom's id is
-        deterministic, so a resumed/replayed re-persist does not duplicate it.
+        Attribution follows ADR-0006's resolution order:
 
-        A filesystem failure is swallowed — a memory write never crashes a Run.
+        1. **Declared** — ``finding.related_entities`` is not ``None``: validated
+           against ``alert.entities union scalar string values of alert.context``; only
+           values matching an envelope entity (``alert.entities``) yield atoms —
+           context-only values emit ``finding_unattributed`` (see module docstring).
+        2. **Detected (fallback)** — ``finding.related_entities`` is ``None``: a
+           substring scan of the finding text against the known entity values.
+        3. **Unattributed** — neither path yields an envelope entity: no atom
+           persisted; a ``finding_unattributed`` event is emitted to ``journal``
+           when provided (``None`` = silent, preserving the leaf's best-effort
+           posture; ``core._conclude_run`` passes the real journal).
+
+        Atom KEYS are envelope ``entities`` only (``entity_type`` is looked up
+        from ``alert.entities``).  This preserves recall compatibility: recall
+        scopes by alert entities, keyed on ``entity_type``.
+
+        Empty entities or empty findings persist nothing. Writes are idempotent:
+        an atom's id is deterministic, so a resumed/replayed re-persist does not
+        duplicate it. A filesystem failure is swallowed — a memory write never
+        crashes a Run.
+
+        Args:
+            run_id: The Run's unique identifier (stamped on every atom).
+            alert: The Alert whose entity envelope defines valid atom keys.
+            verdict: The synthesized Verdict whose findings are attributed.
+            journal: Optional Journal for ``finding_unattributed`` events.  Pass
+                the real journal from ``core._conclude_run``; omit (or pass
+                ``None``) from ``_seed_memory`` (NoopJournal acceptable there).
         """
         atoms_by_entity: dict[tuple[str, str], list[FindingAtom]] = {}
-        for entity_type, entity_value in _matchable_entities(alert.entities):
-            for finding in verdict.findings:
+        for finding in verdict.findings:
+            attributed_values = attribute_finding(finding, alert)
+            # Filter to envelope entities only (context-only values have no
+            # entity_type in the envelope and cannot key an atom — see module
+            # docstring: "ATOM KEYS remain envelope entities only").
+            envelope_values = [
+                value
+                for value in attributed_values
+                if _entity_type_for(value, alert.entities) is not None
+            ]
+
+            if not envelope_values:
+                # Unattributed path: emit journal event when a journal is provided.
+                if journal is not None:
+                    journal.emit(
+                        EVT_FINDING_UNATTRIBUTED,
+                        {
+                            "statement": finding.statement[:_UNATTRIBUTED_STATEMENT_MAX],
+                            "reason": (
+                                "no alert entity attributed to this finding"
+                                " (declared empty or text-scan found nothing)"
+                            ),
+                        },
+                    )
+                continue
+
+            for entity_value in envelope_values:
+                entity_type = _entity_type_for(entity_value, alert.entities)
+                if entity_type is None:  # pragma: no cover  # defensive: filtered above
+                    continue  # safety guard — envelope_values only contains matched values
                 atom = FindingAtom(
                     atom_id=atom_id_for(
                         run_id=run_id,
@@ -153,7 +240,11 @@ class MemoryStore:
         """Append atoms to an entity file, swallowing any filesystem failure."""
         path = self._path_for(entity_type, entity_value)
         try:
-            self.base_dir.mkdir(parents=True, exist_ok=True)
+            # 0o700: the memory dir contains per-entity finding atoms that may
+            # contain sensitive org data; restrict to owner only. ``mkdir`` with
+            # mode is advisory when the process umask masks some bits — on those
+            # systems the effective permissions are already at least as tight.
+            self.base_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             lines = [
                 json.dumps(atom.model_dump(), sort_keys=True, ensure_ascii=False) for atom in atoms
             ]

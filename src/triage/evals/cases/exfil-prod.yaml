@@ -9,7 +9,8 @@
 # get_asset_info — both concluded correctly); pinning them flaps on reasonable
 # trajectories.
 name: exfil-prod
-alert: alerts/ALT-2026-04-7821-data-exfiltration.json
+alert: src/triage/evals/cases/alerts/ALT-2026-04-7821-data-exfiltration.json
+judge_min: 50                              # stable sentinel — median-of-3 scores 78-85 band
 expect:
   trajectory:
     must_call_tools: [lookup_user, query_logs]        # the account + the volume evidence are unavoidable

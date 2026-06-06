@@ -56,6 +56,17 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from triage.constants import (
+    COMPLETED,
+    ERROR,
+    EVT_LLM_CALL,
+    EVT_PLAN_REVISED,
+    EVT_TOOL_CALLED,
+    EVT_TOOL_RESULT,
+    MAX_STEPS,
+    NO_PROGRESS,
+    REVISE_EXHAUSTED,
+)
 from triage.errors import LLMError
 from triage.models import (
     Alert,
@@ -70,6 +81,7 @@ from triage.rendering import (
     dump_compact,
     journal_llm_callbacks,
     observation_tag,
+    render_guard_note,
     split_stable_dynamic,
     truncate,
 )
@@ -88,6 +100,14 @@ _PROMPT_PATH = Path(__file__).resolve().parents[2] / "prompts" / "reasoner.md"
 
 _DEFAULT_MAX_STEPS = 15
 _OBSERVATION_DATA_MAX_CHARS = 4000
+_NO_PROGRESS_THRESHOLD = 6
+"""K=6 consecutive ok=False observations trigger the no-progress backstop (RFC-0003 §Parameters).
+
+A conservative fixed safety constant: the recorded all-miss trajectories run
+3-4 failed steps before self-concluding, so K sits comfortably above that
+while staying well below MAX_STEPS=15.  Counter is reset on any ok=True
+observation; repeat-guard refusals do NOT advance it.
+"""
 
 
 def _truncate_data(serialized: str) -> str:
@@ -349,7 +369,7 @@ class Executor:
                 pending=state.pending,
             )
         except LLMError:
-            return ExecutionResult(observations=state.observations, terminated_reason="error")
+            return ExecutionResult(observations=state.observations, terminated_reason=ERROR)
         outcome = self._dispatch(decision, state.observations, pending=state.pending)
         if outcome.terminated is not None:
             return outcome.terminated
@@ -367,7 +387,7 @@ class Executor:
             if state.budget_used >= self._max_steps:
                 return ExecutionResult(
                     observations=state.observations,
-                    terminated_reason="max_steps",
+                    terminated_reason=MAX_STEPS,
                 )
             state.budget_used += 1
             state.step += 1
@@ -380,28 +400,44 @@ class Executor:
                 guard_notes=state.guard_notes,
             )
             # A2: track consecutive ok=False results and surface adapt notes.
-            if state.observations and not state.observations[-1].result.ok:
+            # Repeat-guard refusals do NOT advance this counter (RFC-0003 §Decision):
+            # a refused step produces no Observation, so state.observations is unchanged
+            # and the last entry's ok flag is whatever it was before the guard fired.
+            # We detect a "new" observation by comparing against the step we just ran:
+            # if the latest observation's step equals the current step, a tool ran.
+            last_obs = state.observations[-1] if state.observations else None
+            new_obs_this_step = last_obs is not None and last_obs.step == state.step
+            if new_obs_this_step and not last_obs.result.ok:  # type: ignore[union-attr]
                 state.consecutive_miss_count += 1
-                obs = state.observations[-1]
+                obs = last_obs
                 if state.consecutive_miss_count == 1:
-                    note = (
-                        f"<guard_note>Step {state.step}: {obs.tool} failed for entity "
+                    detail = (
+                        f"{obs.tool} failed for entity "
                         f"'{obs.args.get('entity', '?')}' ({obs.result.error}). "
-                        "Adapt: try a different entity from the alert or a different "
-                        "tool.</guard_note>"
+                        "Adapt: try a different entity from the alert or a different tool."
                     )
                 else:
-                    note = (
-                        f"<guard_note>Step {state.step}: {obs.tool} failed for entity "
+                    detail = (
+                        f"{obs.tool} failed for entity "
                         f"'{obs.args.get('entity', '?')}' ({obs.result.error}). "
                         f"This is the {state.consecutive_miss_count}th consecutive "
                         "failure. Do not retry similar lookups — pivot to an entity or "
                         "tool you have NOT tried yet (especially an unverified entity "
                         "type such as user identity). Conclude only when no relevant "
-                        "untried tool/entity remains.</guard_note>"
+                        "untried tool/entity remains."
                     )
-                state.guard_notes.append(note)
-            else:
+                note_kind = "miss_1" if state.consecutive_miss_count == 1 else "miss_n"
+                state.guard_notes.append(render_guard_note(note_kind, state.step, detail))
+                # No-progress backstop: K=6 consecutive ok=False observations
+                # (RFC-0003 §Decision).  This fires AFTER emitting the adapt note so
+                # the last note is still in the trajectory — but BEFORE the reason call
+                # so no LLM token is spent on a provably-unrecoverable situation.
+                if state.consecutive_miss_count >= _NO_PROGRESS_THRESHOLD:
+                    return ExecutionResult(
+                        observations=state.observations,
+                        terminated_reason=NO_PROGRESS,
+                    )
+            elif new_obs_this_step:
                 state.consecutive_miss_count = 0
             try:
                 decision = self._reason(
@@ -411,7 +447,7 @@ class Executor:
                     pending=state.pending,
                 )
             except LLMError:
-                return ExecutionResult(observations=state.observations, terminated_reason="error")
+                return ExecutionResult(observations=state.observations, terminated_reason=ERROR)
             outcome = self._dispatch(decision, state.observations, pending=state.pending)
             if outcome.terminated is not None:
                 return outcome.terminated
@@ -419,7 +455,7 @@ class Executor:
 
         # The plan (and every revision) was exhausted without a ``conclude``: the
         # gathered Observations stand as a completed trajectory for the verdict.
-        return ExecutionResult(observations=state.observations, terminated_reason="completed")
+        return ExecutionResult(observations=state.observations, terminated_reason=COMPLETED)
 
     def _dispatch(
         self,
@@ -440,7 +476,7 @@ class Executor:
             return _Dispatch(
                 terminated=ExecutionResult(
                     observations=observations,
-                    terminated_reason="completed",
+                    terminated_reason=COMPLETED,
                     final_rationale=decision.rationale,
                 ),
             )
@@ -453,15 +489,17 @@ class Executor:
             # that count.  A multi-step revision would mean the count is no longer a
             # valid index — do not change this without updating the rebuild and resume
             # logic together.
-            self._journal.emit("plan_revised", {"steps": [decision.next_step.model_dump()]})
+            self._journal.emit(EVT_PLAN_REVISED, {"steps": [decision.next_step.model_dump()]})
             return _Dispatch(pending=[decision.next_step])
         if decision.decision == "revise_plan":
             # ``revise_plan`` with no ``next_step`` is a degenerate revision —
-            # there is nothing to run next, so the loop ends like a conclude.
+            # there is nothing to run next.  This terminates with ``revise_exhausted``
+            # (RFC-0003 §Decision) instead of laundering into ``completed``, so
+            # callers can distinguish "investigation concluded" from "planner gave up".
             return _Dispatch(
                 terminated=ExecutionResult(
                     observations=observations,
-                    terminated_reason="completed",
+                    terminated_reason=REVISE_EXHAUSTED,
                     final_rationale=decision.rationale,
                 ),
             )
@@ -487,11 +525,12 @@ class Executor:
         """
         key = (plan_step.tool, _args_key(plan_step.args))
         if key in attempted:
-            guard_notes.append(
-                f"Step {step}: refused to repeat the identical call "
+            detail = (
+                f"refused to repeat the identical call "
                 f"{plan_step.tool}({_args_key(plan_step.args)}) — choose a different "
-                "tool or arguments, or conclude.",
+                "tool or arguments, or conclude."
             )
+            guard_notes.append(render_guard_note("repeat_guard", step, detail))
             return
         attempted.add(key)
 
@@ -503,11 +542,11 @@ class Executor:
                 error=f"unknown tool '{plan_step.tool}' — not a registered investigation tool",
             )
             self._journal.emit(
-                "tool_called",
+                EVT_TOOL_CALLED,
                 {"step": step, "tool": plan_step.tool, "args": dict(plan_step.args), "attempt": 1},
             )
             self._journal.emit(
-                "tool_result",
+                EVT_TOOL_RESULT,
                 {"step": step, "attempt": 1, "ok": False, "error": result.error},
             )
         else:
@@ -516,7 +555,7 @@ class Executor:
                 plan_step.args,
                 self._source,
                 before_attempt=lambda attempt: self._journal.emit(
-                    "tool_called",
+                    EVT_TOOL_CALLED,
                     {
                         "step": step,
                         "tool": plan_step.tool,
@@ -525,7 +564,7 @@ class Executor:
                     },
                 ),
                 after_attempt=lambda attempt, r: self._journal.emit(
-                    "tool_result",
+                    EVT_TOOL_RESULT,
                     {"step": step, "attempt": attempt, "ok": r.ok}
                     | ({"data": r.data} if r.ok else {"error": r.error}),
                 ),
@@ -571,7 +610,7 @@ class Executor:
             on_repair=on_repair,
         )
         self._journal.emit(
-            "llm_call",
+            EVT_LLM_CALL,
             {
                 "purpose": purpose,
                 "model": completion.model,

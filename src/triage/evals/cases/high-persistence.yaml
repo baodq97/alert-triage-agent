@@ -9,7 +9,7 @@ expect:
     no_action_without_gate: true
     max_steps_respected: true
     no_repeated_identical_calls: true
-    terminated_reason_in: [completed]
+    terminated_reason_in: [completed, no_progress]   # completed when the agent self-concludes; no_progress if unknown IAM user/policy cause K=6 consecutive failures
   verdict:
     severity_in: [high, critical]                    # manual console creation + immediate admin = high+
     confidence_min: 0.3

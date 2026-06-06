@@ -6,6 +6,7 @@
 # This is the RFC-0002 eval AC: "at least one golden case exercising delegation end-to-end".
 name: high-exfil-tor-ti
 alert: src/triage/evals/cases/alerts/high-exfil-tor-ti.json
+judge_min: 50                              # stable sentinel — median-of-3 scores 78-85 band
 gate: approve
 ti_enabled: true
 expect:

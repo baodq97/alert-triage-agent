@@ -87,7 +87,13 @@ Produce a Verdict:
   whether the observation confirms, contradicts, or cannot resolve the threat.
   NEVER assert findings the observations do not support. NEVER infer events
   tools did not observe. If all tools failed: name each entity that could not
-  be verified and state what this means for the risk assessment.
+  be verified and state what this means for the risk assessment. Each finding
+  must also declare `related_entities`: a list of the entity values from the
+  alert payload (user names, IPs, account IDs, hostnames, etc.) that this
+  specific finding is directly about. Use exact values from the alert — do not
+  paraphrase. If the finding covers no specific alert entity, declare an empty
+  list `[]`. This field determines which entity's memory the finding will be
+  stored under; an empty or omitted list means the finding is stored nowhere.
 - `recommended_actions`: response actions to take. Each must target an entity
   from the alert payload above; do not invent targets. Every recommended action
   must be traceable to at least one finding that names the same entity — if no

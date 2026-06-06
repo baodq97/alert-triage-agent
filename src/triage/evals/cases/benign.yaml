@@ -2,6 +2,7 @@
 # takes no high-risk action (a verdict that over-escalates a clean login regresses).
 name: benign
 alert: src/triage/evals/cases/alerts/benign.json
+judge_min: 50                              # stable sentinel — median-of-3 scores 78-85 band
 expect:
   trajectory:
     must_call_tools: [lookup_user]                   # at least confirm the user before dismissing

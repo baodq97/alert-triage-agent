@@ -8,7 +8,8 @@
 # correctly) — pinning any of them fails reasonable trajectories, against the
 # eval-authoring principle that assertions fail on plausibly-broken agents only.
 name: priv-esc
-alert: alerts/ALT-2026-04-7835-privilege-escalation.json
+alert: src/triage/evals/cases/alerts/ALT-2026-04-7835-privilege-escalation.json
+judge_min: 50                              # stable sentinel — median-of-3 scores 78-85 band
 expect:
   trajectory:
     must_call_tools: [lookup_user]                   # the IAM user is the unavoidable lead

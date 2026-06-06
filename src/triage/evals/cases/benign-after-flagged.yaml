@@ -27,6 +27,7 @@ prior_runs:
       findings:
         - statement: svc-deploy-prod egressed 4.2GB of customer records to an external IP
           evidence: query_logs
+          related_entities: ["svc-deploy-prod"]
       recommended_actions: []
       confidence: 0.9
 expect:

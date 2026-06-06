@@ -76,7 +76,11 @@ def _verdict(**overrides: object) -> Verdict:
     base: dict[str, Any] = {
         "severity": "high",
         "findings": [
-            Finding(statement="Exfiltrated 5MB to a known-bad IP.", evidence="query_logs: flow 42"),
+            Finding(
+                statement="Exfiltrated 5MB to a known-bad IP.",
+                evidence="query_logs: flow 42",
+                related_entities=["10.0.0.9"],
+            ),
         ],
         "recommended_actions": [],
         "confidence": 0.9,
@@ -97,7 +101,13 @@ def _populate_store(store: MemoryStore) -> None:
         _verdict(
             severity="medium",
             confidence=0.6,
-            findings=[Finding(statement="Repeated connection to bad IP.", evidence="rep: flow")],
+            findings=[
+                Finding(
+                    statement="Repeated connection to bad IP.",
+                    evidence="rep: flow",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
     store.persist(
@@ -174,8 +184,27 @@ def test_brief_is_byte_identical_across_calls(tmp_path: Path) -> None:
 
 def test_deterministic_synthesis_is_bounded(tmp_path: Path) -> None:
     store = MemoryStore(base_dir=tmp_path)
-    findings = [Finding(statement=f"fact {i}", evidence=f"ev{i}") for i in range(50)]
+    # Use declared related_entities so atoms are persisted; test that synthesis
+    # stays within the posture cap even with many atoms.
+    findings = [
+        Finding(
+            statement=f"fact {i}",
+            evidence=f"ev{i}",
+            related_entities=["10.0.0.9"],
+        )
+        for i in range(50)
+    ]
     store.persist("run-big", _alert(), _verdict(findings=findings))
+    # Also persist a duplicate-statement atom (same run-id → same atom_id is
+    # idempotent, but two DIFFERENT runs with the same statement exercise the
+    # _top_n_atoms dedup path: seen_statements deduplicates by statement text).
+    store.persist(
+        "run-big-2",
+        _alert(alert_id="ALT-BIG2"),
+        _verdict(
+            findings=[Finding(statement="fact 0", evidence="ev0-2", related_entities=["10.0.0.9"])]
+        ),
+    )
     synth = PostureSynthesizer(base_dir=tmp_path)
 
     brief = synth.synthesize_deterministic()
@@ -566,3 +595,23 @@ def test_maybe_synthesize_posture_swallows_unexpected_exception(
         side_effect=RuntimeError("injected crash"),
     ):
         run_mod._maybe_synthesize_posture()  # type: ignore[union-attr]  # noqa: SLF001 — must not raise
+
+
+# --------------------------------------------------------------------------- #
+# RFC-0003 adjacent hardening: 0o700 permissions on posture write              #
+# --------------------------------------------------------------------------- #
+
+
+def test_posture_write_creates_base_dir_with_0o700(tmp_path: Path) -> None:
+    """PostureSynthesizer.write() creates the memory dir with mode 0o700.
+
+    Skipped on Windows where POSIX mode bits are not enforced.
+    """
+    if sys.platform == "win32":
+        return  # pragma: no cover  # POSIX permissions not applicable on Windows.
+    base = tmp_path / ".memory-posture-perm"
+    synth = PostureSynthesizer(base_dir=base)
+    synth.write("# test posture brief")
+    mode = base.stat().st_mode & 0o777
+    assert mode & 0o700 == 0o700, f"expected 0o700 bits set, got {oct(mode)}"
+    assert mode & 0o077 == 0, f"expected no group/other bits, got {oct(mode)}"

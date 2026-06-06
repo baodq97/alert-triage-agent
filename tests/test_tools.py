@@ -23,6 +23,7 @@ import pytest
 
 from triage.errors import ToolError
 from triage.models import Action, Alert, ToolResult
+from triage.threat_intel.tools import TIFixtureDataSource, TIToolRegistry
 from triage.tools import (
     BLOCK_USER_TARGET_KEY,
     DataSource,
@@ -156,6 +157,135 @@ def test_callbacks_fire_per_attempt_for_journal_observability(backoffs: list[int
 def test_execute_tool_runs_without_callbacks() -> None:
     result = execute_tool(_tool(), {"entity": "x"}, _ScriptedSource([{"a": 1}]))
     assert result.ok is True
+
+
+# --- args_schema enforcement (RFC-0003 §Parameters / US-0008 adjacent hardening) --
+
+
+def _schema_tool(schema: dict[str, Any]) -> InvestigationTool:
+    """Build a tool with a custom args_schema for schema-enforcement tests."""
+    return InvestigationTool(name="lookup_user", description="d", args_schema=schema)
+
+
+def test_args_schema_missing_required_key_returns_ok_false() -> None:
+    """A missing required key yields ok=False — never a crash or retry."""
+    schema = {
+        "type": "object",
+        "properties": {"entity": {"type": "string"}},
+        "required": ["entity"],
+    }
+    result = execute_tool(_schema_tool(schema), {}, _ScriptedSource([{"ok": 1}]))
+    assert result.ok is False
+    assert "missing required key 'entity'" in (result.error or "")
+
+
+def test_args_schema_wrong_type_returns_ok_false() -> None:
+    """A value of the wrong scalar type yields ok=False — never a crash."""
+    schema = {
+        "type": "object",
+        "properties": {"entity": {"type": "string"}},
+        "required": ["entity"],
+    }
+    result = execute_tool(_schema_tool(schema), {"entity": 123}, _ScriptedSource([{"ok": 1}]))
+    assert result.ok is False
+    assert "args violate schema" in (result.error or "")
+
+
+def test_args_schema_wrong_type_bool_for_number_returns_ok_false() -> None:
+    """A bool value for a 'number' type field yields ok=False (bool is int subclass)."""
+    schema = {
+        "type": "object",
+        "properties": {"count": {"type": "number"}},
+        "required": ["count"],
+    }
+    result = execute_tool(_schema_tool(schema), {"count": True}, _ScriptedSource([{"ok": 1}]))
+    assert result.ok is False
+    assert "args violate schema" in (result.error or "")
+
+
+def test_args_schema_valid_args_unaffected() -> None:
+    """Valid args pass the schema check and reach the tool normally."""
+    schema = {
+        "type": "object",
+        "properties": {"entity": {"type": "string"}},
+        "required": ["entity"],
+    }
+    result = execute_tool(
+        _schema_tool(schema),
+        {"entity": "alice"},
+        _ScriptedSource([{"role": "dev"}]),
+    )
+    assert result.ok is True
+    assert result.data == {"role": "dev"}
+
+
+def test_args_schema_violation_fires_both_callbacks() -> None:
+    """Schema violation still fires before_attempt(1) and after_attempt(1, result)."""
+    schema = {"type": "object", "required": ["entity"]}
+    before: list[int] = []
+    after: list[tuple[int, bool]] = []
+    result = execute_tool(
+        _schema_tool(schema),
+        {},
+        _ScriptedSource([]),
+        before_attempt=before.append,
+        after_attempt=lambda n, r: after.append((n, r.ok)),
+    )
+    assert result.ok is False
+    assert before == [1]
+    assert after == [(1, False)]
+
+
+def test_args_schema_violation_does_not_retry() -> None:
+    """A schema violation returns immediately without touching the source (no retry)."""
+    source = _ScriptedSource([])  # empty script — a real attempt would IndexError
+    schema = {"type": "object", "required": ["entity"]}
+    result = execute_tool(_schema_tool(schema), {}, source)
+    assert result.ok is False
+    assert source.calls == 0
+
+
+def test_args_schema_optional_key_absent_is_accepted() -> None:
+    """A key in properties but NOT in required is accepted even when absent from args."""
+    schema = {
+        "type": "object",
+        "properties": {"entity": {"type": "string"}, "extra": {"type": "string"}},
+        "required": ["entity"],
+    }
+    # "extra" is optional — absent from args but not in required, must pass.
+    result = execute_tool(
+        _schema_tool(schema),
+        {"entity": "alice"},
+        _ScriptedSource([{"ok": 1}]),
+    )
+    assert result.ok is True
+
+
+def test_args_schema_unknown_type_string_is_permissive() -> None:
+    """An unrecognised type string in the schema is silently accepted (permissive)."""
+    schema = {
+        "type": "object",
+        "properties": {"entity": {"type": "exotic_type_unknown_to_grammar"}},
+        "required": ["entity"],
+    }
+    # The unknown type "exotic_type_unknown_to_grammar" should not cause a schema
+    # error — the grammar is permissive at the edges.
+    result = execute_tool(
+        _schema_tool(schema),
+        {"entity": "alice"},
+        _ScriptedSource([{"ok": 1}]),
+    )
+    assert result.ok is True
+
+
+def test_args_schema_ti_tool_covered() -> None:
+    """TI tools use the same execute_tool path — schema enforcement covers them."""
+    # The TI tools use args_schema with required=["ioc"]; missing "ioc" → ok=False.
+    registry = TIToolRegistry()
+    tool = registry.get("multi_source_reputation")
+    result = execute_tool(tool, {}, TIFixtureDataSource())  # missing "ioc"
+    assert result.ok is False
+    assert "missing required key 'ioc'" in (result.error or "")
 
 
 def test_backoff_sleeps_the_configured_interval(monkeypatch: pytest.MonkeyPatch) -> None:
