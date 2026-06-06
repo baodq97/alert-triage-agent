@@ -10,3 +10,4 @@
 | [US-0006](./US-0006-memory-entity-attribution.md) | Memory v2: entity-attributed finding atoms | done | baodq97 | 2026-06-06 |
 | [US-0007](./US-0007-eval-judge-soft-gate.md) | Eval hardening: judge soft-gate, flake hardening, suite hygiene | done | baodq97 | 2026-06-06 |
 | [US-0008](./US-0008-loop-v2-verify-hook.md) | Agent loop v2: verify hook, no-progress backstop, structured termination | done | baodq97 | 2026-06-06 |
+| [US-0009](./US-0009-multi-model-eval-runner.md) | Multi-model eval runner: promote sweep to source + cross-model results | done | baodq97 | 2026-06-06 |

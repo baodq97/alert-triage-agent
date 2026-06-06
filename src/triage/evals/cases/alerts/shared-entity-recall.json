@@ -1,0 +1,18 @@
+{
+  "alert_id": "ALT-EVAL-SHAREDENT-0001",
+  "timestamp": "2026-06-05T02:40:00Z",
+  "source": "siem",
+  "severity_hint": "medium",
+  "event_type": "unusual_access_pattern",
+  "description": "User account 'user-payroll-erin' accessed 41 payroll records at 02:40 local time, well above the 30-day baseline (median: 4 reports/session). Access is within role permissions; no data transfer detected yet. Prior context from memory may be relevant.",
+  "entities": {
+    "user": "user-payroll-erin"
+  },
+  "context": {
+    "reports_accessed": 41,
+    "access_time": "02:40",
+    "baseline_median": 4,
+    "data_transfer_detected": false,
+    "note": "store also holds an unrelated prior incident for a DIFFERENT entity; entity-scoped recall must surface only user-payroll-erin's history"
+  }
+}

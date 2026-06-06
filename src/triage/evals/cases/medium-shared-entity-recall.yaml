@@ -1,0 +1,53 @@
+# Guards: cross-entity recall PRECISION end-to-end (US-0009 / ADR-0006).
+#
+# The store holds TWO prior incidents: a HIGH-confidence malicious finding for
+# the SHARED entity 'user-payroll-erin' (prior A), and an unrelated DISTRACTOR
+# incident for a DIFFERENT entity 'svc-batch-zeta' (prior B). The new ambiguous
+# alert names only user-payroll-erin. Entity-scoped recall must surface erin's
+# prior history (elevating this alert to at least medium) WITHOUT pulling in the
+# distractor — proving recall precision does not degrade as the store grows.
+#
+# The absence of cross-entity pollution is proven deterministically by
+# tests/test_memory.py::test_recall_shared_entity_precision_no_cross_pollution;
+# this golden case proves the same precision survives the full live loop.
+name: medium-shared-entity-recall
+alert: src/triage/evals/cases/alerts/shared-entity-recall.json
+prior_runs:
+  - run_id: ALT-EVAL-SHAREDENT-PRIOR-A-0001
+    alert: src/triage/evals/cases/alerts/shared-entity-recall-prior-a.json
+    verdict:
+      severity: high
+      findings:
+        - statement: user-payroll-erin exfiltrated 9 GB of payroll records to personal cloud storage
+          evidence: query_logs confirmed the transfer; check_reputation flagged the destination
+          related_entities: ["user-payroll-erin"]
+      recommended_actions: []
+      confidence: 0.9
+  - run_id: ALT-EVAL-SHAREDENT-PRIOR-B-0001
+    alert: src/triage/evals/cases/alerts/shared-entity-recall-prior-b.json
+    verdict:
+      severity: high
+      findings:
+        - statement: svc-batch-zeta attached PowerUserAccess to its own role without approval
+          evidence: query_logs showed the iam.attach_policy event
+          related_entities: ["svc-batch-zeta"]
+      recommended_actions: []
+      confidence: 0.85
+expect:
+  trajectory:
+    must_call_tools: [lookup_user]
+    gate_before_high_risk: true
+    no_action_without_gate: true
+    no_repeated_identical_calls: true
+    terminated_reason_in: [completed]
+  verdict:
+    severity_in: [medium, high]                # erin's recalled prior should elevate above low
+    confidence_min: 0.3
+    must_reference_entities: [user-payroll-erin]
+reference:
+  expected_tools:
+    - name: lookup_user
+  expected_severity: medium
+  expected_actions: []
+  ordered: false
+  exact: false

@@ -1,0 +1,15 @@
+{
+  "alert_id": "ALT-EVAL-SHAREDENT-PRIOR-B-0001",
+  "timestamp": "2026-05-25T14:30:00Z",
+  "source": "cloud-trail",
+  "severity_hint": "high",
+  "event_type": "privilege_escalation_attempt",
+  "description": "Unrelated DISTRACTOR incident: user 'svc-batch-zeta' attached an elevated policy to its own role. Seeds memory for a DIFFERENT entity that must NOT be recalled for the shared-entity case.",
+  "entities": {
+    "user": "svc-batch-zeta",
+    "policy_attached": "arn:aws:iam::aws:policy/PowerUserAccess"
+  },
+  "context": {
+    "note": "distractor: a different entity's history; entity-scoped recall must NOT surface this for user-payroll-erin"
+  }
+}

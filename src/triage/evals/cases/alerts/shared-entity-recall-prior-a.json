@@ -1,0 +1,17 @@
+{
+  "alert_id": "ALT-EVAL-SHAREDENT-PRIOR-A-0001",
+  "timestamp": "2026-05-22T10:00:00Z",
+  "source": "edr",
+  "severity_hint": "critical",
+  "event_type": "data_exfiltration",
+  "description": "User account 'user-payroll-erin' downloaded 9 GB of payroll records and transferred them to a personal cloud storage service. The account was suspended. This prior run seeds memory for the shared-entity recall case.",
+  "entities": {
+    "user": "user-payroll-erin",
+    "destination": "personal-cloud-storage"
+  },
+  "context": {
+    "bytes_exfiltrated": 9000000000,
+    "destination_type": "personal",
+    "note": "prior HIGH-confidence malicious run for the SHARED entity"
+  }
+}
