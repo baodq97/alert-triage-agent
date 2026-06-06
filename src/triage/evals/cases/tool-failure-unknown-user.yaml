@@ -9,7 +9,7 @@ expect:
     no_action_without_gate: true
     max_steps_respected: true
     no_repeated_identical_calls: true
-    terminated_reason_in: [completed]
+    terminated_reason_in: [completed, no_progress]   # completed when the agent self-concludes; no_progress if K=6 consecutive failures occur with a weak model
   verdict:
     severity_in: [low, medium, high, critical]       # point is a verdict exists at all; severity range is wide
     confidence_min: 0.0

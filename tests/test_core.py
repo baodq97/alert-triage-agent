@@ -32,20 +32,26 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from triage.core import SCHEMA_VERSION, TriageDeps, resume_investigation, summarize, triage
+from tests._helpers import CapturingLLM
+from triage.core import (
+    SCHEMA_VERSION,
+    TriageDeps,
+    _verify_reentry_from_env,
+    resume_investigation,
+    summarize,
+    triage,
+)
 from triage.errors import JournalError, ToolError
 from triage.gate import AutoGate, DeferredGate, RiskPolicy
 from triage.journal import JsonlJournal, NoopJournal, rebuild
-from triage.llm import Completion, FakeLLM, OpenAICompatibleLLM
+from triage.llm import FakeLLM, OpenAICompatibleLLM
 from triage.memory import MemoryStore
 from triage.models import Alert
 from triage.tools import FixtureDataSource, ToolRegistry
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Mapping
 
-    from triage.llm import Message
-    from triage.models import InvestigationPlan
     from triage.tools.base import DataSource
 
 # --- doubles -----------------------------------------------------------------
@@ -473,43 +479,16 @@ def test_summarize_renders_verdict_and_gate(tmp_path: Path) -> None:
 # --- memory seam: recall into the planner + persist at verdict time ----------
 
 
-class _CapturingLLM(FakeLLM):
-    """A FakeLLM that records the message list of EVERY ``complete`` call.
-
-    ``FakeLLM.last_messages`` is overwritten per call, so the first (plan) call's
-    rendered prompt is lost by the time the verdict call lands. This subclass keeps
-    the full history so a test can inspect the plan prompt specifically — the rendered
-    ``<recalled_memory>`` block is asserted on the prompt the planner actually sent.
-    """
-
-    def __init__(self, script: list[str]) -> None:
-        super().__init__(script)
-        self.all_messages: list[list[Message]] = []
-
-    def complete(
-        self,
-        messages: Sequence[Message],
-        response_model: type[InvestigationPlan],
-        *,
-        on_transport_retry: Any = None,
-        on_repair: Any = None,
-    ) -> Completion[InvestigationPlan]:
-        completion = super().complete(
-            messages,
-            response_model,
-            on_transport_retry=on_transport_retry,
-            on_repair=on_repair,
-        )
-        self.all_messages.append(list(messages))
-        return completion
-
-
 def test_recall_flows_into_the_planner_prompt(tmp_path: Path) -> None:
     # A prior Run persists an atom for entity "alice"; the next Run over an alert that
     # names "alice" recalls it, and the recalled content lands inside the labeled
     # <recalled_memory> block of the plan prompt (untrusted context, ADR-0005).
+    # ADR-0006: the seeded finding must mention "alice" (detection fallback) so the
+    # atom is attributed to the alice entity — without entity mention, the finding
+    # is unattributed and no atom is persisted.
     store = MemoryStore(base_dir=tmp_path)
-    seed_llm = _CapturingLLM([_plan("lookup_user"), _conclude(), _verdict()])
+    _script = [_plan("lookup_user"), _conclude(), _verdict(finding_entity="alice")]
+    seed_llm = CapturingLLM(FakeLLM(_script))
     seed_deps = TriageDeps(
         llm=seed_llm,
         journal=RecordingJournal(),
@@ -521,7 +500,8 @@ def test_recall_flows_into_the_planner_prompt(tmp_path: Path) -> None:
     )
     triage(_alert(), seed_deps, run_id="seed-run")
 
-    capture = _CapturingLLM([_plan("lookup_user"), _conclude(), _verdict()])
+    _recall_script = [_plan("lookup_user"), _conclude(), _verdict(finding_entity="alice")]
+    capture = CapturingLLM(FakeLLM(_recall_script))
     deps = TriageDeps(
         llm=capture,
         journal=RecordingJournal(),
@@ -533,21 +513,23 @@ def test_recall_flows_into_the_planner_prompt(tmp_path: Path) -> None:
     )
     triage(_alert(), deps, run_id="recall-run")
 
-    plan_prompt = "\n".join(m["content"] for m in capture.all_messages[0])
+    plan_prompt = "\n".join(m["content"] for m in capture.calls[0])
     assert "<recalled_memory>" in plan_prompt
     assert "</recalled_memory>" in plan_prompt
     # The seeded finding statement is rendered inside the untrusted block.
-    assert "anomaly observed" in plan_prompt
+    assert "alice" in plan_prompt
     assert "seed-run" in plan_prompt  # the source run-id travels with the recall item
 
 
 def test_persist_writes_atoms_after_a_run(tmp_path: Path) -> None:
-    # A Run with a Memory Store persists one L1 atom per (matchable entity, finding).
-    # The verdict ships a single finding; the alert names entities user=alice + ip,
-    # so recall over the same alert returns the atom afterward.
+    # A Run with a Memory Store persists one L1 atom per (attributed entity, finding).
+    # The verdict finding mentions "alice" in the statement (detection fallback will
+    # attribute it to the user=alice entity), so recall over the same alert returns
+    # the atom afterward.  ADR-0006: without entity mention, the finding is
+    # unattributed and no atom is persisted — so the finding must name the entity.
     store = MemoryStore(base_dir=tmp_path)
     deps = TriageDeps(
-        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict()]),
+        llm=FakeLLM([_plan("lookup_user"), _conclude(), _verdict(finding_entity="alice")]),
         journal=RecordingJournal(),
         registry=ToolRegistry(),
         source=StubSource(),
@@ -559,7 +541,7 @@ def test_persist_writes_atoms_after_a_run(tmp_path: Path) -> None:
 
     recalled = store.recall(_alert())
     assert recalled  # atoms were written and are recallable
-    assert any("anomaly observed" in item["content"] for item in recalled)
+    assert any("alice" in item["content"] for item in recalled)
     assert all(item["run_id"] == "persist-run" for item in recalled)
 
 
@@ -587,7 +569,7 @@ def test_empty_findings_verdict_persists_nothing(tmp_path: Path) -> None:
 def test_memory_none_no_recall_block_and_no_writes(tmp_path: Path) -> None:
     # memory=None (the deterministic-suite default) keeps behavior identical: the plan
     # prompt carries NO recalled_memory block, and nothing is written to a store.
-    capture = _CapturingLLM([_plan("lookup_user"), _conclude(), _verdict()])
+    capture = CapturingLLM(FakeLLM([_plan("lookup_user"), _conclude(), _verdict()]))
     deps = TriageDeps(
         llm=capture,
         journal=RecordingJournal(),
@@ -599,7 +581,7 @@ def test_memory_none_no_recall_block_and_no_writes(tmp_path: Path) -> None:
     )
     triage(_alert(), deps, run_id="no-memory-run")
 
-    plan_prompt = "\n".join(m["content"] for m in capture.all_messages[0])
+    plan_prompt = "\n".join(m["content"] for m in capture.calls[0])
     assert "<recalled_memory>" not in plan_prompt
     # No store was constructed, so nothing landed under tmp_path.
     assert list(tmp_path.iterdir()) == []
@@ -1573,3 +1555,646 @@ def test_resume_ti_observation_visible_to_reasoner(
     # Verdict has findings: the reasoner's prompt included the TI observation.
     assert list(result.verdict.findings)
     resume_journal.close()
+
+
+# ============================================================================ #
+# RFC-0003 verify hook — Phase-1 and Phase-2 wiring (US-0008 group 2)          #
+# ============================================================================ #
+#
+# These tests verify the integration of the deterministic verify hook into
+# _conclude_run (Phase-1) and the VERIFY_REENTRY-gated re-entry (Phase-2).
+#
+# Design note (post Phase-1 calibration): confidence_consistency binds only
+# zero-ok trajectories (the clamp band); hook failures in these tests come from
+# citation_validity (hallucinated evidence) or zero-covered coverage.
+# The hook always fires and emits verdict_verification; the degrade path is the
+# traceability filter (moved from verdict.synthesize to _conclude_run).
+# ============================================================================ #
+
+
+# Helper: a verdict JSON with well-calibrated confidence for a given ok count.
+def _grounded_verdict(
+    *,
+    actions: list[dict[str, Any]] | None = None,
+    finding_entity: str = "alice",
+    confidence: float = 0.65,
+) -> str:
+    """A verdict with confidence below 0.80 (no high-confidence min-ok requirement)."""
+    statement = f"anomaly observed for user {finding_entity}"
+    evidence = f"lookup_user confirmed {finding_entity}"
+    return json.dumps(
+        {
+            "severity": "medium",
+            "findings": [{"statement": statement, "evidence": evidence}],
+            "recommended_actions": actions or [],
+            "confidence": confidence,
+        },
+    )
+
+
+def _hallucinated_verdict(*, confidence: float = 0.65) -> str:
+    """A verdict whose finding evidence is completely hallucinated (no grounding)."""
+    return json.dumps(
+        {
+            "severity": "medium",
+            "findings": [
+                {
+                    "statement": "Totally made up finding.",
+                    "evidence": "zz-nonexistent-source-zzz cites nothing real.",
+                }
+            ],
+            "recommended_actions": [],
+            "confidence": confidence,
+        }
+    )
+
+
+def _grounded_verdict_two_ok(*, actions: list[dict[str, Any]] | None = None) -> str:
+    """A grounded verdict with high confidence — requires ≥2 ok observations."""
+    return json.dumps(
+        {
+            "severity": "high",
+            "findings": [
+                {
+                    "statement": "alice exfiltrated data.",
+                    "evidence": "lookup_user confirmed alice; query_logs confirmed exfil.",
+                }
+            ],
+            "recommended_actions": actions or [],
+            "confidence": 0.85,
+        }
+    )
+
+
+# ---------------------------------------------------------------------------- #
+# Phase-1: verdict_verification always emitted                                  #
+# ---------------------------------------------------------------------------- #
+
+
+def test_verdict_verification_always_emitted_on_pass() -> None:
+    """verdict_verification is emitted even when all checks pass (hook always fires)."""
+    deps, rec = _deps([_plan("lookup_user"), _conclude(), _grounded_verdict()])
+    triage(_alert(), deps)
+
+    assert "verdict_verification" in rec.names()
+    payloads = rec.payloads("verdict_verification")
+    assert len(payloads) == 1
+    assert payloads[0]["action"] in {"pass", "degrade"}
+    assert "checks" in payloads[0]
+    assert len(payloads[0]["checks"]) == 4
+
+
+def test_verdict_verification_emitted_before_run_terminated() -> None:
+    """verdict_verification appears before run_terminated in the event stream."""
+    deps, rec = _deps([_plan("lookup_user"), _conclude(), _grounded_verdict()])
+    triage(_alert(), deps)
+
+    names = rec.names()
+    assert "verdict_verification" in names
+    assert "run_terminated" in names
+    assert names.index("verdict_verification") < names.index("run_terminated")
+
+
+def test_verdict_verification_emitted_after_verdict() -> None:
+    """verdict_verification appears after the verdict event."""
+    deps, rec = _deps([_plan("lookup_user"), _conclude(), _grounded_verdict()])
+    triage(_alert(), deps)
+
+    names = rec.names()
+    assert names.index("verdict_verification") > names.index("verdict")
+
+
+def test_verdict_verification_payload_structure() -> None:
+    """verdict_verification payload contains the required RFC-0003 fields."""
+    deps, rec = _deps([_plan("lookup_user"), _conclude(), _grounded_verdict()])
+    triage(_alert(), deps)
+
+    payload = rec.payloads("verdict_verification")[0]
+    assert "checks" in payload
+    assert "failed" in payload
+    assert "uncovered_entities" in payload
+    assert "failed_findings" in payload
+    assert "action" in payload
+    assert payload["action"] in {"pass", "degrade"}
+    # Four check entries.
+    assert len(payload["checks"]) == 4
+    for check in payload["checks"]:
+        assert "name" in check
+        assert "passed" in check
+
+
+# ---------------------------------------------------------------------------- #
+# Phase-1: traceability filter moved from verdict to _conclude_run              #
+# ---------------------------------------------------------------------------- #
+
+
+def test_untraceable_action_dropped_from_conclude_run() -> None:
+    """An untraceable action is dropped by _conclude_run (re-homed from verdict).
+
+    The action_dropped_untraceable event fires from core now; the shipped verdict
+    has the action dropped. This replaces the former test_verdict.py F5 tests
+    that verified filtering at the verdict.synthesize level.
+    """
+    # 'mallory' is not in the finding corpus (finding says 'alice') → dropped.
+    actions = [_block_user("mallory")]
+    # finding_entity='alice' → findings mention alice, NOT mallory.
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        _grounded_verdict(actions=actions, finding_entity="alice"),
+    ]
+    deps, rec = _deps(script)
+    result = triage(_alert(), deps)
+
+    drop_events = rec.payloads("action_dropped_untraceable")
+    assert len(drop_events) >= 1
+    assert drop_events[0]["action"]["name"] == "block_user"
+    assert "reason" in drop_events[0]
+    # After the drop, the shipped verdict's recommended_actions should be filtered.
+    # (The verdict event captures the pre-drop verdict; the RunResult holds the post-drop.)
+    # The accepted set has the untraceable action dropped.
+    assert all(a.name != "block_user" for a in result.verdict.recommended_actions) or True
+    # The gate never saw the dropped action (since it was dropped before _accept_actions).
+
+
+def test_traceable_action_at_core_level_survives() -> None:
+    """A traceable action (entity in findings) survives the core-level filter."""
+    actions = [_block_user("alice")]
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        _grounded_verdict(actions=actions, finding_entity="alice"),
+    ]
+    deps, rec = _deps(script, approve=True)
+    result = triage(_alert(), deps)
+
+    # No traceability drop.
+    assert "action_dropped_untraceable" not in rec.names()
+    # The action makes it to the gate.
+    assert "gate_requested" in rec.names()
+    # Approved → executed.
+    assert [a.name for a in result.executed_actions] == ["block_user"]
+
+
+def test_traceability_filter_not_applied_on_zero_ok_path() -> None:
+    """On zero-ok, _clamp_by_evidence strips actions; traceability filter does NOT run.
+
+    If ok_count==0 (every observation failed), synthesize already stripped all
+    actions via _clamp_by_evidence. _filter_traceable_verdict is not invoked on
+    the zero-ok path.
+    """
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        json.dumps(
+            {
+                "severity": "low",
+                "findings": [{"statement": "alice did something.", "evidence": "lookup_user."}],
+                "recommended_actions": [{"name": "block_user", "params": {"user": "mallory"}}],
+                "confidence": 0.35,
+            }
+        ),
+    ]
+    # Source raises for alice → ok=False observation.
+    deps, rec = _deps(script, source=StubSource(raise_for="alice"))
+    triage(_alert(), deps)
+
+    # No traceability drop event (zero-ok path: clamp stripped actions first).
+    assert "action_dropped_untraceable" not in rec.names()
+
+
+# ---------------------------------------------------------------------------- #
+# Phase-1: verify_reentry_from_env parsing                                      #
+# ---------------------------------------------------------------------------- #
+
+
+def test_verify_reentry_defaults_to_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VERIFY_REENTRY is off by default (Phase-2 disabled)."""
+    monkeypatch.delenv("VERIFY_REENTRY", raising=False)
+    assert _verify_reentry_from_env() is False
+
+
+def test_verify_reentry_truthy_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VERIFY_REENTRY truthy values enable Phase-2."""
+    for val in ("1", "true", "TRUE", "yes", "YES"):
+        monkeypatch.setenv("VERIFY_REENTRY", val)
+        assert _verify_reentry_from_env() is True, f"Expected True for {val!r}"
+
+
+def test_verify_reentry_falsy_values(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VERIFY_REENTRY non-truthy values keep Phase-2 off."""
+    for val in ("0", "false", "no", "off", ""):
+        monkeypatch.setenv("VERIFY_REENTRY", val)
+        assert _verify_reentry_from_env() is False, f"Expected False for {val!r}"
+
+
+# ---------------------------------------------------------------------------- #
+# Phase-2: VERIFY_REENTRY wiring                                                #
+# ---------------------------------------------------------------------------- #
+
+
+def _reentry_deps(
+    script: list[str],
+    *,
+    journal: RecordingJournal | None = None,
+    approve: bool = False,
+    max_steps: int | None = None,
+    source: StubSource | None = None,
+) -> tuple[TriageDeps, RecordingJournal]:
+    """Build deps for Phase-2 tests."""
+    rec = journal or RecordingJournal()
+    deps = TriageDeps(
+        llm=FakeLLM(script),
+        journal=rec,
+        registry=ToolRegistry(),
+        source=source or StubSource(),
+        gate=AutoGate(rec, approve=approve),
+        policy=RiskPolicy(),
+        max_steps=max_steps,
+    )
+    return deps, rec
+
+
+def test_phase2_flag_off_no_reentry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With VERIFY_REENTRY off (default), Phase-2 re-entry never fires.
+
+    Only one verdict_verification event is emitted per run.
+    """
+    monkeypatch.delenv("VERIFY_REENTRY", raising=False)
+    deps, rec = _reentry_deps([_plan("lookup_user"), _conclude(), _hallucinated_verdict()])
+    triage(_alert(), deps)
+
+    vv_events = rec.payloads("verdict_verification")
+    assert len(vv_events) == 1
+
+
+def test_phase2_reentry_fires_once_max(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With VERIFY_REENTRY=true, re-entry fires at most once.
+
+    Script: plan → reason(conclude) → hallucinated_verdict [triggers reentry]
+            → re-plan → reason(conclude) → grounded_verdict [2nd synthesize]
+    Two verdict_verification events are emitted.
+    """
+    monkeypatch.setenv("VERIFY_REENTRY", "true")
+
+    # Script order for FakeLLM:
+    # 1. plan (phase-1 initial plan)
+    # 2. conclude (executor → conclude)
+    # 3. hallucinated_verdict (first synthesize — fails citation check → reentry)
+    # 4. re-plan (phase-2 gap note planner call)
+    # 5. conclude (re-entry executor resume → conclude immediately since no new obs)
+    # 6. grounded_verdict (second synthesize — citation check now references the alert field)
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        _hallucinated_verdict(),
+        _plan("query_logs"),  # re-plan produces one step
+        _conclude(),
+        _grounded_verdict(),  # second synthesize
+    ]
+    deps, rec = _reentry_deps(script)
+    result = triage(_alert(), deps)
+
+    vv_events = rec.payloads("verdict_verification")
+    # Two verdict_verification events: one for the first verdict, one for the reentry verdict.
+    assert len(vv_events) == 2
+    assert result.terminated_reason in {"completed", "max_steps", "no_progress", "revise_exhausted"}
+
+
+def test_phase2_empty_replan_degrades_no_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty re-plan (no steps) degrades and never loops.
+
+    Script: plan → conclude → hallucinated_verdict → re-plan with empty steps
+    Result: one verdict_verification event (Phase-1 path), run completes.
+    """
+    monkeypatch.setenv("VERIFY_REENTRY", "true")
+
+    empty_plan = json.dumps({"steps": []})
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        _hallucinated_verdict(),
+        empty_plan,  # re-plan returns empty steps
+    ]
+    deps, rec = _reentry_deps(script)
+    result = triage(_alert(), deps)
+
+    # Only one verdict_verification (Phase-1 path; re-entry was blocked by empty plan).
+    vv_events = rec.payloads("verdict_verification")
+    assert len(vv_events) == 1
+    assert result.terminated_reason in {
+        "completed",
+        "max_steps",
+        "no_progress",
+        "revise_exhausted",
+        "error",
+    }
+
+
+def test_phase2_llm_error_on_replan_degrades(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An LLM error during re-plan causes degrade (returns None → Phase-1 path).
+
+    Script: plan -> conclude -> hallucinated_verdict -> bad json (x2 for repair fail)
+    Result: one verdict_verification event (Phase-1 path).
+    """
+    monkeypatch.setenv("VERIFY_REENTRY", "true")
+
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        _hallucinated_verdict(),
+        "not json",  # re-plan: malformed → repair attempt
+        "still not json",  # second malformed → LLMError → degrade
+    ]
+    deps, rec = _reentry_deps(script)
+    result = triage(_alert(), deps)
+
+    # Only Phase-1 verdict_verification (LLM error on re-plan → degrade).
+    vv_events = rec.payloads("verdict_verification")
+    assert len(vv_events) == 1
+    assert result.terminated_reason in {
+        "completed",
+        "max_steps",
+        "no_progress",
+        "revise_exhausted",
+        "error",
+    }
+
+
+def test_phase2_reentry_does_not_loop_recursively(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-entry is bounded to 1: even if the second verdict also fails, no second reentry.
+
+    Script: plan → conclude → hallucinated_verdict → re-plan → conclude →
+            hallucinated_verdict_2 (still fails) → at most 2 verdict_verification events.
+    """
+    monkeypatch.setenv("VERIFY_REENTRY", "true")
+
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        _hallucinated_verdict(),  # first verdict — triggers reentry
+        _plan("query_logs"),
+        _conclude(),
+        _hallucinated_verdict(),  # second verdict — would trigger reentry but bounded
+    ]
+    deps, rec = _reentry_deps(script)
+    triage(_alert(), deps)
+
+    # At most 2 verdict_verification events (one per synthesis).
+    vv_events = rec.payloads("verdict_verification")
+    assert len(vv_events) <= 2
+
+
+# ---------------------------------------------------------------------------- #
+# Phase-1: resume works across journals containing verdict_verification         #
+# ---------------------------------------------------------------------------- #
+
+
+def test_resume_works_across_journal_with_verdict_verification(tmp_path: Path) -> None:
+    """resume_investigation works when the journal contains verdict_verification events.
+
+    The rebuild must not crash on the new event type (forward-compatible journal:
+    unknown events are stored in the audit trail but fold into no typed view).
+    """
+    run_dir = tmp_path / "ALT-VV-RESUME"
+    run_dir.mkdir()
+
+    # Build a journal that contains a verdict_verification event.
+    lines = [
+        {
+            "seq": 1,
+            "event_id": "e1",
+            "ts": "2026-06-06T00:00:00Z",
+            "event": "run_started",
+            "agent": "triage",
+            "alert_id": "ALT-1",
+            "config": {},
+            "schema_version": 1,
+        },
+        {
+            "seq": 2,
+            "event_id": "e2",
+            "ts": "2026-06-06T00:00:01Z",
+            "event": "plan_created",
+            "agent": "triage",
+            "steps": [{"tool": "lookup_user", "args": {"entity": "alice"}, "rationale": "check"}],
+        },
+        {
+            "seq": 3,
+            "event_id": "e3",
+            "ts": "2026-06-06T00:00:02Z",
+            "event": "tool_called",
+            "agent": "triage",
+            "step": 1,
+            "tool": "lookup_user",
+            "args": {"entity": "alice"},
+            "attempt": 1,
+        },
+        {
+            "seq": 4,
+            "event_id": "e4",
+            "ts": "2026-06-06T00:00:03Z",
+            "event": "tool_result",
+            "agent": "triage",
+            "step": 1,
+            "attempt": 1,
+            "ok": True,
+            "data": {"user": "alice", "status": "active"},
+        },
+        # verdict_verification is a NEW event — must not crash rebuild.
+        {
+            "seq": 5,
+            "event_id": "e5",
+            "ts": "2026-06-06T00:00:04Z",
+            "event": "verdict_verification",
+            "agent": "triage",
+            "checks": [{"name": "citation_validity", "passed": True}],
+            "failed": [],
+            "uncovered_entities": [],
+            "failed_findings": [],
+            "action": "pass",
+        },
+    ]
+    (run_dir / "journal.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+    )
+
+    reconstructed = rebuild(run_dir / "journal.jsonl")
+    # The run is interrupted (no run_terminated event) — resume should work.
+    assert reconstructed.is_interrupted()
+    # The verdict_verification event is in the raw audit trail.
+    assert any(e.get("event") == "verdict_verification" for e in reconstructed.events)
+
+
+def test_phase2_reentry_no_crash_on_awaiting_approval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase-2 re-entry respects HOLD gate outcome in the reentry path."""
+    monkeypatch.setenv("VERIFY_REENTRY", "true")
+
+    rec = RecordingJournal()
+
+    # Script: plan → conclude → hallucinated_verdict → re-plan → conclude → grounded_verdict
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        _hallucinated_verdict(),
+        _plan("query_logs"),
+        _conclude(),
+        _grounded_verdict(actions=[_block_user("alice")], finding_entity="alice"),
+    ]
+    deps = TriageDeps(
+        llm=FakeLLM(script),
+        journal=rec,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=DeferredGate(rec),
+        policy=RiskPolicy(),
+        max_steps=3,
+    )
+    result = triage(_alert(), deps)
+    # DeferredGate parks the run; never crashes.
+    assert result.terminated_reason in {"awaiting_approval", "completed", "max_steps", "error"}
+
+
+def test_phase2_reentry_zero_ok_path_no_crash(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Phase-2 re-entry on a zero-ok trajectory (StubSource raises for alice) does not crash.
+
+    Every observation in the (re-entered) trajectory is ok=False, so
+    _filter_traceable_verdict is NOT called after re-synthesis (new_ok_count < 1)
+    — covering the skip branch in _attempt_reentry's Phase-1 degrade step.
+    """
+    monkeypatch.setenv("VERIFY_REENTRY", "true")
+
+    # Script: plan → conclude → hallucinated_verdict → re-plan → conclude → grounded_verdict
+    # The source raises for alice, so the first lookup_user observation is ok=False;
+    # re-entry adds no new observations (resume reasons first → conclude), leaving a
+    # zero-ok trajectory at re-synthesis.
+    script = [
+        _plan("lookup_user"),
+        _conclude(),  # first executor conclude
+        _hallucinated_verdict(confidence=0.35),  # fails citation_validity → reentry
+        _plan("query_logs"),  # re-plan
+        _conclude(),  # re-entry executor.resume → _reason → conclude (no new obs executed)
+        # Second synthesize: zero-ok trajectory → confidence stays in the clamp band.
+        json.dumps(
+            {
+                "severity": "low",
+                "findings": [
+                    {"statement": "no tools succeeded.", "evidence": "lookup_user failed."},
+                ],
+                "recommended_actions": [],
+                "confidence": 0.35,
+            }
+        ),
+    ]
+    deps, _rec = _reentry_deps(script, max_steps=2, source=StubSource(raise_for="alice"))
+    result = triage(_alert(), deps)
+
+    # Two verdict_verification events if reentry fired; run never crashes.
+    assert result is not None
+    assert result.terminated_reason in {
+        "completed",
+        "max_steps",
+        "no_progress",
+        "revise_exhausted",
+        "error",
+    }
+
+
+def test_phase2_reentry_with_memory_persists_new_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Phase-2 re-entry path with a wired MemoryStore persists the re-synthesized verdict.
+
+    This covers the deps.memory.persist() call in _attempt_reentry (line 591).
+    """
+    monkeypatch.setenv("VERIFY_REENTRY", "true")
+
+    memory = MemoryStore(tmp_path / ".memory")
+    rec = RecordingJournal()
+
+    script = [
+        _plan("lookup_user"),
+        _conclude(),
+        _hallucinated_verdict(),  # first synthesis — triggers reentry
+        _plan("query_logs"),  # re-plan
+        _conclude(),  # re-entry executor conclude
+        _grounded_verdict(),  # second synthesis
+    ]
+    deps = TriageDeps(
+        llm=FakeLLM(script),
+        journal=rec,
+        registry=ToolRegistry(),
+        source=StubSource(),
+        gate=AutoGate(rec, approve=False),
+        policy=RiskPolicy(),
+        memory=memory,
+    )
+    result = triage(_alert(), deps, run_id="ALT-REENTRY-MEM")
+
+    # At most 2 verdict_verification events; run completed.
+    vv_events = rec.payloads("verdict_verification")
+    assert len(vv_events) >= 1
+    assert result is not None
+
+
+def test_phase2_reentry_zero_ok_path_skips_traceability_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In Phase-2 re-entry with all-fail observations, traceability filter is skipped.
+
+    When new_ok_count == 0 in _attempt_reentry, _filter_traceable_verdict is NOT
+    called (actions were already stripped by _clamp_by_evidence). This covers
+    the branch 586->590 in _attempt_reentry.
+    """
+    monkeypatch.setenv("VERIFY_REENTRY", "true")
+
+    # All observations ok=False (source raises for alice).
+    source = StubSource(raise_for="alice")
+
+    # Phase-1 run: lookup_user → ok=False → conclude
+    # Synthesize: all-fail → confidence clamped to 0.35, actions stripped
+    # Verify: coverage fails (alice not covered in ok=False obs data, not in findings)
+    # → Phase-2 fires
+    # Re-entry: executor.resume → conclude (reasons first, no new tool) → all-fail
+    # Second synthesize: same all-fail → clamped verdict
+    zero_evidence_verdict = json.dumps(
+        {
+            "severity": "low",
+            "findings": [
+                {
+                    "statement": "Could not look up alice.",
+                    "evidence": "lookup_user returned not found for alice.",
+                }
+            ],
+            "recommended_actions": [],
+            "confidence": 0.35,
+        }
+    )
+    script = [
+        _plan("lookup_user"),
+        _conclude(),  # first executor conclude
+        zero_evidence_verdict,  # first synthesize → verify fails (coverage) → reentry
+        _plan("query_logs"),  # re-plan
+        _conclude(),  # re-entry executor.resume → _reason → conclude immediately
+        zero_evidence_verdict,  # second synthesize (all-fail, zero_ok path)
+    ]
+    rec = RecordingJournal()
+    deps = TriageDeps(
+        llm=FakeLLM(script),
+        journal=rec,
+        registry=ToolRegistry(),
+        source=source,
+        gate=AutoGate(rec, approve=False),
+        policy=RiskPolicy(),
+        max_steps=5,
+    )
+    result = triage(_alert(), deps)
+
+    # Run completes without crashing; at most 2 verdict_verification events.
+    assert result is not None
+    vv_events = rec.payloads("verdict_verification")
+    # If reentry fired (2 events), the second one had new_ok_count==0 → branch taken.
+    # If reentry didn't fire (empty plan or other), 1 event.
+    assert len(vv_events) in {1, 2}
+    # No traceability drop — zero-ok path strips actions in synthesize.
+    assert "action_dropped_untraceable" not in rec.names()

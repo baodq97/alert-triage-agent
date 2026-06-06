@@ -16,6 +16,7 @@ Pinned contracts:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic import BaseModel
@@ -25,6 +26,7 @@ from triage.rendering import (
     dump_compact,
     journal_llm_callbacks,
     observation_tag,
+    render_guard_note,
     split_stable_dynamic,
     truncate,
 )
@@ -237,6 +239,36 @@ def test_journal_llm_callbacks_on_repair_emits_correct_event() -> None:
     assert event == "llm_repair"
     assert payload["purpose"] == "verdict"
     assert payload["error"] == "not valid json"
+
+
+# ---------------------------------------------------------------------------
+# render_guard_note (RFC-0003 step 4 — structured guard notes)
+# ---------------------------------------------------------------------------
+
+
+def test_render_guard_note_wraps_in_guard_note_tags() -> None:
+    """render_guard_note produces a <guard_note>...</guard_note> string."""
+    result = render_guard_note("miss_1", 3, "tool failed for entity 'alice'")
+    assert result.startswith("<guard_note>")
+    assert result.endswith("</guard_note>")
+
+
+def test_render_guard_note_body_is_valid_json() -> None:
+    """The body of a guard note is valid compact JSON."""
+    result = render_guard_note("repeat_guard", 5, "refused to repeat the call")
+    inner = result[len("<guard_note>") : -len("</guard_note>")]
+    parsed = json.loads(inner)
+    assert parsed["kind"] == "repeat_guard"
+    assert parsed["step"] == 5
+    assert "refused" in parsed["detail"]
+
+
+def test_render_guard_note_field_order_is_deterministic() -> None:
+    """The JSON fields appear in sorted key order (detail, kind, step)."""
+    result = render_guard_note("miss_n", 2, "consecutive failure")
+    inner = result[len("<guard_note>") : -len("</guard_note>")]
+    # Sorted order: detail < kind < step.
+    assert inner.index('"detail"') < inner.index('"kind"') < inner.index('"step"')
 
 
 def test_journal_llm_callbacks_purpose_captured_in_closure() -> None:

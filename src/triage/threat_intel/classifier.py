@@ -6,6 +6,13 @@ Internal or org-scoped identifiers always return ``None`` and never delegate.
 
 Classification algorithm (applied in order — first match wins):
 
+0. **Org-domain allowlist** (``TI_ORG_DOMAINS`` env var, comma-separated, empty
+   by default) — if ``entity_value`` equals or is a subdomain of any listed org
+   domain, classify ``None`` (internal, never delegated).  Empty env var = current
+   behavior (no allowlist).  Example: ``TI_ORG_DOMAINS=corp.example.com,acme.io``
+   means ``corp.example.com``, ``api.corp.example.com``, and ``*.acme.io`` all
+   return ``None`` without reaching step 1.
+
 1. **Public IP** — try to parse ``entity_value`` with ``ipaddress``; if it
    parses and is NOT in any private/reserved/loopback/link-local/multicast range
    as defined by ``ipaddress.ip_address.is_global``, classify ``"public_ip"``.
@@ -38,6 +45,7 @@ label from steering delegation.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 
 from triage.threat_intel.models import IOCType
@@ -51,7 +59,36 @@ _LABEL_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$|^[a-zA-Z0-9]$"
 # TLD must be two or more ASCII alpha characters (ICANN minimum).
 _TLD_RE = re.compile(r"^[a-zA-Z]{2,}$")
 
+_ENV_ORG_DOMAINS = "TI_ORG_DOMAINS"
+
 __all__ = ["IOCType", "classify_ioc"]
+
+
+def _org_domains() -> frozenset[str]:
+    """Return the set of configured org domains from ``TI_ORG_DOMAINS``.
+
+    Parses ``TI_ORG_DOMAINS`` (comma-separated, case-insensitive, leading/
+    trailing whitespace stripped).  An unset or empty env var returns the empty
+    frozenset, preserving existing behavior (no allowlist).
+    """
+    raw = os.environ.get(_ENV_ORG_DOMAINS, "")
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def _is_org_domain(value: str, org_domains: frozenset[str]) -> bool:
+    """Return ``True`` when ``value`` equals or is a subdomain of an org domain.
+
+    Comparison is case-insensitive.  ``value`` is a subdomain of ``org_domain``
+    when it ends with ``"." + org_domain`` (the dot prevents a partial label
+    match like ``evilcorp.example.com`` matching ``corp.example.com``).
+    """
+    if not org_domains:
+        return False
+    normalized = value.lower()
+    for org_domain in org_domains:
+        if normalized == org_domain or normalized.endswith("." + org_domain):
+            return True
+    return False
 
 
 def classify_ioc(entity_type: str, entity_value: str) -> str | None:  # noqa: ARG001 — entity_type intentionally unused (see module docstring).
@@ -69,6 +106,10 @@ def classify_ioc(entity_type: str, entity_value: str) -> str | None:  # noqa: AR
         external IOC; ``None`` for internal/org-scoped identifiers.
     """
     if not entity_value:
+        return None
+
+    # Step 0: Org-domain allowlist — configured internal domains are never delegated.
+    if _is_org_domain(entity_value, _org_domains()):
         return None
 
     # Step 1: IP address (public only).

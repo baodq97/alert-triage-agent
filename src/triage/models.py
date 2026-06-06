@@ -36,7 +36,14 @@ Severity = Literal["low", "medium", "high", "critical"]
 ReasonerVerb = Literal["continue", "revise_plan", "conclude"]
 """The Reasoner's decision after each Observation."""
 
-TerminatedReason = Literal["completed", "max_steps", "awaiting_approval", "error"]
+TerminatedReason = Literal[
+    "completed",
+    "max_steps",
+    "awaiting_approval",
+    "error",
+    "no_progress",
+    "revise_exhausted",
+]
 """Why a Run ended — shared by Verdict, RunResult, and the ``run_terminated`` event."""
 
 
@@ -94,10 +101,21 @@ class InvestigationPlan(_Lax):
 
 
 class Finding(_Lax):
-    """One evidence-backed fact derived from Observations, citing its source."""
+    """One evidence-backed fact derived from Observations, citing its source.
+
+    ``related_entities`` is the LLM-declared attribution field (ADR-0006 §Resolution
+    order step 1 — "Declared"): a list of entity values from the alert's known
+    entity values (``entities`` dict union scalar string values of ``context``) that
+    this finding is about.  Values are validated in code against the known entity
+    values — hallucinated names are dropped before any atom is persisted.  ``None``
+    (the default) triggers the detection fallback in ``attribution.py``; an empty
+    list signals "nothing attributed" and goes straight to the unattributed path
+    without scanning the text.
+    """
 
     statement: str = Field(min_length=1)
     evidence: str = Field(min_length=1)
+    related_entities: list[str] | None = None
 
 
 class Action(_Lax):

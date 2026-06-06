@@ -1,7 +1,7 @@
 ---
 id: US-0007
 title: "Eval hardening: judge soft-gate, flake hardening, suite hygiene"
-status: open
+status: done
 owner: baodq97
 date: 2026-06-06
 priority: P2
@@ -44,15 +44,15 @@ new golden cases (US-0008 adds the verify-hook cases).
 
 ## Acceptance criteria
 
-- [ ] A case with `judge_min: 50` whose median-of-3 score is below 50 → `make eval`
+- [x] A case with `judge_min: 50` whose median-of-3 score is below 50 → `make eval`
       exits 2, WARN section names the case and scores; Tier-1-only failures still exit 1;
       both failing → exit 1 (Tier-1 wins); all passing → exit 0
-- [ ] `judge_min` absent → zero behavior change (gating identical to today)
-- [ ] exfil-prod: 5 consecutive live runs pass `must_reference_entities` (was 1 failure
+- [x] `judge_min` absent → zero behavior change (gating identical to today)
+- [x] exfil-prod: 5 consecutive live runs pass `must_reference_entities` (was 1 failure
       in 6 logged live runs); no other case's Tier-1 regresses on the shared re-record
-- [ ] All 6 original cases' `alert:` paths use the `cases/alerts/` convention; suite green
-- [ ] One shared capturing-LLM test double; duplicates removed (grep proves it)
-- [ ] `make check` + `make eval` + `make eval-replay` green after the batched re-record
+- [x] All 6 original cases' `alert:` paths use the `cases/alerts/` convention; suite green
+- [x] One shared capturing-LLM test double; duplicates removed (grep proves it)
+- [x] `make check` + `make eval` + `make eval-replay` green after the batched re-record
 
 ## Success metric
 

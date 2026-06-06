@@ -172,6 +172,19 @@ class GoldenCase(_CaseModel):
     other.  The default ``False`` keeps every existing case byte-identical —
     TI code paths are off unless a case explicitly sets ``ti_enabled: true``.
     """
+    judge_min: float | None = None
+    """Per-case minimum Tier-2 judge score (median-of-3, 0-100 scale).
+
+    When set, a case whose judge score falls below this threshold fails the
+    soft gate (exit 2, ``TIER-2 WARN`` section) — but ONLY when a judge is
+    actually wired.  If no judge is passed to ``evaluate_case`` this field is
+    silently ignored and the gate behaviour is identical to a case without it.
+    A judge that returns ``scored=False`` (transport error, no key) also never
+    triggers the soft gate regardless of this value — degradation must not
+    block CI.  Only set on sentinel cases with demonstrably stable median
+    scores (≥ 60 band across 3+ sweeps); leave ``None`` on the known-hard
+    tail (tool-failure\\*, edge-\\*) whose scores vary run to run.
+    """
     prior_runs: list[PriorRun] | None = None
     expect_trajectory: TrajectoryExpect = Field(
         default_factory=TrajectoryExpect,

@@ -23,7 +23,7 @@ directly and script only Reasoner replies on the ``FakeLLM``. A tiny fake
 
 from __future__ import annotations
 
-import json
+import json as _json
 from typing import TYPE_CHECKING, Any
 
 from triage.errors import ToolError
@@ -106,7 +106,7 @@ def _decision(verb: str, *, next_step: PlanStep | None = None) -> str:
     payload: dict[str, Any] = {"decision": verb, "rationale": f"{verb} for a reason."}
     if next_step is not None:
         payload["next_step"] = next_step.model_dump()
-    return json.dumps(payload)
+    return _json.dumps(payload)
 
 
 def _executor(
@@ -203,14 +203,15 @@ def test_revise_plan_replaces_remaining_plan_and_emits_plan_revised() -> None:
     assert revised_event["steps"] == [revised.model_dump()]
 
 
-def test_revise_plan_without_next_step_terminates_completed() -> None:
+def test_revise_plan_without_next_step_terminates_revise_exhausted() -> None:
+    """A degenerate revise_plan (no next_step) terminates revise_exhausted (RFC-0003 step 2)."""
     journal = RecordingJournal()
     llm = FakeLLM([_decision("revise_plan")])
     executor = _executor(llm=llm, journal=journal)
 
     result = executor.run(_alert(), _plan(_step()))
 
-    assert result.terminated_reason == "completed"
+    assert result.terminated_reason == "revise_exhausted"
     assert result.final_rationale == "revise_plan for a reason."
     assert "plan_revised" not in journal.names()
     assert [o.tool for o in result.observations] == ["lookup_user"]
@@ -824,3 +825,202 @@ def test_run_initial_step_zero_budget_not_consumed_by_offset() -> None:
     # 1 step ran (numbered 6 = 5+1).
     assert len(result.observations) == 1
     assert result.observations[0].step == 6
+
+
+# --------------------------------------------------------------------------- #
+# RFC-0003 step 2: revise_exhausted                                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_revise_plan_without_next_step_emits_no_plan_revised() -> None:
+    """A degenerate revise (no next_step) never emits plan_revised — no step to replace."""
+    journal = RecordingJournal()
+    llm = FakeLLM([_decision("revise_plan")])
+    executor = _executor(llm=llm, journal=journal)
+
+    executor.run(_alert(), _plan(_step()))
+
+    assert "plan_revised" not in journal.names()
+
+
+# --------------------------------------------------------------------------- #
+# RFC-0003 step 3: no_progress backstop (K=6)                                  #
+# --------------------------------------------------------------------------- #
+
+
+def test_six_consecutive_misses_terminate_no_progress() -> None:
+    """K=6 consecutive ok=False observations trigger no_progress (RFC-0003 §Decision)."""
+    journal = RecordingJournal()
+    # 6 different failing entities so each call is distinct (no repeat-guard).
+    source = FixtureSource(raise_for={f"ghost{i}": ToolError("not found") for i in range(6)})
+    # The reasoner always continues so the backstop fires before a self-conclude.
+    llm = FakeLLM([_decision("continue")] * 6)
+    # Build a 6-step plan with distinct entities.
+    steps = [_step(entity=f"ghost{i}") for i in range(6)]
+    executor = _executor(llm=llm, journal=journal, source=source, max_steps=10)
+
+    result = executor.run(_alert(), InvestigationPlan(steps=steps))
+
+    assert result.terminated_reason == "no_progress"
+    # All 6 observations gathered before termination.
+    assert len(result.observations) == 6
+    # All observations are failures.
+    assert all(not o.result.ok for o in result.observations)
+
+
+def test_four_misses_then_conclude_still_self_concludes() -> None:
+    """3-4 consecutive misses followed by a conclude still terminates completed.
+
+    The backstop (K=6) must never preempt a capable model's own self-conclude.
+    """
+    journal = RecordingJournal()
+    source = FixtureSource(raise_for={f"ghost{i}": ToolError("not found") for i in range(4)})
+    steps = [_step(entity=f"ghost{i}") for i in range(4)]
+    # After 4 misses the model concludes on its own — before K is reached.
+    llm = FakeLLM([_decision("continue")] * 3 + [_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=source, max_steps=10)
+
+    result = executor.run(_alert(), InvestigationPlan(steps=steps))
+
+    assert result.terminated_reason == "completed"
+    assert len(result.observations) == 4
+
+
+def test_no_progress_counter_resets_on_ok_true() -> None:
+    """An ok=True observation resets the consecutive-miss counter.
+
+    5 misses + 1 success resets the counter to 0; the backstop never fires.
+    """
+    journal = RecordingJournal()
+    # 5 ghosts fail, then alice succeeds.
+    source = FixtureSource(raise_for={f"ghost{i}": ToolError("not found") for i in range(5)})
+    # 5 failing steps, then alice succeeds, then conclude.
+    steps = [_step(entity=f"ghost{i}") for i in range(5)] + [
+        _step(entity="alice"),
+    ]
+    llm = FakeLLM([_decision("continue")] * 5 + [_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=source, max_steps=10)
+
+    result = executor.run(_alert(), InvestigationPlan(steps=steps))
+
+    # Should conclude normally — the 5 misses were reset by the alice success.
+    assert result.terminated_reason == "completed"
+
+
+def test_repeat_guard_refusal_does_not_advance_no_progress_counter() -> None:
+    """Repeat-guard refusals do NOT advance the consecutive-miss counter (RFC-0003 §Decision).
+
+    A refused duplicate produces no Observation — the consecutive_miss_count
+    must not increment on a guard refusal.
+    """
+    journal = RecordingJournal()
+    # ghost always fails — 5 fails so far (counter = 5).
+    source = FixtureSource(raise_for={"ghost": ToolError("not found")})
+    dup = _step(entity="ghost")
+    # Plan: ghost (fails), ghost (refused by guard, no obs), then alice (succeeds).
+    # The guard refusal must NOT count as a 6th miss.
+    llm = FakeLLM(
+        [
+            _decision("revise_plan", next_step=dup),  # step 2 proposes same dup
+            _decision("conclude"),  # step 3 (alice) concludes
+        ]
+    )
+    # One failing step, then the dup is refused, then alice runs.
+    steps = [dup, _step(entity="bob")]
+    executor = _executor(llm=llm, journal=journal, source=source, max_steps=10)
+
+    result = executor.run(_alert(), InvestigationPlan(steps=steps))
+
+    # Would be no_progress if guard refusals wrongly incremented counter; must be completed.
+    assert result.terminated_reason in ("completed", "max_steps")
+    # Only one tool_called for ghost (the dup was refused, alice if executed).
+    ghost_calls = [
+        p
+        for e, p, _ in journal.events
+        if e == "tool_called"
+        and p.get("tool") == "lookup_user"
+        and p.get("args", {}).get("entity") == "ghost"
+    ]
+    assert len(ghost_calls) == 1
+
+
+# --------------------------------------------------------------------------- #
+# RFC-0003 step 4: structured guard notes                                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_guard_notes_are_structured_json_in_guard_note_tag() -> None:
+    """Guard/adapt notes are {kind, step, detail} records in <guard_note> tags."""
+    journal = RecordingJournal()
+    source = FixtureSource(raise_for={"ghost": ToolError("not found")})
+    llm = FakeLLM([_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal, source=source)
+
+    executor.run(_alert(), _plan(_step(entity="ghost")))
+
+    rendered = "\n".join(m["content"] for m in llm.last_messages)
+    assert "<guard_note>" in rendered
+    # The note is JSON-encoded inside the tag.
+    # Extract the guard_note content.
+    start = rendered.index("<guard_note>") + len("<guard_note>")
+    end = rendered.index("</guard_note>")
+    note_content = rendered[start:end]
+    parsed = _json.loads(note_content)
+    assert "kind" in parsed
+    assert "step" in parsed
+    assert "detail" in parsed
+    assert parsed["kind"] == "miss_1"
+    assert parsed["step"] == 1
+
+
+def test_repeat_guard_note_is_wrapped_in_guard_note_tag() -> None:
+    """The repeat-guard note is also wrapped in <guard_note> tags (RFC-0003 step 4)."""
+    journal = RecordingJournal()
+    dup = _step(entity="alice")
+    llm = FakeLLM([_decision("revise_plan", next_step=dup), _decision("conclude")])
+    executor = _executor(llm=llm, journal=journal)
+
+    executor.run(_alert(), _plan(dup))
+
+    # The second Reasoner call sees the guard note in a <guard_note> tag.
+    second_rendered = "\n".join(m["content"] for m in llm.messages_by_call[1])
+    assert "<guard_note>" in second_rendered
+    start = second_rendered.index("<guard_note>") + len("<guard_note>")
+    end = second_rendered.index("</guard_note>")
+    note_content = second_rendered[start:end]
+    parsed = _json.loads(note_content)
+    assert parsed["kind"] == "repeat_guard"
+    assert "refused to repeat" in parsed["detail"]
+
+
+# --------------------------------------------------------------------------- #
+# RFC-0003 adjacent hardening: args_schema enforcement via executor            #
+# --------------------------------------------------------------------------- #
+
+
+def test_executor_bad_args_plan_step_degrades_gracefully() -> None:
+    """A plan step with args violating the tool's schema yields ok=False, no crash.
+
+    The schema-violation ToolResult flows through as a normal ok=False observation
+    (with the standard tool_called + tool_result journal pair) and the run
+    concludes normally — the LLM can adapt from the failed observation.
+    """
+    journal = RecordingJournal()
+    # lookup_user requires {"entity": string}; passing {"entity": 999} violates it.
+    bad_step = PlanStep(tool="lookup_user", args={"entity": 999}, rationale="bad args")  # type: ignore[arg-type]
+    llm = FakeLLM([_decision("conclude")])
+    executor = _executor(llm=llm, journal=journal)
+
+    result = executor.run(_alert(), _plan(bad_step))
+
+    assert result.terminated_reason == "completed"
+    # The schema-violating step produced one observation, ok=False.
+    assert len(result.observations) == 1
+    assert result.observations[0].result.ok is False
+    assert "args violate schema" in (result.observations[0].result.error or "")
+    # Journal: tool_called then tool_result (normal pair) then llm_call.
+    event_names = journal.names()
+    assert "tool_called" in event_names
+    assert "tool_result" in event_names
+    result_event = next(p for e, p, _ in journal.events if e == "tool_result")
+    assert result_event["ok"] is False

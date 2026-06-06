@@ -1,0 +1,22 @@
+{
+  "alert_id": "ALT-2026-04-7835",
+  "timestamp": "2026-04-09T11:47:02Z",
+  "source": "cloud-trail",
+  "severity_hint": "medium",
+  "event_type": "privilege_escalation_attempt",
+  "description": "IAM user 'dev-intern-jpark' attached AdministratorAccess policy to their own role. No change request or approval ticket found. Action originated from a new device fingerprint not seen before for this user.",
+  "entities": {
+    "iam_user": "dev-intern-jpark",
+    "source_ip": "203.0.113.22",
+    "target_resource": "arn:aws:iam::123456789012:role/dev-intern-jpark-role",
+    "policy_attached": "arn:aws:iam::aws:policy/AdministratorAccess",
+    "environment": "staging"
+  },
+  "context": {
+    "user_tenure_days": 12,
+    "previous_max_privilege": "ReadOnlyAccess",
+    "device_fingerprint": "new_unknown",
+    "change_ticket_found": false,
+    "mfa_used": false
+  }
+}

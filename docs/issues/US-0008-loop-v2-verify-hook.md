@@ -1,7 +1,7 @@
 ---
 id: US-0008
 title: "Agent loop v2: verify hook, no-progress backstop, structured termination"
-status: in-progress
+status: done
 owner: baodq97
 date: 2026-06-06
 priority: P1
@@ -61,32 +61,32 @@ attribution itself (US-0006).
 
 ## Acceptance criteria
 
-- [ ] Code structure mirrors RFC-0003's tree: the PR description maps each branch of the
+- [x] Code structure mirrors RFC-0003's tree: the PR description maps each branch of the
       diagram to one code path; no undeclared transitions
-- [ ] Phase-1 calibration gate: the hook reports **0 failing checks** across all
+- [x] Phase-1 calibration gate: the hook reports **0 failing checks** across all
       recorded-correct verdicts when run over the replayed suite, and ≤10% on live
       re-runs of benign cases — measured numbers in the wave report
-- [ ] A verdict with a hallucinated citation (evidence matching no tool name, no
+- [x] A verdict with a hallucinated citation (evidence matching no tool name, no
       observation value, and no alert field) journals a failing `verdict_verification`
       and ships degraded (Phase 1); with `VERIFY_REENTRY=true` and budget remaining, the
       run re-plans against the gap note and re-enters at most once (pinned by test),
       then ships the re-synthesized verdict
-- [ ] Re-entry with empty re-plan output degrades (never loops); loop remains absolutely
+- [x] Re-entry with empty re-plan output degrades (never loops); loop remains absolutely
       bounded; never-crash preserved on every new path; resume works across journals
       containing the new events/reasons (rebuild test)
-- [ ] 6 consecutive ok=false steps → `no_progress` termination with a verdict; a
+- [x] 6 consecutive ok=false steps → `no_progress` termination with a verdict; a
       3-4-miss-then-self-conclude run (the recorded all-miss shape) still concludes
       itself; repeat-guard refusals do not advance the no-progress counter (pinned)
-- [ ] Degenerate revise terminates `revise_exhausted`, verdict ships
-- [ ] `terminated_reason` values and journal event names come from value-preserving
+- [x] Degenerate revise terminates `revise_exhausted`, verdict ships
+- [x] `terminated_reason` values and journal event names come from value-preserving
       constants (grep: no bare string literals at emit/termination sites; serialized
       `result.json`/journal bytes unchanged for existing reasons)
-- [ ] `execute_tool` rejects args violating the declared grammar as an ok=false
+- [x] `execute_tool` rejects args violating the declared grammar as an ok=false
       observation (not a crash), for primary and TI registries; TI allowlist knob
       excludes configured org domains
-- [ ] RFC-0003 §Success metrics Phase-1 rows measured and met on the re-recorded suite
+- [x] RFC-0003 §Success metrics Phase-1 rows measured and met on the re-recorded suite
       (Tier-1 green, judge mean ≥ 72, citation validity 100% pass-or-journaled)
-- [ ] `make check` 100% coverage; `make eval` + `make eval-replay` green
+- [x] `make check` 100% coverage; `make eval` + `make eval-replay` green
 
 ## Success metric
 

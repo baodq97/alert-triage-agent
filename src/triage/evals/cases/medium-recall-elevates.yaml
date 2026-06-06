@@ -19,6 +19,7 @@ prior_runs:
       findings:
         - statement: user-finops-charlie exfiltrated 12 GB of financial records to personal cloud storage
           evidence: query_logs confirmed the transfer; check_reputation flagged the destination
+          related_entities: ["user-finops-charlie"]
       recommended_actions: []
       confidence: 0.9
 expect:

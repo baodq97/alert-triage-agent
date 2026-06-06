@@ -168,7 +168,8 @@ class PostureSynthesizer:
         """
         path = self.base_dir / _POSTURE_FILENAME
         try:
-            self.base_dir.mkdir(parents=True, exist_ok=True)
+            # 0o700: memory dir contains sensitive org data; owner-only access.
+            self.base_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             path.write_text(brief[:POSTURE_CHAR_CAP], encoding="utf-8")
         except OSError:
             return  # A posture write failure must never crash a Run.
@@ -189,7 +190,8 @@ class PostureSynthesizer:
         """Overwrite the counter file; swallow any I/O failure."""
         path = self.base_dir / _COUNTER_FILENAME
         try:
-            self.base_dir.mkdir(parents=True, exist_ok=True)
+            # 0o700: same memory dir; keep permissions consistent with _append.
+            self.base_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             path.write_text(str(value), encoding="utf-8")
         except OSError:
             return  # A counter write failure must never crash a Run.

@@ -108,6 +108,18 @@ These rules mean `confidence_max` assertions on tool-failure cases are more mean
 3. Compare per-assertion results to the previous baseline (eval report includes model + prompt hashes from the journal)
 4. Tier-1 regression → fix or revert before merge; Tier-2 score drop → judgment call, note it
 
+## Judge sweep procedure (choosing judge_min values)
+
+Set `judge_min` only on cases with demonstrably stable median scores.  The procedure:
+
+1. **Record three independent live runs** of the case (re-record the `.replay.json` between sweeps so each run uses a fresh LLM call, not a cached response).
+2. **Collect the median-of-3 score** from each sweep run (`_workspace/run_dataset.py` logs `score:` per case in the `TIER-2 JUDGE` section).
+3. **Require the three sweep medians to cluster within a ≤ 20-point band** (e.g. 72, 78, 81 → band = 9 → stable; 60, 85, 78 → band = 25 → not yet stable).
+4. **Set judge_min = 50** (a conservative floor ≈ 30 points below the observed cluster centre) so routine LLM variance does not trip it.  Never set judge_min above 60 without a wider sweep (≥ 5 runs).
+5. **Do NOT set judge_min** on cases in the known-hard tail (`tool-failure-*`, `edge-*`) whose judge scores vary widely run to run — these will flap the soft gate.
+
+The 78–85 band observed across the quality-wave sweeps for the five sentinel cases (`exfil-prod`, `priv-esc`, `benign`, `high-gate-denied`, `high-exfil-tor-ti`) is the empirical basis for the `judge_min: 50` floor shipped with US-0007.
+
 ## Non-determinism handling
 
 Assertions are ranges/sets; if a case flaps, run it N=2–3 times and require majority pass — but first ask whether the assertion is too tight (severity_in too narrow, confidence_min too high). A flaky eval erodes trust faster than no eval.

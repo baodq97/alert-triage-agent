@@ -660,3 +660,29 @@ def test_rebuild_steps_after_last_revision_unaffected_by_ti_inner_rows(
     # The TI inner rows (step=1) and the TI wrapper (step=1, before revision)
     # must not inflate this counter.
     assert run.steps_after_last_revision == 1
+
+
+# --------------------------------------------------------------------------- #
+# RFC-0003 adjacent hardening: 0o700 permissions on the run dir                #
+# --------------------------------------------------------------------------- #
+
+
+import sys  # noqa: E402 — late import acceptable: test-only, platform guard reads it.
+
+
+def test_jsonl_journal_creates_run_dir_with_0o700(tmp_path: Path) -> None:
+    """JsonlJournal creates runs/ dirs with mode 0o700 (owner-only access).
+
+    Skipped on platforms where directory permissions are not enforced
+    (Windows does not honour POSIX mode bits).
+    """
+    if sys.platform == "win32":
+        return  # pragma: no cover  # POSIX permissions not applicable on Windows.
+    run_dir = tmp_path / "runs" / "ALT-perm-test"
+    journal = JsonlJournal(run_dir)
+    journal.emit("run_started", {"alert_id": "ALT-perm-test", "config": {}, "schema_version": 1})
+    journal._handle.close()  # noqa: SLF001 — close file handle for stat to reflect final state.
+    mode = run_dir.stat().st_mode & 0o777
+    # 0o700 or more restrictive (umask may tighten further — never looser for owner bits).
+    assert mode & 0o700 == 0o700, f"expected 0o700 bits set, got {oct(mode)}"
+    assert mode & 0o077 == 0, f"expected no group/other bits, got {oct(mode)}"

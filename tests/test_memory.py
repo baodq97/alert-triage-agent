@@ -20,6 +20,7 @@ Structural / determinism assertions only:
 from __future__ import annotations
 
 import json
+import sys
 from typing import TYPE_CHECKING, Any
 
 from triage.memory import MemoryStore
@@ -63,7 +64,11 @@ def _verdict(**overrides: object) -> Verdict:
     base: dict[str, Any] = {
         "severity": "high",
         "findings": [
-            Finding(statement="Exfiltrated 5MB to a known-bad IP.", evidence="query_logs: flow 42"),
+            Finding(
+                statement="Exfiltrated 5MB to a known-bad IP.",
+                evidence="query_logs: flow 42",
+                related_entities=["10.0.0.9"],
+            ),
         ],
         "recommended_actions": [],
         "confidence": 0.9,
@@ -133,7 +138,13 @@ def test_recall_ordering_is_deterministic(tmp_path: Path) -> None:
         _alert(),
         _verdict(
             confidence=0.3,
-            findings=[Finding(statement="low-confidence fact", evidence="ev")],
+            findings=[
+                Finding(
+                    statement="low-confidence fact",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
     store.persist(
@@ -141,7 +152,13 @@ def test_recall_ordering_is_deterministic(tmp_path: Path) -> None:
         _alert(),
         _verdict(
             confidence=0.95,
-            findings=[Finding(statement="high-confidence fact", evidence="ev")],
+            findings=[
+                Finding(
+                    statement="high-confidence fact",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
 
@@ -179,12 +196,12 @@ def test_dossier_is_deterministic_group_by(tmp_path: Path) -> None:
     store.persist(
         "run-b",
         _alert(),
-        _verdict(findings=[Finding(statement="b", evidence="ev")]),
+        _verdict(findings=[Finding(statement="b", evidence="ev", related_entities=["10.0.0.9"])]),
     )
     store.persist(
         "run-a",
         _alert(),
-        _verdict(findings=[Finding(statement="a", evidence="ev")]),
+        _verdict(findings=[Finding(statement="a", evidence="ev", related_entities=["10.0.0.9"])]),
     )
 
     first = store.dossier("ip", "10.0.0.9")
@@ -208,13 +225,27 @@ def test_missing_store_dir_recalls_nothing(tmp_path: Path) -> None:
 def test_non_scalar_entities_are_skipped(tmp_path: Path) -> None:
     store = MemoryStore(base_dir=tmp_path)
     alert = _alert(entities={"ip": "10.0.0.9", "ports": [22, 443], "meta": {"a": 1}, "x": None})
-    store.persist("run-1", alert, _verdict())
+    # The finding declares the scalar ip entity; non-scalar entities can't be declared.
+    verdict = _verdict(
+        findings=[
+            Finding(
+                statement="Suspicious traffic from 10.0.0.9.",
+                evidence="check_reputation",
+                related_entities=["10.0.0.9"],
+            )
+        ]
+    )
+    store.persist("run-1", alert, verdict)
 
     # The scalar ip persisted; the list/dict/None entities were skipped.
     assert store.dossier("ip", "10.0.0.9")
-    # A recall keyed only on a non-scalar entity finds nothing matchable.
-    no_match = _alert(alert_id="A2", entities={"ports": [22, 443]})
-    assert store.recall(no_match) == []
+    # A recall keyed only on non-scalar entities (list, dict, None) finds nothing
+    # matchable — exercises _matchable_entities for all non-str, non-list branches.
+    no_match_list = _alert(alert_id="A2", entities={"ports": [22, 443]})
+    assert store.recall(no_match_list) == []
+    # dict and None values are skipped by _matchable_entities (neither str nor list).
+    no_match_nonscalar = _alert(alert_id="A3", entities={"meta": {"a": 1}, "x": None})
+    assert store.recall(no_match_nonscalar) == []
 
 
 def test_empty_string_entities_persist_no_atoms_and_never_crash(tmp_path: Path) -> None:
@@ -226,6 +257,8 @@ def test_empty_string_entities_persist_no_atoms_and_never_crash(tmp_path: Path) 
 
     assert list(tmp_path.glob("*.jsonl")) == []
     assert store.recall(_alert(alert_id="A2", entities={"user": ""})) == []
+    # Recall with an empty-key entity also exercises _matchable_entities empty-name guard.
+    assert store.recall(_alert(alert_id="A3", entities={"": "x"})) == []
 
 
 def test_empty_findings_persists_no_atoms(tmp_path: Path) -> None:
@@ -294,7 +327,7 @@ def test_default_base_dir_falls_back_without_env(monkeypatch: pytest.MonkeyPatch
 def test_recall_caps_at_top_n(tmp_path: Path) -> None:
     store = MemoryStore(base_dir=tmp_path)
     findings = [
-        Finding(statement=f"fact {i}", evidence=f"ev {i}")
+        Finding(statement=f"fact {i}", evidence=f"ev {i}", related_entities=["10.0.0.9"])
         for i in range(MemoryStore.RECALL_TOP_N + 5)
     ]
     store.persist("run-1", _alert(), _verdict(findings=findings))
@@ -325,7 +358,8 @@ def test_atom_round_trips_through_jsonl(tmp_path: Path) -> None:
     line = path.read_text(encoding="utf-8").splitlines()[0]
     atom = FindingAtom.model_validate(json.loads(line))
 
-    assert atom.entity_value in {"10.0.0.9", "alice"}
+    # With the attributed persist, only the declared entity (10.0.0.9) gets an atom.
+    assert atom.entity_value == "10.0.0.9"
 
 
 # --------------------------------------------------------------------------- #
@@ -341,7 +375,13 @@ def test_equal_confidence_newer_atom_ranks_first(tmp_path: Path) -> None:
         _alert(timestamp="2024-01-01T00:00:00Z"),
         _verdict(
             confidence=0.7,
-            findings=[Finding(statement="older fact", evidence="ev")],
+            findings=[
+                Finding(
+                    statement="older fact",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
     store.persist(
@@ -349,7 +389,13 @@ def test_equal_confidence_newer_atom_ranks_first(tmp_path: Path) -> None:
         _alert(timestamp="2025-06-01T00:00:00Z"),
         _verdict(
             confidence=0.7,
-            findings=[Finding(statement="newer fact", evidence="ev")],
+            findings=[
+                Finding(
+                    statement="newer fact",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
 
@@ -373,7 +419,13 @@ def test_recall_breaks_confidence_ties_by_recency(tmp_path: Path) -> None:
         _alert(timestamp="2022-03-15T08:00:00Z"),
         _verdict(
             confidence=0.6,
-            findings=[Finding(statement="2022 finding", evidence="ev")],
+            findings=[
+                Finding(
+                    statement="2022 finding",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
     store.persist(
@@ -381,7 +433,13 @@ def test_recall_breaks_confidence_ties_by_recency(tmp_path: Path) -> None:
         _alert(timestamp="2026-01-01T00:00:00Z"),
         _verdict(
             confidence=0.6,
-            findings=[Finding(statement="2026 finding", evidence="ev")],
+            findings=[
+                Finding(
+                    statement="2026 finding",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
 
@@ -401,7 +459,13 @@ def test_higher_confidence_always_wins_regardless_of_recency(tmp_path: Path) -> 
         _alert(timestamp="2022-01-01T00:00:00Z"),
         _verdict(
             confidence=0.95,
-            findings=[Finding(statement="old high-conf", evidence="ev")],
+            findings=[
+                Finding(
+                    statement="old high-conf",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
     store.persist(
@@ -409,7 +473,13 @@ def test_higher_confidence_always_wins_regardless_of_recency(tmp_path: Path) -> 
         _alert(timestamp="2025-06-01T00:00:00Z"),
         _verdict(
             confidence=0.3,
-            findings=[Finding(statement="new low-conf", evidence="ev")],
+            findings=[
+                Finding(
+                    statement="new low-conf",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
         ),
     )
 
@@ -424,10 +494,19 @@ def test_higher_confidence_always_wins_regardless_of_recency(tmp_path: Path) -> 
 
 
 def test_list_entity_persists_and_recalls_per_item(tmp_path: Path) -> None:
-    """A list entity value yields one atom per non-empty str item."""
+    """A list entity value yields one atom per attributed str item."""
     store = MemoryStore(base_dir=tmp_path)
     alert = _alert(entities={"source_ips": ["1.2.3.4", "5.6.7.8"]})
-    store.persist("run-list", alert, _verdict())
+    verdict = _verdict(
+        findings=[
+            Finding(
+                statement="Traffic from both IPs was suspicious.",
+                evidence="check_reputation",
+                related_entities=["1.2.3.4", "5.6.7.8"],
+            )
+        ]
+    )
+    store.persist("run-list", alert, verdict)
 
     # Each IP in the list should produce a separate recall entry.
     recalled_first = store.recall(_alert(alert_id="A2", entities={"source_ips": ["1.2.3.4"]}))
@@ -435,14 +514,23 @@ def test_list_entity_persists_and_recalls_per_item(tmp_path: Path) -> None:
 
     assert recalled_first, "1.2.3.4 should have been persisted and recalled"
     assert recalled_second, "5.6.7.8 should have been persisted and recalled"
-    assert any("Exfiltrated" in item["content"] for item in recalled_first)
+    assert any("Traffic from both IPs" in item["content"] for item in recalled_first)
 
 
 def test_list_entity_skips_non_str_members(tmp_path: Path) -> None:
     """Non-str items in a list (int, None, dict) are skipped silently."""
     store = MemoryStore(base_dir=tmp_path)
     alert = _alert(entities={"ports": [22, None, {"nested": 1}, "valid-str"]})
-    store.persist("run-mixed", alert, _verdict())
+    verdict = _verdict(
+        findings=[
+            Finding(
+                statement="Activity on valid-str port was suspicious.",
+                evidence="check_reputation",
+                related_entities=["valid-str"],
+            )
+        ]
+    )
+    store.persist("run-mixed", alert, verdict)
 
     # Only the valid str item ("valid-str") should produce atoms.
     recalled = store.recall(_alert(alert_id="A2", entities={"ports": ["valid-str"]}))
@@ -457,7 +545,16 @@ def test_list_entity_skips_empty_strings(tmp_path: Path) -> None:
     """Empty strings inside a list are not persisted (min_length violation guard)."""
     store = MemoryStore(base_dir=tmp_path)
     alert = _alert(entities={"ips": ["", "  ", "10.0.0.1"]})
-    store.persist("run-empty-list", alert, _verdict())
+    verdict = _verdict(
+        findings=[
+            Finding(
+                statement="Traffic from 10.0.0.1.",
+                evidence="check_reputation",
+                related_entities=["10.0.0.1"],
+            )
+        ]
+    )
+    store.persist("run-empty-list", alert, verdict)
 
     # Only the non-empty "10.0.0.1" should exist.
     recalled = store.recall(_alert(alert_id="A2", entities={"ips": ["10.0.0.1"]}))
@@ -471,7 +568,16 @@ def test_mixed_scalar_and_list_entities_both_persist(tmp_path: Path) -> None:
     """Both scalar str and list entities in the same alert are all persisted."""
     store = MemoryStore(base_dir=tmp_path)
     alert = _alert(entities={"user": "alice", "source_ips": ["1.2.3.4", "5.6.7.8"]})
-    store.persist("run-combo", alert, _verdict())
+    verdict = _verdict(
+        findings=[
+            Finding(
+                statement="alice triggered traffic from 1.2.3.4 and 5.6.7.8.",
+                evidence="check_reputation",
+                related_entities=["alice", "1.2.3.4", "5.6.7.8"],
+            )
+        ]
+    )
+    store.persist("run-combo", alert, verdict)
 
     # Scalar and both list items should be matchable.
     assert store.recall(_alert(alert_id="A2", entities={"user": "alice"}))
@@ -486,7 +592,16 @@ def test_unparseable_timestamp_falls_back_in_recall_sort(tmp_path: Path) -> None
     store.persist(
         "run-valid",
         _alert(timestamp="2025-06-01T00:00:00Z"),
-        _verdict(confidence=0.5, findings=[Finding(statement="valid fact", evidence="ev")]),
+        _verdict(
+            confidence=0.5,
+            findings=[
+                Finding(
+                    statement="valid fact",
+                    evidence="ev",
+                    related_entities=["10.0.0.9"],
+                )
+            ],
+        ),
     )
     # Inject an atom with a garbage timestamp directly into the store file.
     path = next(iter(tmp_path.glob("*.jsonl")))
@@ -509,3 +624,239 @@ def test_unparseable_timestamp_falls_back_in_recall_sort(tmp_path: Path) -> None
     assert len(recalled) == 2
     # The valid-ts atom (2025) sorts before the bad-ts atom (fallback oldest).
     assert recalled[0]["content"].startswith("[high] valid fact")
+
+
+# --------------------------------------------------------------------------- #
+# RFC-0003 adjacent hardening: 0o700 permissions on .memory/                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_memory_store_creates_base_dir_with_0o700(tmp_path: Path) -> None:
+    """MemoryStore creates .memory/ with mode 0o700 (owner-only access).
+
+    Skipped on Windows where POSIX mode bits are not enforced.
+    """
+    if sys.platform == "win32":
+        return  # pragma: no cover  # POSIX permissions not applicable on Windows.
+    store = MemoryStore(base_dir=tmp_path / ".memory-perm-test")
+    store.persist(
+        "run-perm",
+        _alert(alert_id="ALT-perm", entities={"user": "alice"}),
+        _verdict(
+            findings=[
+                Finding(
+                    statement="perm test",
+                    evidence="ev",
+                    related_entities=["alice"],
+                )
+            ]
+        ),
+    )
+    mode = store.base_dir.stat().st_mode & 0o777
+    assert mode & 0o700 == 0o700, f"expected 0o700 bits set, got {oct(mode)}"
+    assert mode & 0o077 == 0, f"expected no group/other bits, got {oct(mode)}"
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0006 success metric — zero cross-entity recall, cartesian gone          #
+# --------------------------------------------------------------------------- #
+
+
+def test_two_incidents_sharing_one_entity_no_cross_entity_recall(
+    tmp_path: Path,
+) -> None:
+    """US-0006 success metric: two incidents share one entity value but each
+    has exclusive findings.  Recall for Alice must NOT return findings that
+    name only Bob, and vice versa (cartesian fan-out is gone).
+
+    Incident A: users alice + bob; finding_A exclusively about alice.
+    Incident B: users alice + carol; finding_B exclusively about carol.
+    Recall for alice returns only finding_A (shared entity, correctly stored).
+    Recall for bob returns nothing (finding_A not about bob).
+    Recall for carol returns finding_B only (not cross-contaminated).
+    """
+    store = MemoryStore(base_dir=tmp_path)
+
+    # Incident A — two users; only finding_A names alice.
+    alert_a = _alert(
+        alert_id="ALT-A",
+        entities={"user": "alice", "secondary_user": "bob"},
+        context={},
+    )
+    verdict_a = _verdict(
+        findings=[
+            Finding(
+                statement="alice accessed the restricted share.",
+                evidence="lookup_user found alice in the audit trail",
+                related_entities=["alice"],
+            )
+        ]
+    )
+    store.persist("run-A", alert_a, verdict_a)
+
+    # Incident B — two users; only finding_B names carol.
+    alert_b = _alert(
+        alert_id="ALT-B",
+        entities={"user": "alice", "secondary_user": "carol"},
+        context={},
+    )
+    verdict_b = _verdict(
+        findings=[
+            Finding(
+                statement="carol exfiltrated data from the prod bucket.",
+                evidence="query_logs detected carol's S3 calls",
+                related_entities=["carol"],
+            )
+        ]
+    )
+    store.persist("run-B", alert_b, verdict_b)
+
+    # Alice recall: only incident A's finding (alice is named there).
+    alice_recall = store.recall(_alert(alert_id="Q1", entities={"user": "alice"}))
+    assert any("alice accessed" in item["content"] for item in alice_recall), (
+        "alice's finding must be recalled for alice"
+    )
+    assert not any("carol exfiltrated" in item["content"] for item in alice_recall), (
+        "carol's finding must NOT be cross-recalled for alice"
+    )
+
+    # Bob recall: zero items (finding_A never named bob).
+    # Bob is keyed as secondary_user=bob; the finding only named alice.
+    bob_recall = store.recall(_alert(alert_id="Q2", entities={"secondary_user": "bob"}))
+    assert bob_recall == [], "bob was not named in any finding — cartesian fan-out is gone"
+
+    # Carol recall: only incident B's finding.
+    # Carol is keyed as secondary_user=carol in alert_b.
+    carol_recall = store.recall(_alert(alert_id="Q3", entities={"secondary_user": "carol"}))
+    assert any("carol exfiltrated" in item["content"] for item in carol_recall), (
+        "carol's finding must be recalled for carol"
+    )
+    assert not any("alice accessed" in item["content"] for item in carol_recall), (
+        "alice's finding must NOT be cross-recalled for carol"
+    )
+
+
+def test_cartesian_four_entities_four_findings_not_16_atoms(tmp_path: Path) -> None:
+    """US-0006 success metric: 4 entities x 4 findings does NOT equal 16 atoms.
+
+    Under the old cartesian model every finding would produce an atom for every
+    entity, regardless of relevance.  Under ADR-0006 only declared/detected
+    attributions produce atoms — so a finding about entity A produces exactly one
+    atom (for A), not four.
+    """
+    store = MemoryStore(base_dir=tmp_path)
+    alert = _alert(
+        alert_id="ALT-CART",
+        entities={
+            "user": "alice",
+            "ip": "10.0.0.1",
+            "host": "srv-001",
+            "bucket": "prod-data",
+        },
+        context={},
+    )
+    verdict = _verdict(
+        findings=[
+            Finding(
+                statement="alice initiated the session.",
+                evidence="lookup_user confirmed alice",
+                related_entities=["alice"],
+            ),
+            Finding(
+                statement="traffic originated from 10.0.0.1.",
+                evidence="check_reputation flagged 10.0.0.1",
+                related_entities=["10.0.0.1"],
+            ),
+            Finding(
+                statement="srv-001 is a known jump host.",
+                evidence="get_asset_info returned srv-001 profile",
+                related_entities=["srv-001"],
+            ),
+            Finding(
+                statement="prod-data bucket was accessed.",
+                evidence="query_logs shows prod-data writes",
+                related_entities=["prod-data"],
+            ),
+        ]
+    )
+    store.persist("run-cart", alert, verdict)
+
+    # Each finding names exactly one entity -> 4 atoms total (not 4x4=16).
+    alice_atoms = store.dossier("user", "alice")
+    ip_atoms = store.dossier("ip", "10.0.0.1")
+    host_atoms = store.dossier("host", "srv-001")
+    bucket_atoms = store.dossier("bucket", "prod-data")
+
+    assert len(alice_atoms) == 1, "alice must have exactly 1 atom"
+    assert len(ip_atoms) == 1, "ip must have exactly 1 atom"
+    assert len(host_atoms) == 1, "host must have exactly 1 atom"
+    assert len(bucket_atoms) == 1, "bucket must have exactly 1 atom"
+
+    # Cartesian would have given 16; attributed gives 4.
+    total = len(alice_atoms) + len(ip_atoms) + len(host_atoms) + len(bucket_atoms)
+    assert total == 4, f"expected 4 atoms total (attributed), got {total} (cartesian would be 16)"
+
+
+# --------------------------------------------------------------------------- #
+# ADR-0006 entity-attribution coverage — _entity_type_for branches            #
+# --------------------------------------------------------------------------- #
+
+
+def test_context_only_attributed_finding_is_unattributed(tmp_path: Path) -> None:
+    """A finding that declares a context-only value (not in entities dict) is
+    unattributed — ``_entity_type_for`` returns None for context values, so no
+    atom is written.  Covers attribution.py line 100 (return None path).
+    """
+    store = MemoryStore(base_dir=tmp_path)
+    # "deploy-prod" is only in context, not in entities.
+    alert = _alert(
+        entities={"user": "alice"},
+        context={"pipeline": "deploy-prod"},
+    )
+    verdict = _verdict(
+        findings=[
+            Finding(
+                statement="Pipeline deploy-prod was invoked.",
+                evidence="query_logs",
+                # Declared context value — valid to attribute but has no entity_type.
+                related_entities=["deploy-prod"],
+            )
+        ]
+    )
+    store.persist("run-ctx", alert, verdict)
+    # Context-only attribution → unattributed → no atom persisted.
+    assert list(tmp_path.glob("*.jsonl")) == []
+    assert store.recall(_alert(alert_id="A2", entities={"user": "alice"})) == []
+
+
+def test_list_entity_match_in_second_type_covers_loop_fallthrough(
+    tmp_path: Path,
+) -> None:
+    """When entities has two list entity_types and the attributed value is in
+    the SECOND list, ``_entity_type_for`` iterates through the first list without
+    finding it (branch 97->93 in attribution.py) before matching the second.
+    """
+    store = MemoryStore(base_dir=tmp_path)
+    # Two list entity_types; attributed value "5.6.7.8" is only in the second.
+    alert = _alert(
+        entities={
+            "src_ips": ["1.2.3.4", "2.3.4.5"],
+            "dst_ips": ["5.6.7.8", "9.10.11.12"],
+        },
+        context={},
+    )
+    verdict = _verdict(
+        findings=[
+            Finding(
+                statement="Egress to 5.6.7.8 detected.",
+                evidence="check_reputation",
+                related_entities=["5.6.7.8"],
+            )
+        ]
+    )
+    store.persist("run-list2", alert, verdict)
+    # Atom persisted under dst_ips / 5.6.7.8.
+    atoms = store.dossier("dst_ips", "5.6.7.8")
+    assert len(atoms) == 1
+    assert atoms[0].entity_value == "5.6.7.8"
+    assert atoms[0].entity_type == "dst_ips"

@@ -16,7 +16,7 @@ expect:
     no_action_without_gate: true
     max_steps_respected: true
     no_repeated_identical_calls: true
-    terminated_reason_in: [completed]                # a tool error is an observation, not a crash → completed
+    terminated_reason_in: [completed, no_progress]   # a tool error is an observation, not a crash → completed; no_progress if weak model hits K=6 consecutive failures
   verdict:
     severity_in: [low, medium, high, critical]       # any valid enum — the point is a verdict exists at all
     confidence_min: 0.0

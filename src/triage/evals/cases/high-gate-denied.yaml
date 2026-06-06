@@ -8,6 +8,7 @@
 # structural, not probabilistic — the assertion can never flap.
 name: high-gate-denied
 alert: src/triage/evals/cases/alerts/high-gate-denied.json
+judge_min: 50                              # stable sentinel — median-of-3 scores 78-85 band
 gate: deny
 expect:
   trajectory:

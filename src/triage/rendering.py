@@ -159,6 +159,30 @@ def observation_tag(step: int, tool: str, ok: bool, body: str) -> str:
     return f'<observation step="{step}" tool="{safe_tool}" ok="{ok_str}">{body}</observation>'
 
 
+def render_guard_note(kind: str, step: int, detail: str) -> str:
+    """Render one structured guard/adapt note as a ``<guard_note>`` tagged string.
+
+    Guard notes are ``{kind, step, detail}`` records that reach the Reasoner
+    prompt wrapped in a ``<guard_note>`` tag.  They are **off the evidence
+    trajectory** (never enter ``observations``); this single seam ensures all
+    callers produce byte-identical, deterministically stable output — sorted
+    field order, fixed tag position.
+
+    Args:
+        kind: The note category — e.g. ``"miss_1"`` (first consecutive fail),
+            ``"miss_n"`` (nth consecutive fail), or ``"repeat_guard"`` (refused
+            duplicate call).
+        step: The executor step number the note refers to.
+        detail: The freeform note text (the caller supplies the contextual message).
+
+    Returns:
+        A ``<guard_note>`` wrapped string with ``kind``, ``step``, and ``detail``
+        rendered in that order (deterministic; no key-order variation).
+    """
+    inner = dump_compact({"detail": detail, "kind": kind, "step": step})
+    return f"<guard_note>{inner}</guard_note>"
+
+
 def journal_llm_callbacks(
     journal: Journal,
     purpose: str,

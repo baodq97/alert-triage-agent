@@ -1,0 +1,22 @@
+{
+  "alert_id": "ALT-2026-04-7821",
+  "timestamp": "2026-04-09T03:12:44Z",
+  "source": "api-gateway",
+  "severity_hint": "high",
+  "event_type": "anomalous_api_activity",
+  "description": "Service account 'svc-deploy-prod' made 847 API calls to /admin/users/export in a 3-minute window. Normal baseline is <10 calls/hour. Source IP 10.200.3.47 does not match known CI/CD runner IPs.",
+  "entities": {
+    "service_account": "svc-deploy-prod",
+    "source_ip": "10.200.3.47",
+    "target_endpoint": "/admin/users/export",
+    "asset": "user-management-api",
+    "environment": "production"
+  },
+  "context": {
+    "calls_in_window": 847,
+    "window_minutes": 3,
+    "baseline_calls_per_hour": 8,
+    "auth_method": "api_key",
+    "geo_location": "US-East"
+  }
+}

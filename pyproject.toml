@@ -35,6 +35,12 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+"src/triage/threat_intel/classifier.py" = [
+    "PLR0911", # classify_ioc has 7 ordered guard-clause returns — the linear
+               # structure (step 0 through 4) is intentional, each return is a
+               # distinct classification outcome; no refactor reduces the count
+               # without hiding the algorithm behind an additional helper.
+]
 "tests/**" = [
     "S101",    # assert is the test mechanism in pytest
     "PLR2004", # magic values are expected in test assertions
@@ -62,6 +68,7 @@ error-on-warning = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = "--cov=triage --cov=run --cov-branch --cov-report=term-missing"
 markers = [
     "live: Tier B live smoke — hits a real LLM endpoint; auto-skipped without LLM_API_KEY",

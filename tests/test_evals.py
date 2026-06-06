@@ -24,11 +24,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import pytest
 from pydantic import BaseModel
 
-# Purity boundary: the assertion engine + eval models are imported here WITHOUT the
-# runner. ``test_assert_case_is_pure_over_a_constructed_record`` uses ONLY these two
-# imports to score a hand-built record — proving a foreign tool reuses the checks
-# without importing the runner (US-0003 AC). The runner/replay/judge imports below
-# serve the other tests; they never participate in the purity test.
+from tests._helpers import CapturingLLM
 from triage.errors import ConfigError, LLMError
 from triage.evals import runner
 from triage.evals.adapters import DeepEvalProjection, project_reference
@@ -69,6 +65,12 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 T = TypeVar("T", bound=BaseModel)
+
+# Purity boundary: the assertion engine + eval models are imported here WITHOUT the
+# runner. ``test_assert_case_is_pure_over_a_constructed_record`` uses ONLY these two
+# imports to score a hand-built record — proving a foreign tool reuses the checks
+# without importing the runner (US-0003 AC). The runner/replay/judge imports above
+# serve the other tests; they never participate in the purity test.
 
 # --- shared builders ---------------------------------------------------------
 
@@ -1035,40 +1037,13 @@ def test_main_replay_path_never_reaches_live_llm(
 # --- memory seeding: declarative prior_runs wire recall into the planner -----
 
 
-class _CapturingLLM:
-    """Wraps a ``FakeLLM`` and keeps EVERY call's messages (not just the last).
-
-    ``FakeLLM`` retains only ``last_messages`` (the verdict call); the plan is the
-    first ``complete``. This capturer records each call's rendered messages so a
-    test can inspect the plan prompt (``calls[0]``) for the recalled-memory block.
-    """
-
-    def __init__(self, inner: FakeLLM) -> None:
-        self._inner = inner
-        self.model = inner.model
-        self.calls: list[list[Message]] = []
-
-    def complete(
-        self,
-        messages: Sequence[Message],
-        response_model: type[T],
-        *,
-        on_transport_retry: Any = None,
-        on_repair: Any = None,
-    ) -> Completion[T]:
-        self.calls.append(list(messages))
-        return self._inner.complete(
-            messages, response_model, on_transport_retry=on_transport_retry, on_repair=on_repair
-        )
-
-
 def test_seeded_case_wires_recall_into_the_planner_prompt() -> None:
     # The benign-after-flagged case declares a prior high-severity verdict for
     # svc-deploy-prod; run_case must persist it through the REAL MemoryStore and the
     # recall must reach the plan prompt. Asserted in-process (the run record cannot
     # carry prompt text). The verdict stays LOW — recall informs, never dictates.
     case = load_case(_case_path("benign-after-flagged"))
-    capturer = _CapturingLLM(FakeLLM(_script_for("benign-after-flagged")))
+    capturer = CapturingLLM(FakeLLM(_script_for("benign-after-flagged")))
 
     record = run_case(case, capturer)
 
@@ -1085,7 +1060,7 @@ def test_unseeded_case_runs_memory_free() -> None:
     # A case WITHOUT prior_runs gets no recall block in its plan prompt — the loop is
     # byte-for-byte memory-free, identical to before the seam was wired.
     case = load_case(_case_path("benign"))
-    capturer = _CapturingLLM(FakeLLM(_script_for("benign")))
+    capturer = CapturingLLM(FakeLLM(_script_for("benign")))
 
     run_case(case, capturer)
 
@@ -1177,7 +1152,7 @@ def test_seed_store_never_touches_the_configured_memory_dir(
     monkeypatch.setenv("MEMORY_DIR", str(configured))
 
     case = load_case(_case_path("benign-after-flagged"))
-    run_case(case, _CapturingLLM(FakeLLM(_script_for("benign-after-flagged"))))
+    run_case(case, CapturingLLM(FakeLLM(_script_for("benign-after-flagged"))))
 
     assert list(configured.iterdir()) == []
 
@@ -1391,6 +1366,278 @@ def test_judge_default_samples_1_is_byte_identical_to_original() -> None:
     assert result.score == 75
     judge_calls = [e for e in rec.events if e[0] == "llm_call"]
     assert len(judge_calls) == 1
+
+
+# --- judge_min soft gate (US-0007) -------------------------------------------
+
+
+def _case_with_judge_min(judge_min: float | None) -> GoldenCase:
+    """Return a minimal GoldenCase with judge_min set for soft-gate tests."""
+    return GoldenCase.model_validate(
+        {
+            "name": "sentinel",
+            "alert": "src/triage/evals/cases/alerts/benign.json",
+            "judge_min": judge_min,
+            "verdict": {"severity_in": ["high", "critical"]},  # passes with default high verdict
+        }
+    )
+
+
+def test_judge_min_fail_exits_2_with_warn_section(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """A case with judge_min whose judge score falls below → exit 2 + TIER-2 WARN section."""
+    # Build one case with judge_min=80; the scripted judge returns score=40 (< 80).
+    # Tier-1 passes (severity high satisfies severity_in: [high, critical]).
+    case = _case_with_judge_min(judge_min=80)
+    # Score=40 < judge_min=80 → soft gate trip.
+    judge = Judge(llm=_MultiScriptedJudgeLLM([40]), journal=NoopJournal(), samples=1)
+
+    caches_dir = tmp_path / "cases"
+    caches_dir.mkdir()
+    cache = ReplayCache({}, model="fake-model")
+    run_case(case, RecordingLLM(FakeLLM(_exfil_script()), cache))
+    cache.dump(case_replay_path(case, caches_dir))
+
+    def _patched_path(c: Any) -> Any:
+        return case_replay_path(c, caches_dir)
+
+    monkeypatch.setattr(runner, "case_replay_path", _patched_path)
+    monkeypatch.setattr(runner, "load_cases", lambda _: [case])
+    monkeypatch.setattr(runner, "_build_live_llm", lambda: _MultiScriptedJudgeLLM([40]))
+
+    # Inject judge into evaluate_case via monkeypatching the suite call.
+    original_evaluate = runner.evaluate_case
+
+    def _patched_evaluate(c: Any, llm: Any, **_: Any) -> Any:
+        return original_evaluate(c, llm, judge=judge)
+
+    monkeypatch.setattr(runner, "evaluate_case", _patched_evaluate)
+
+    code = runner.main(["--replay"])
+    captured = capsys.readouterr()
+
+    assert code == 2, f"Expected exit 2 (soft gate), got {code}"
+    assert "TIER-2 WARN" in captured.out
+    assert "sentinel" in captured.out
+    assert "score=40" in captured.out
+    assert "judge_min=80" in captured.out
+
+
+def test_tier1_fail_wins_over_judge_soft_fail(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+) -> None:
+    """When both Tier-1 and judge_min fail, Tier-1 wins: exit 1, NOT exit 2."""
+    # Tier-1 fails: 'low' verdict violates severity_in: [high, critical].
+    # judge_min=80 also fails: score=40 < 80.
+    case = _case_with_judge_min(judge_min=80)
+    low_score_judge = Judge(llm=_MultiScriptedJudgeLLM([40]), journal=NoopJournal(), samples=1)
+
+    caches_dir = tmp_path / "cases"
+    caches_dir.mkdir()
+    cache = ReplayCache({}, model="fake-model")
+    # Record with low severity so Tier-1 fails.
+    run_case(case, RecordingLLM(FakeLLM(_exfil_script(severity="low")), cache))
+    cache.dump(case_replay_path(case, caches_dir))
+
+    def _patched_path(c: Any) -> Any:
+        return case_replay_path(c, caches_dir)
+
+    monkeypatch.setattr(runner, "case_replay_path", _patched_path)
+    monkeypatch.setattr(runner, "load_cases", lambda _: [case])
+
+    original_evaluate = runner.evaluate_case
+
+    def _patched_evaluate(c: Any, llm: Any, **_: Any) -> Any:
+        return original_evaluate(c, llm, judge=low_score_judge)
+
+    monkeypatch.setattr(runner, "evaluate_case", _patched_evaluate)
+
+    code = runner.main(["--replay"])
+    captured = capsys.readouterr()
+
+    # Tier-1 failure wins: exit 1, not 2.
+    assert code == 1, f"Expected exit 1 (Tier-1 wins), got {code}"
+    # TIER-2 WARN must NOT appear (Tier-1 already failed).
+    assert "TIER-2 WARN" not in captured.out
+
+
+def test_judge_min_both_pass_exits_zero(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """When both Tier-1 and judge score pass → exit 0."""
+    # judge_min=50; score=84 (from _ScriptedJudgeLLM) → passes.
+    # Tier-1 passes: severity high satisfies severity_in: [high, critical].
+    case = _case_with_judge_min(judge_min=50)
+    passing_judge = Judge(llm=_ScriptedJudgeLLM(), journal=NoopJournal(), samples=1)
+
+    caches_dir = tmp_path / "cases"
+    caches_dir.mkdir()
+    cache = ReplayCache({}, model="fake-model")
+    run_case(case, RecordingLLM(FakeLLM(_exfil_script()), cache))
+    cache.dump(case_replay_path(case, caches_dir))
+
+    def _patched_path(c: Any) -> Any:
+        return case_replay_path(c, caches_dir)
+
+    monkeypatch.setattr(runner, "case_replay_path", _patched_path)
+    monkeypatch.setattr(runner, "load_cases", lambda _: [case])
+
+    original_evaluate = runner.evaluate_case
+
+    def _patched_evaluate(c: Any, llm: Any, **_: Any) -> Any:
+        return original_evaluate(c, llm, judge=passing_judge)
+
+    monkeypatch.setattr(runner, "evaluate_case", _patched_evaluate)
+
+    code = runner.main(["--replay"])
+    assert code == 0
+
+
+def test_main_live_wires_judge_only_for_judge_min_cases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``main`` (live mode) natively judges judge_min cases and ONLY those.
+
+    The CLI builds the Tier-2 Judge itself (US-0007 consumer scope: ``make
+    eval``); cases without ``judge_min`` must not pay the judge's live cost.
+    """
+    sentinel = _case_with_judge_min(judge_min=50)
+    plain = _case_with_judge_min(judge_min=None)
+    judged_records: list[Any] = []
+
+    class _SpyJudge:
+        def score(self, run_record: Any) -> Any:
+            judged_records.append(run_record)
+            from triage.evals.judge import JudgeResult  # noqa: PLC0415
+
+            return JudgeResult(scored=True, score=84, rationale="spy")
+
+    monkeypatch.setattr(runner, "load_cases", lambda _: [sentinel, plain])
+    monkeypatch.setattr(runner, "_build_live_llm", lambda: FakeLLM(_exfil_script() * 2))
+    monkeypatch.setattr(runner, "_build_judge", lambda _llm: _SpyJudge())
+
+    code = runner.main([])
+
+    assert code == 0
+    # Exactly one case (the judge_min sentinel) was judged.
+    assert len(judged_records) == 1
+
+
+def test_judge_min_absent_no_behavior_change() -> None:
+    """Absent judge_min → zero behavior change (gate identical to before)."""
+    case = _case_with_judge_min(judge_min=None)
+    # Even a low judge score should not trigger soft gate when judge_min is None.
+    low_score_judge = Judge(llm=_MultiScriptedJudgeLLM([10]), journal=NoopJournal(), samples=1)
+
+    report = evaluate_case(case, FakeLLM(_exfil_script()), judge=low_score_judge)
+
+    # judge_min is None → judge_failed must always be False.
+    assert not report.judge_failed
+    assert report.judge_min is None
+
+
+def test_not_scored_judge_never_fails_soft_gate() -> None:
+    """A judge that returns scored=False must never trigger the soft gate."""
+    # judge_min=50; judge raises error → scored=False → no soft fail.
+    case = _case_with_judge_min(judge_min=50)
+    failing_judge = Judge(llm=_ScriptedJudgeLLM(raise_error=True), journal=NoopJournal())
+
+    report = evaluate_case(case, FakeLLM(_exfil_script()), judge=failing_judge)
+
+    assert report.judge is not None
+    assert not report.judge.scored
+    assert not report.judge_failed, "Not-scored judge must never fail the soft gate"
+
+
+def test_case_report_judge_failed_property() -> None:
+    """Unit-level: CaseReport.judge_failed reflects the score vs judge_min contract."""
+    from triage.evals.judge import JudgeResult  # noqa: PLC0415 — local to this test block
+    from triage.evals.runner import CaseReport  # noqa: PLC0415
+
+    # Scored below threshold → fails.
+    r_fail = CaseReport(
+        name="x",
+        pending=False,
+        judge=JudgeResult(scored=True, score=40, rationale="low"),
+        judge_min=80.0,
+    )
+    assert r_fail.judge_failed
+
+    # Scored above threshold → passes.
+    r_pass = CaseReport(
+        name="x",
+        pending=False,
+        judge=JudgeResult(scored=True, score=85, rationale="good"),
+        judge_min=80.0,
+    )
+    assert not r_pass.judge_failed
+
+    # No judge result → no soft fail.
+    r_no_judge = CaseReport(name="x", pending=False, judge=None, judge_min=80.0)
+    assert not r_no_judge.judge_failed
+
+    # Not scored → no soft fail (degradation rule).
+    r_not_scored = CaseReport(
+        name="x",
+        pending=False,
+        judge=JudgeResult(scored=False, rationale="unavail"),
+        judge_min=80.0,
+    )
+    assert not r_not_scored.judge_failed
+
+    # judge_min=None → never fails.
+    r_no_min = CaseReport(
+        name="x",
+        pending=False,
+        judge=JudgeResult(scored=True, score=10, rationale="terrible"),
+        judge_min=None,
+    )
+    assert not r_no_min.judge_failed
+
+    # Pending case → never fails soft gate.
+    r_pending = CaseReport(
+        name="x",
+        pending=True,
+        judge=JudgeResult(scored=True, score=10, rationale="bad"),
+        judge_min=50.0,
+    )
+    assert not r_pending.judge_failed
+
+
+def test_sentinel_cases_have_judge_min_set() -> None:
+    """The 5 stable sentinel cases must have judge_min=50; known-hard tail must not."""
+    cases = {c.name: c for c in load_cases(_CASES_DIR)}
+    sentinels = {"exfil-prod", "priv-esc", "benign", "high-gate-denied", "high-exfil-tor-ti"}
+    for name in sentinels:
+        assert cases[name].judge_min == 50, f"{name} should have judge_min=50"
+    # Known-hard tail cases must NOT have judge_min set.
+    hard_tail = {n for n in cases if n.startswith(("tool-failure", "edge-"))}
+    for name in hard_tail:
+        assert cases[name].judge_min is None, f"{name} should not have judge_min (known-hard tail)"
+
+
+def test_alert_paths_use_cases_alerts_convention() -> None:
+    """All 6 original cases must use the src/triage/evals/cases/alerts/ convention."""
+    cases = {c.name: c for c in load_cases(_CASES_DIR)}
+    originals = {
+        "exfil-prod",
+        "priv-esc",
+        "unknown-event-type",
+        "benign",
+        "tool-failure",
+        "benign-after-flagged",
+    }
+    for name in originals:
+        alert_path = cases[name].alert
+        assert alert_path.startswith("src/triage/evals/cases/alerts/"), (
+            f"{name}: alert path must use cases/alerts/ convention, got: {alert_path}"
+        )
 
 
 # --- loaders + shipped cases + adapters --------------------------------------

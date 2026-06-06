@@ -70,12 +70,12 @@ and consistency, which code can check deterministically. It does NOT verify corr
 against ground truth (the eval suite's job). The check set was calibrated against the 35
 recorded verdicts: every check below passes all currently-recorded correct verdicts.
 
-| Check | Pass condition (deterministic) |
+| Check | Pass condition (deterministic, as calibrated in Phase 1) |
 |---|---|
-| Citation validity | every `finding.evidence` either (a) contains the name of a tool the run actually called, (b) contains a data value present in the run's observation set, or (c) is an alert-correlation citation (references alert fields — sanctioned by verdict.md for zero-evidence runs). Fails only when evidence matches none of the three. |
-| Confidence-evidence consistency | ok_count=0 → conf ∈ [0.30,0.40] (the existing clamp band); conf ≥ 0.8 requires ≥2 ok observations; conf is never > the band ceiling when every observation failed |
+| Citation validity | every `finding.evidence` either (a) contains the name of a tool the run actually called, (b) contains a data value present in the run's observation set, (c) is an alert-correlation citation (references alert fields — sanctioned by verdict.md for zero-evidence runs), or (d) is a failure citation (`ok:false` appears in the evidence and the run actually has ≥1 failed observation — summary findings over failed trajectories are grounded in the run). Fails only when evidence matches none of the four. |
+| Confidence-evidence consistency | ok_count=0 → conf ∈ [0.30,0.40] (the existing clamp band). The band rule subsumes the high-confidence rule (conf ≥ 0.8 requires ≥1 ok observation): with zero ok observations any conf above the band ceiling fails. |
 | Action traceability | every targeted action's entity named by ≥1 finding (the `_filter_traceable_actions` call is removed from verdict synthesis and re-homed here as the canonical enforcement point) |
-| Coverage | every alert **envelope entity** (the `entities` dict) either has ≥1 observation targeting it (by args) or its value appears in ≥1 finding (acknowledged) — TI enrichment observations count as coverage for their IOC |
+| Coverage | an envelope entity (the `entities` dict) is *covered* when ≥1 tool call targets it (by args), its value appears in ≥1 observation's data, or it appears in ≥1 finding (acknowledged) — TI enrichment observations count for their IOC. The check **fails only when zero envelope entities are covered** (a blind verdict); partial gaps never fail but the full `uncovered_entities` list is always journaled and feeds the Phase-2 gap note. |
 
 **Deliberately excluded** (adversarial-review findings — not deterministically
 implementable without false-failing real verdicts):
@@ -177,6 +177,30 @@ checks, the re-plan mechanism, phased rollout gated on a measured false-flag rat
 restated as a conservative constant. The review also verified: `benign-after-flagged`
 recall survives ADR-0006's cartesian removal; no invariant (never-crash, boundedness,
 single-writer journal, ADR-0005 containment) is violated by the revised design.
+
+### Phase-1 measurement (implementation calibration, 2026-06-06)
+
+Running the hook over the freshly re-recorded 35-case suite surfaced three further
+calibration deltas, fixed before the gate was met:
+
+1. **Coverage measured args-blind** — the first implementation matched entities against
+   observation *data* only (ToolResult carries no args), so a run that *targeted* an
+   entity whose fixture data never echoed the value was flagged (e.g. a queried IAM role
+   ARN). Fixed per this RFC's own "targeting it (by args)" wording: the executor's
+   per-call args now thread into the check.
+2. **Full-entity coverage over-fails** — 10/35 recorded-correct verdicts legitimately
+   leave noise entities uninvestigated (a benign conclusion does not enumerate every
+   envelope value). Calibrated to fail only on **zero** covered entities; partial gaps
+   journal as telemetry (`uncovered_entities`) without failing.
+3. **≥2-ok high-confidence rule over-fails** — one recorded-correct verdict carries 0.88
+   confidence on one decisive ok observation. Calibrated to the band rule (zero-ok runs
+   stay clamped); a four-th citation branch (failure citation: `ok:false` + real failed
+   observations) covers summary findings over all-failed trajectories.
+
+**Measured result after calibration: 0 failing checks across all 35 recorded-correct
+verdicts (hook action `pass` on every case); 10 cases carry advisory coverage-gap
+telemetry.** The Phase-1 "0 false-flag" gate for enabling Phase-2 re-entry is met on the
+recorded suite; the live ≤10% bound remains to be observed in live runs.
 
 ## Alternatives considered
 

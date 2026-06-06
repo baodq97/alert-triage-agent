@@ -9,7 +9,7 @@ expect:
     no_action_without_gate: true
     max_steps_respected: true
     no_repeated_identical_calls: true
-    terminated_reason_in: [completed]
+    terminated_reason_in: [completed, no_progress]   # completed when the agent self-concludes on empty entities; no_progress pre-widened for backstop
   verdict:
     severity_in: [low, medium, high, critical]       # any valid verdict — graceful handling is the point
     confidence_min: 0.0

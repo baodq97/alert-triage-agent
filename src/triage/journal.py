@@ -141,7 +141,12 @@ class JsonlJournal:
         """
         self._path = run_dir / "journal.jsonl"
         try:
-            run_dir.mkdir(parents=True, exist_ok=True)
+            # 0o700: the run dir contains the full audit trail and must not be
+            # world-readable. ``mkdir(mode=0o700)`` is correct on systems where
+            # the process umask does not mask owner bits; on systems with a
+            # restrictive umask (e.g. 0o077) the mode is already more
+            # restrictive, so the effective permissions are at least as tight.
+            run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             self._seq = self._prepare_for_append()
             self._handle = self._path.open("a", encoding="utf-8")
         except OSError as exc:

@@ -1,7 +1,7 @@
 ---
 id: US-0006
 title: "Memory v2: entity-attributed finding atoms"
-status: open
+status: done
 owner: baodq97
 date: 2026-06-06
 priority: P1
@@ -42,18 +42,18 @@ Out of scope: dossier/recall ranking changes (mechanism unchanged), L3 posture c
 
 ## Acceptance criteria
 
-- [ ] A finding declaring `related_entities: [X]` persists atoms only for X (given X is an
+- [x] A finding declaring `related_entities: [X]` persists atoms only for X (given X is an
       alert entity); hallucinated entity names persist nothing for those names
-- [ ] An undeclared finding whose statement/evidence names alert entity Y persists exactly
+- [x] An undeclared finding whose statement/evidence names alert entity Y persists exactly
       Y's atom (text-scan fallback); one not naming any entity persists nothing and emits
       `finding_unattributed`
-- [ ] Cartesian fan-out is gone: a 4-entity / 4-finding verdict no longer yields 16 atoms
+- [x] Cartesian fan-out is gone: a 4-entity / 4-finding verdict no longer yields 16 atoms
       unless every finding genuinely names all 4 entities
-- [ ] `benign-after-flagged` and `medium-recall-elevates` golden cases still pass (their
+- [x] `benign-after-flagged` and `medium-recall-elevates` golden cases still pass (their
       seeded recall semantics preserved via explicit entity declarations)
-- [ ] One shared attribution helper serves persist AND action traceability (grep proves no
+- [x] One shared attribution helper serves persist AND action traceability (grep proves no
       duplicate substring matcher)
-- [ ] `make check` green, 100% coverage; full suite re-recorded once (batched) and
+- [x] `make check` green, 100% coverage; full suite re-recorded once (batched) and
       `make eval` + `make eval-replay` green
 
 ## Success metric

@@ -619,6 +619,68 @@ class TestEnrichDomainIOC:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# classifier.py — org-domain allowlist knob (TI_ORG_DOMAINS, RFC-0003 §Parameters)
+# ---------------------------------------------------------------------------
+
+
+class TestOrgDomainAllowlist:
+    def test_empty_env_unchanged_behavior(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Empty TI_ORG_DOMAINS (the default) leaves classification unchanged."""
+        monkeypatch.delenv("TI_ORG_DOMAINS", raising=False)
+        # A domain that would normally classify as "domain" still does.
+        assert classify_ioc("domain", "evil.example.com") == "domain"
+
+    def test_listed_domain_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A domain equal to a listed org domain classifies as None (internal)."""
+        monkeypatch.setenv("TI_ORG_DOMAINS", "corp.example.com")
+        assert classify_ioc("domain", "corp.example.com") is None
+
+    def test_subdomain_of_listed_domain_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A subdomain of a listed org domain classifies as None (internal)."""
+        monkeypatch.setenv("TI_ORG_DOMAINS", "corp.example.com")
+        assert classify_ioc("domain", "api.corp.example.com") is None
+
+    def test_deep_subdomain_of_listed_domain_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A deeply nested subdomain of a listed org domain is also excluded."""
+        monkeypatch.setenv("TI_ORG_DOMAINS", "acme.io")
+        assert classify_ioc("domain", "a.b.c.acme.io") is None
+
+    def test_unrelated_domain_still_classifies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A domain not in the allowlist still receives normal classification."""
+        monkeypatch.setenv("TI_ORG_DOMAINS", "corp.example.com")
+        assert classify_ioc("domain", "evil.example.com") == "domain"
+
+    def test_partial_label_match_not_excluded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A domain whose suffix looks similar but is NOT a subdomain is not excluded.
+
+        'evilcorp.example.com' must not be excluded by 'corp.example.com'
+        because 'evilcorp.example.com' does not end with '.corp.example.com'.
+        """
+        monkeypatch.setenv("TI_ORG_DOMAINS", "corp.example.com")
+        assert classify_ioc("domain", "evilcorp.example.com") == "domain"
+
+    def test_multiple_org_domains_comma_separated(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Multiple org domains are all applied."""
+        monkeypatch.setenv("TI_ORG_DOMAINS", "corp.example.com,acme.io")
+        assert classify_ioc("domain", "mail.corp.example.com") is None
+        assert classify_ioc("domain", "acme.io") is None
+        assert classify_ioc("domain", "evil.external.com") == "domain"
+
+    def test_case_insensitive_match(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Org-domain comparison is case-insensitive."""
+        monkeypatch.setenv("TI_ORG_DOMAINS", "Corp.Example.COM")
+        assert classify_ioc("domain", "API.CORP.EXAMPLE.COM") is None
+
+    def test_whitespace_trimmed_in_domain_list(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Leading/trailing whitespace around each entry is stripped."""
+        monkeypatch.setenv("TI_ORG_DOMAINS", " corp.example.com , acme.io ")
+        assert classify_ioc("domain", "corp.example.com") is None
+        assert classify_ioc("domain", "acme.io") is None
+
+
 class TestTIPromptFile:
     def test_prompt_file_exists(self) -> None:
         prompts_dir = (

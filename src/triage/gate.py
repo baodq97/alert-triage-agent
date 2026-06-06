@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING, Final, Literal, Protocol, cast, get_args, runt
 
 import yaml
 
+from triage.constants import EVT_GATE_DECISION, EVT_GATE_REQUESTED
 from triage.errors import ConfigError
 from triage.models import Action, GateDecision
 
@@ -197,12 +198,12 @@ class _BaseGate:
         if not batch:
             return None
         self._journal.emit(
-            "gate_requested",
+            EVT_GATE_REQUESTED,
             {"actions": [action.model_dump() for action in batch], "risk": _HIGH_RISK},
         )
         decision = GateDecision(decision=self._decide(batch), by=self._by)
         self._journal.emit(
-            "gate_decision",
+            EVT_GATE_DECISION,
             {"decision": decision.decision, "by": decision.by},
         )
         return decision
@@ -279,7 +280,7 @@ class DeferredGate:
         if not batch:
             return None
         self._journal.emit(
-            "gate_requested",
+            EVT_GATE_REQUESTED,
             {"actions": [action.model_dump() for action in batch], "risk": _HIGH_RISK},
         )
         return HOLD

@@ -26,6 +26,20 @@ optional callbacks: ``before_attempt(attempt)`` lets the caller emit
 ``tool_result`` — including for a failed transient attempt, so each attempt is
 journaled with a shared ``step`` + ``attempt``. The backoff between attempts is
 ``_backoff`` — a module-level seam tests monkeypatch so they never really wait.
+
+**Args-schema enforcement (RFC-0003 §Parameters / US-0008 adjacent hardening):**
+``execute_tool`` validates ``args`` against the tool's ``args_schema`` before the
+first attempt using a minimal in-tree grammar — no jsonschema dependency.  The
+grammar covers:
+
+* ``required`` — every listed key must be present in ``args``;
+* ``properties[key].type`` — when present, the value must satisfy the declared
+  scalar type (``"string"`` → ``str``; ``"number"`` → ``int | float`` (not bool);
+  ``"boolean"`` → ``bool``).
+
+A violation yields ``ToolResult(ok=False, error="args violate schema: <why>")``
+and fires the normal ``before_attempt`` / ``after_attempt`` callbacks (attempt 1)
+so existing journal invariants hold.  It never crashes and never consumes a retry.
 """
 
 from __future__ import annotations
@@ -42,10 +56,68 @@ if TYPE_CHECKING:
 _MAX_ATTEMPTS = 2
 _BACKOFF_SECONDS = 0.2
 
+# Mapping from JSON Schema type strings to their Python equivalents.
+# ``"number"`` maps to ``(int, float)`` excluding ``bool`` (a bool is an int
+# subclass in Python — exclude it explicitly so ``True`` is not a valid number).
+_SCALAR_TYPE_MAP: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "integer": (int,),
+}
+
 
 def _backoff() -> None:
     """Wait the short backoff between retry attempts (tests monkeypatch this)."""
     time.sleep(_BACKOFF_SECONDS)
+
+
+def _validate_args(schema: dict[str, Any], args: Mapping[str, Any]) -> str | None:
+    """Validate ``args`` against the minimal in-tree args-schema grammar.
+
+    Checks (in order):
+
+    1. **Required keys** — every key listed in ``schema["required"]`` must be
+       present in ``args`` (the value may be ``None``; absence is the violation).
+    2. **Scalar type** — for each key in ``schema.get("properties", {})``, when
+       the property declares a ``"type"`` field and the key is present in
+       ``args``, the value must be an instance of the corresponding Python type.
+       ``"number"`` accepts ``int | float`` but NOT ``bool`` (``bool`` is a
+       Python ``int`` subclass — exclude it so ``True`` is not a number).
+
+    No jsonschema dependency.  Unrecognised ``type`` strings and schemas that
+    lack both ``required`` and ``properties`` are silently accepted (permissive
+    at the edges — the grammar is not exhaustive).
+
+    Args:
+        schema: The tool's ``args_schema`` dict.
+        args: The caller-supplied arguments.
+
+    Returns:
+        ``None`` when ``args`` pass validation; a human-readable reason string
+        when they fail (the first failure found — no accumulation).
+    """
+    # Check required keys.
+    for key in schema.get("required", []):
+        if key not in args:
+            return f"missing required key '{key}'"
+    # Check declared scalar types.
+    properties: dict[str, Any] = schema.get("properties", {})
+    for key, prop in properties.items():
+        declared_type = prop.get("type") if isinstance(prop, dict) else None
+        if declared_type is None or key not in args:
+            continue
+        python_types = _SCALAR_TYPE_MAP.get(declared_type)
+        if python_types is None:
+            continue  # unknown type string — permissive
+        value = args[key]
+        # Special case: bool is a subclass of int, so for "number"/"integer"
+        # checks we must reject bool values explicitly.
+        if declared_type in ("number", "integer") and isinstance(value, bool):
+            return f"key '{key}' must be {declared_type}, got bool"
+        if not isinstance(value, python_types):
+            return f"key '{key}' must be {declared_type}, got {type(value).__name__}"
+    return None
 
 
 @runtime_checkable
@@ -137,6 +209,18 @@ def execute_tool(
     Returns:
         The last attempt's ``ToolResult`` (``ok=True`` on success).
     """
+    # Validate args against the schema before attempting the call.
+    # A violation emits the normal before_attempt/after_attempt callbacks at
+    # attempt 1 so existing journal invariants hold, then returns without retry.
+    schema_error = _validate_args(tool.args_schema, args)
+    if schema_error is not None:
+        result = ToolResult(tool=tool.name, ok=False, error=f"args violate schema: {schema_error}")
+        if before_attempt is not None:
+            before_attempt(1)
+        if after_attempt is not None:
+            after_attempt(1, result)
+        return result
+
     result = ToolResult(tool=tool.name, ok=False, error="not attempted")
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         if before_attempt is not None:

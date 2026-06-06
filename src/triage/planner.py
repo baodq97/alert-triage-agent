@@ -31,6 +31,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from triage.constants import EVT_LLM_CALL, EVT_PLAN_CREATED
 from triage.models import Alert, InvestigationPlan
 from triage.rendering import dump_alert, dump_compact, journal_llm_callbacks, split_stable_dynamic
 
@@ -102,7 +103,7 @@ class Planner:
             on_repair=on_repair,
         )
         self._journal.emit(
-            "llm_call",
+            EVT_LLM_CALL,
             {
                 "purpose": purpose,
                 "model": completion.model,
@@ -112,7 +113,7 @@ class Planner:
             },
         )
         plan = completion.value
-        self._journal.emit("plan_created", {"steps": plan.model_dump()["steps"]})
+        self._journal.emit(EVT_PLAN_CREATED, {"steps": plan.model_dump()["steps"]})
         return plan
 
     def _render(
