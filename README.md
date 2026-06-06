@@ -230,10 +230,27 @@ pinned by a deterministic test. Full measurement and the two seeded recall cases
 
 ---
 
+## Tests & quality gates
+
+```bash
+make check       # the full gate: lint + typecheck + tests (run this before committing)
+make test        # pytest only
+make lint        # ruff check + format --check
+make typecheck   # ty
+```
+
+`make check` is the local mirror of CI: `ruff` (lint + format), `ty` (types), and
+`pytest` with a **100% line+branch coverage floor** (ADR-0004). The suite is
+deterministic and key-free — it runs `FakeLLM` / replay doubles, never a live
+model — so it needs no API key. Live-model tests are marked `@pytest.mark.live`
+and are opt-in.
+
+---
+
 ## Evals
 
 The eval harness is the functional acceptance gate — a prompt change that breaks a
-golden case does not ship.
+golden case does not ship. Full guide: **[docs/evals/](docs/evals/)**.
 
 ### Two tiers
 
@@ -254,23 +271,29 @@ never blocks. Only Tier-1 carries acceptance weight.
 ### Running evals
 
 ```bash
-# Replay mode — deterministic, key-free, CI-safe (uses cached LLM responses)
+# Replay — deterministic, key-free, CI-safe (serves cached LLM responses)
 make eval-replay
 
-# Live mode — real LLM calls (requires .env with LLM_API_KEY)
+# Live — real LLM calls on the configured model (requires .env with LLM_API_KEY)
 make eval
 ```
 
 Replay mode uses prompt-hash-keyed cached responses stored in `.replay.json` files
-alongside each case. When you change a prompt, the cache misses loudly (`ReplayMiss`);
-re-record the suite live with:
+alongside each case. When you change a prompt, the cache misses loudly (`ReplayMiss`).
+
+**Re-record / multi-model sweep** (US-0009) — run the suite on any model from an
+isolated env file, judge pinned to the baseline so Tier-2 scores stay comparable:
 
 ```bash
-uv run python _workspace/run_dataset.py --dirs src/triage/evals/cases --out _workspace/evalrunN
+# Re-record the canonical baseline caches (next to each YAML)
+uv run python -m triage.evals.sweep --env-file .env --out _workspace/evalrun
+
+# Evaluate another model — config only, no code change (caches kept in --out)
+make eval-sweep ENV=.env.llama    OUT=_workspace/evalrun-llama
+make eval-sweep ENV=.env.deepseek OUT=_workspace/evalrun-deepseek WORKERS=1 SECS=60
 ```
 
-This re-runs all cases live, writes fresh `.replay.json` caches next to each YAML,
-and dumps per-case metrics (Tier-1 results, judge median-of-3, latency) to `--out`.
+Full eval guide (settings, flags, model matrix, memory recall): **[docs/evals/](docs/evals/)**.
 
 ### Golden case coverage
 
